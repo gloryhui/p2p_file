@@ -2,7 +2,11 @@
 name = "p2p_file"
 version = "0.1.0"
 edition = "2024"
-description = "点对点文件传输：STUN 发现 + UDP 打洞 + QUIC 加密通道"
+description = "点对点直连：STUN 发现 + UDP 打洞 + QUIC 加密通道，支持文件传输与通用 TCP 隧道"
+repository = "https://github.com/gloryhui/p2p_file"
+readme = "README.md"
+keywords = ["p2p", "nat-traversal", "quic", "file-transfer", "tunnel"]
+categories = ["network-programming"]
 license = "MIT OR Apache-2.0"
 
 [dependencies]
