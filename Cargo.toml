@@ -7,8 +7,7 @@ repository = "https://github.com/gloryhui/p2p_file"
 readme = "README.md"
 keywords = ["p2p", "nat-traversal", "quic", "file-transfer", "tunnel"]
 categories = ["network-programming"]
-# SPDX 写法。`OR` 是双许可的标准表达：两个许可同时生效，不是待定。
-license = "MIT OR Apache-2.0"
+license = "MIT"
 
 [dependencies]
 blake3 = "1.8.7"
