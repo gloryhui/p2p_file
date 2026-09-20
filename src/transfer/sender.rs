@@ -47,10 +47,23 @@ pub async fn send_file(
     // 握手流用完就关，让对端的读取干净结束。
     let _ = handshake_send.finish();
 
+    send_file_after_handshake(connection, path, chunk_size, outcome.peer_node_id).await
+}
+
+/// 在**已经完成握手**的连接上把文件发出去。
+///
+/// 单独拆出来是为了让 `serve` 这种常驻服务复用：它先自己完成握手并核对对端
+/// 身份，再决定这条连接是收文件还是做隧道。
+pub async fn send_file_after_handshake(
+    connection: &Connection,
+    path: &Path,
+    chunk_size: u32,
+    peer_node_id: NodeId,
+) -> Result<SendReport> {
     // 2. 生成清单并开数据流。
     let manifest = manifest_from_path(path, chunk_size)?;
     tracing::info!(
-        peer = %outcome.peer_node_id.short(),
+        peer = %peer_node_id.short(),
         file = %manifest.file_name,
         total_len = manifest.total_len,
         chunks = manifest.chunk_count(),
@@ -147,14 +160,14 @@ pub async fn send_file(
     let _ = send.finish();
 
     tracing::info!(
-        peer = %outcome.peer_node_id.short(),
+        peer = %peer_node_id.short(),
         chunks_sent,
         chunks_skipped,
         "发送完成"
     );
 
     Ok(SendReport {
-        peer_node_id: outcome.peer_node_id,
+        peer_node_id,
         file_name: manifest.file_name.clone(),
         total_len: manifest.total_len,
         chunk_count: manifest.chunk_count(),

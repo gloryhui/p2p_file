@@ -6,5 +6,5 @@ pub mod punch;
 pub mod stun;
 
 pub use classify::{MappingBehavior, StunObservation, classify_mapping};
-pub use punch::{PunchConfig, simultaneous_open};
+pub use punch::{PunchConfig, PunchToken, simultaneous_open, simultaneous_open_any};
 pub use stun::{StunResult, query_binding};

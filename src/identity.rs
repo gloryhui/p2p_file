@@ -66,6 +66,15 @@ impl fmt::Display for NodeId {
     }
 }
 
+/// 让命令行可以直接把节点 ID 当参数解析（`--peer <NODE_ID>`）。
+impl std::str::FromStr for NodeId {
+    type Err = Error;
+
+    fn from_str(text: &str) -> Result<Self> {
+        Self::from_hex(text.trim())
+    }
+}
+
 impl fmt::Debug for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "NodeId({})", self.short())
@@ -75,6 +84,7 @@ impl fmt::Debug for NodeId {
 /// 本机身份：一个 Ed25519 密钥对。
 ///
 /// 私钥只以 32 字节种子的形式存在于内存和密钥文件中。
+#[derive(Clone)]
 pub struct Identity {
     signing_key: SigningKey,
 }

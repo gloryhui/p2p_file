@@ -8,13 +8,17 @@ use std::time::Duration;
 
 use clap::Parser;
 
-use p2p_file::cli::{Cli, Command};
+use p2p_file::cli::{Cli, Command, DirectOpts};
+use p2p_file::discovery::signal::run_signal_server;
 use p2p_file::discovery::{LanDiscovery, parse_announcement};
 use p2p_file::error::{Error, Result};
 use p2p_file::identity::Identity;
+use p2p_file::nat::punch::PunchConfig;
 use p2p_file::nat::stun::{query_binding, resolve_server};
+use p2p_file::net::{DirectConfig, establish};
 use p2p_file::transfer::{receive_file, send_file};
 use p2p_file::transport::quic::{client_endpoint, connect, server_endpoint};
+use p2p_file::tunnel::{ServeConfig, forward_tunnel, push_file, serve_loop};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -55,6 +59,27 @@ async fn run(cli: Cli) -> Result<()> {
             peer,
             chunk_size,
         } => cmd_send(&key_file, file, peer, chunk_size).await,
+
+        Command::SignalServer { listen } => cmd_signal_server(listen).await,
+        Command::Serve {
+            direct,
+            allow,
+            forward,
+            recv_dir,
+            re_punch_after,
+        } => cmd_serve(&key_file, direct, allow, forward, recv_dir, re_punch_after).await,
+        Command::Tunnel {
+            direct,
+            peer,
+            listen,
+            to,
+        } => cmd_tunnel(&key_file, direct, peer, listen, to).await,
+        Command::Push {
+            direct,
+            peer,
+            file,
+            chunk_size,
+        } => cmd_push(&key_file, direct, peer, file, chunk_size).await,
     }
 }
 
@@ -170,7 +195,7 @@ async fn cmd_recv(key_file: &Option<PathBuf>, listen: SocketAddr, out_dir: PathB
                 Some(incoming) => incoming,
                 None => return Err(Error::Transport("端点已关闭".into())),
             },
-            _ = tokio::signal::ctrl_c() => {
+            _ = shutdown_signal() => {
                 println!("\n收到中断信号，退出。");
                 endpoint.close(0u32.into(), b"bye");
                 endpoint.wait_idle().await;
@@ -235,6 +260,196 @@ async fn cmd_send(
     connection.close(0u32.into(), b"done");
     endpoint.wait_idle().await;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 公网直连：信令服务器 / serve / tunnel / push
+// ---------------------------------------------------------------------------
+
+/// 把命令行参数翻译成打洞配置。
+fn direct_config(opts: &DirectOpts, peer: p2p_file::identity::NodeId) -> DirectConfig {
+    let mut config = DirectConfig::new(opts.signal.clone(), peer);
+    config.local_port = opts.port;
+    config.advertise = opts.advertise.clone();
+    config.signal_timeout = Duration::from_secs(opts.wait);
+    config.punch = PunchConfig {
+        attempts: opts.punch_attempts,
+        ..PunchConfig::default()
+    };
+    // 没显式指定就用默认那几台。
+    if !opts.stun.is_empty() {
+        config.stun_servers = opts.stun.clone();
+    }
+    config
+}
+
+/// 等退出信号：终端的 Ctrl-C（SIGINT），或者 systemd 停止服务时的 SIGTERM。
+///
+/// 只处理 Ctrl-C 是不够的——`kill` 和 `systemctl stop` 发的都是 SIGTERM，
+/// 不接住的话进程会被直接干掉，QUIC 连接来不及发关闭帧，对端只能干等
+/// 空闲超时（30 秒）才发现我们已经走了。
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(err) => {
+                tracing::debug!(error = %err, "注册 SIGTERM 处理失败，只监听 Ctrl-C");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// 关掉 QUIC 端点，让对端立刻知道我们走了。
+async fn close_endpoint(endpoint: &quinn::Endpoint) {
+    endpoint.close(0u32.into(), b"bye");
+    // 给关闭帧一点时间发出去；连不上或对端没响应也不必死等。
+    let _ = tokio::time::timeout(Duration::from_secs(3), endpoint.wait_idle()).await;
+}
+
+async fn cmd_signal_server(listen: SocketAddr) -> Result<()> {
+    println!("信令服务器监听 {listen}");
+    println!("它只负责让双方交换候选地址，业务数据一个字节都不经过这里。");
+    println!("记得在云主机安全组里放通这个 TCP 端口。");
+    println!("按 Ctrl-C 退出。");
+
+    tokio::select! {
+        result = run_signal_server(listen) => result,
+        _ = shutdown_signal() => {
+            println!("\n收到中断信号，退出。");
+            Ok(())
+        }
+    }
+}
+
+async fn cmd_serve(
+    key_file: &Option<PathBuf>,
+    direct: DirectOpts,
+    allow: Vec<p2p_file::identity::NodeId>,
+    forward: Vec<SocketAddr>,
+    recv_dir: Option<PathBuf>,
+    re_punch_after: u64,
+) -> Result<()> {
+    let identity = load_identity(key_file)?;
+    println!("本机节点 ID: {}", identity.node_id());
+    println!("（把这个 ID 告诉对方，对方用 --peer 指定）");
+
+    // 打洞必须知道「往哪打」，所以 serve 需要恰好一个对端节点。
+    let peer = match allow.as_slice() {
+        [peer] => *peer,
+        [] => {
+            return Err(Error::Discovery(
+                "serve 必须用 --allow 指定对端节点 ID：不知道对方是谁就没法打洞".into(),
+            ));
+        }
+        _ => {
+            return Err(Error::Discovery(
+                "serve 目前只支持一个 --allow 对端：打洞是点对点的，多个对端请各开一个进程".into(),
+            ));
+        }
+    };
+
+    // serve 是常驻的：一直等对端，空闲后重新打洞。
+    let mut config = direct_config(&direct, peer);
+    config.signal_timeout = Duration::ZERO; // 0 = 一直等，不超时
+
+    if forward.is_empty() && recv_dir.is_none() {
+        println!("提示：没有 --forward 也没有 --recv-dir，对端连上来也没事可做。");
+    }
+    for target in &forward {
+        println!("允许转发到 {target}");
+    }
+    println!();
+    println!("常驻等待中。对端上线后会自动打洞并开始服务。");
+
+    let serve_config = ServeConfig {
+        allowed_peers: allow,
+        forwards: forward,
+        recv_dir,
+        re_punch_after: Duration::from_secs(re_punch_after),
+    };
+
+    tokio::select! {
+        result = serve_loop(identity, config, serve_config) => result,
+        _ = shutdown_signal() => {
+            println!("\n收到中断信号，退出。");
+            Ok(())
+        }
+    }
+}
+
+async fn cmd_tunnel(
+    key_file: &Option<PathBuf>,
+    direct: DirectOpts,
+    peer: p2p_file::identity::NodeId,
+    listen: SocketAddr,
+    to: SocketAddr,
+) -> Result<()> {
+    let identity = load_identity(key_file)?;
+    println!("本机节点 ID: {}", identity.node_id());
+    println!("目标对端:   {} ({})", peer.short(), peer);
+
+    let config = direct_config(&direct, peer);
+    let link = establish(&identity, &config).await?;
+    println!("直连已建立：{}", link.describe());
+    println!();
+    println!("隧道已就绪：连到 {listen} 就等于连到对端的 {to}");
+
+    let target = to.to_string();
+    let endpoint = link.endpoint.clone();
+    tokio::select! {
+        result = forward_tunnel(link, identity, target, listen) => result,
+        _ = shutdown_signal() => {
+            println!("\n收到退出信号，正在关闭隧道……");
+            close_endpoint(&endpoint).await;
+            Ok(())
+        }
+    }
+}
+
+async fn cmd_push(
+    key_file: &Option<PathBuf>,
+    direct: DirectOpts,
+    peer: p2p_file::identity::NodeId,
+    file: PathBuf,
+    chunk_size: u32,
+) -> Result<()> {
+    let identity = load_identity(key_file)?;
+    println!("本机节点 ID: {}", identity.node_id());
+    println!("目标对端:   {} ({})", peer.short(), peer);
+
+    let config = direct_config(&direct, peer);
+    let link = establish(&identity, &config).await?;
+    println!("直连已建立：{}", link.describe());
+
+    let endpoint = link.endpoint.clone();
+    tokio::select! {
+        result = push_file(link, identity, file, chunk_size) => {
+            let report = result?;
+            println!(
+                "发送完成：{} （{} 字节，{} 片，跳过 {} 片）",
+                report.file_name, report.total_len, report.chunk_count, report.chunks_skipped
+            );
+            close_endpoint(&endpoint).await;
+            Ok(())
+        }
+        _ = shutdown_signal() => {
+            println!("\n收到退出信号，正在收尾……");
+            close_endpoint(&endpoint).await;
+            Ok(())
+        }
+    }
 }
 
 fn load_identity(key_file: &Option<PathBuf>) -> Result<Identity> {

@@ -10,30 +10,30 @@ use crate::protocol::message::ControlMessage;
 /// 单帧上限 16 MiB。分片大小上限也是 16 MiB，留出 postcard 自身的编码开销。
 pub const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024 + 4096;
 
-/// 写一帧并 flush。
-pub async fn write_frame<W>(writer: &mut W, message: &ControlMessage) -> Result<()>
+/// 写一帧原始载荷并 flush。
+///
+/// 控制消息和信令消息共用这一层：信令走 TCP，控制消息走 QUIC。
+pub async fn write_raw_frame<W>(writer: &mut W, payload: &[u8]) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    let payload = message.encode()?;
     let len = payload.len();
     if len > MAX_FRAME_LEN as usize {
         return Err(Error::Protocol(format!(
-            "{} 帧过大：{len} 字节，上限 {MAX_FRAME_LEN}",
-            message.kind()
+            "帧过大：{len} 字节，上限 {MAX_FRAME_LEN}"
         )));
     }
     writer.write_all(&(len as u32).to_le_bytes()).await?;
-    writer.write_all(&payload).await?;
+    writer.write_all(payload).await?;
     writer.flush().await?;
     Ok(())
 }
 
-/// 读一帧。
+/// 读一帧原始载荷。
 ///
 /// 对端干净关闭（连长度头都没读到就 EOF）时返回 `Ok(None)`；
 /// 只读到一半就断开视为协议错误。
-pub async fn read_frame<R>(reader: &mut R) -> Result<Option<ControlMessage>>
+pub async fn read_raw_frame<R>(reader: &mut R) -> Result<Option<Vec<u8>>>
 where
     R: AsyncRead + Unpin,
 {
@@ -60,7 +60,34 @@ where
             _ => err.into(),
         })?;
 
-    Ok(Some(ControlMessage::decode(&payload)?))
+    Ok(Some(payload))
+}
+
+/// 写一帧控制消息。
+pub async fn write_frame<W>(writer: &mut W, message: &ControlMessage) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let payload = message.encode()?;
+    if payload.len() > MAX_FRAME_LEN as usize {
+        return Err(Error::Protocol(format!(
+            "{} 帧过大：{} 字节，上限 {MAX_FRAME_LEN}",
+            message.kind(),
+            payload.len()
+        )));
+    }
+    write_raw_frame(writer, &payload).await
+}
+
+/// 读一帧控制消息。
+pub async fn read_frame<R>(reader: &mut R) -> Result<Option<ControlMessage>>
+where
+    R: AsyncRead + Unpin,
+{
+    match read_raw_frame(reader).await? {
+        Some(payload) => Ok(Some(ControlMessage::decode(&payload)?)),
+        None => Ok(None),
+    }
 }
 
 #[cfg(test)]

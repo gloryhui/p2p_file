@@ -3,11 +3,12 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
-use quinn::Connection;
+use quinn::{Connection, RecvStream, SendStream};
 
 use crate::error::{Error, Result};
 use crate::identity::{Identity, NodeId};
 use crate::protocol::frame::{read_frame, write_frame};
+use crate::protocol::manifest::FileManifest;
 use crate::protocol::message::ControlMessage;
 use crate::storage::PartialDownload;
 use crate::transport::handshake::handshake_responder;
@@ -48,7 +49,7 @@ pub async fn receive_file(
     let _ = handshake_send.finish();
 
     // 2. 收清单并开数据流。
-    let (mut send, mut recv) = connection
+    let (send, mut recv) = connection
         .accept_bi()
         .await
         .map_err(|err| Error::Transport(format!("接受数据流失败: {err}")))?;
@@ -66,8 +67,22 @@ pub async fn receive_file(
         }
     };
 
+    receive_file_on_stream(send, recv, manifest, out_dir, outcome.peer_node_id).await
+}
+
+/// 在**已经收好清单**的数据流上把文件收完。
+///
+/// 单独拆出来是为了让常驻的 `serve` 复用：`serve` 先读每条新流的第一个消息，
+/// 是 `Manifest` 就交给这里，是 `TunnelOpen` 就交给隧道处理，两条路都能走。
+pub async fn receive_file_on_stream(
+    mut send: SendStream,
+    mut recv: RecvStream,
+    manifest: FileManifest,
+    out_dir: &Path,
+    peer_node_id: NodeId,
+) -> Result<ReceiveReport> {
     tracing::info!(
-        peer = %outcome.peer_node_id.short(),
+        peer = %peer_node_id.short(),
         file = %manifest.file_name,
         total_len = manifest.total_len,
         chunks = manifest.chunk_count(),
@@ -163,13 +178,13 @@ pub async fn receive_file(
 
     let output_path = download.finalize()?;
     tracing::info!(
-        peer = %outcome.peer_node_id.short(),
+        peer = %peer_node_id.short(),
         path = %output_path.display(),
         "接收完成"
     );
 
     Ok(ReceiveReport {
-        peer_node_id: outcome.peer_node_id,
+        peer_node_id,
         file_name: manifest.file_name.clone(),
         total_len: manifest.total_len,
         chunk_count: manifest.chunk_count(),

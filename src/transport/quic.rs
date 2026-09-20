@@ -54,12 +54,10 @@ fn transport_config() -> Result<TransportConfig> {
     Ok(transport)
 }
 
-/// 创建服务端端点，绑定到 `bind`。
+/// 构造服务端 TLS/QUIC 配置。
 ///
-/// 每次启动生成一张新的自签证书。这不影响身份安全——身份由应用层握手保证。
-pub fn server_endpoint(bind: SocketAddr) -> Result<Endpoint> {
-    install_crypto_provider();
-
+/// 每次调用生成一张新的自签证书。这不影响身份安全——身份由应用层握手保证。
+fn server_config() -> Result<ServerConfig> {
     let certified = rcgen::generate_simple_self_signed(vec!["p2pfile".to_string()])
         .map_err(|err| Error::Transport(format!("生成自签证书失败: {err}")))?;
     let cert_der: CertificateDer<'static> = certified.cert.der().clone();
@@ -76,15 +74,11 @@ pub fn server_endpoint(bind: SocketAddr) -> Result<Endpoint> {
 
     let mut config = ServerConfig::with_crypto(Arc::new(crypto));
     config.transport_config(Arc::new(transport_config()?));
-
-    Endpoint::server(config, bind)
-        .map_err(|err| Error::Transport(format!("绑定 {bind} 失败: {err}")))
+    Ok(config)
 }
 
-/// 创建客户端端点，绑定到 `bind`（通常写 `0.0.0.0:0`）。
-pub fn client_endpoint(bind: SocketAddr) -> Result<Endpoint> {
-    install_crypto_provider();
-
+/// 构造客户端 TLS/QUIC 配置。
+fn client_config() -> Result<ClientConfig> {
     let mut tls = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(SkipServerVerification::new())
@@ -96,10 +90,56 @@ pub fn client_endpoint(bind: SocketAddr) -> Result<Endpoint> {
 
     let mut config = ClientConfig::new(Arc::new(crypto));
     config.transport_config(Arc::new(transport_config()?));
+    Ok(config)
+}
 
+/// 用**现成的** UDP socket 建一个 QUIC 端点。
+///
+/// 这是打洞能真正生效的关键：NAT 映射是按「本地端口」分配的，只有让 QUIC
+/// 复用那个刚刚打过洞、已经建立了映射的 socket，数据才会走直连。
+/// 换一个新 socket 就等于重新开一条 NAT 映射，洞白打了。
+///
+/// 端点同时装了服务端和客户端配置，所以两边都既能 accept 也能 connect——
+/// 打洞是对称的，谁先连谁后连由上层角色决定。
+pub fn endpoint_from_socket(socket: std::net::UdpSocket) -> Result<Endpoint> {
+    install_crypto_provider();
+
+    // quinn 内部会用 tokio 的 from_std 接管这个 socket，而它要求 socket 处于
+    // 非阻塞模式。从 tokio UdpSocket 转出来的本来就是非阻塞的，这里再设一次
+    // 是为了不依赖上层的调用方式。
+    socket
+        .set_nonblocking(true)
+        .map_err(|err| Error::Transport(format!("设置非阻塞失败: {err}")))?;
+
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| Error::Transport("当前没有可用的异步运行时".into()))?;
+
+    let config = server_config()?;
+    let mut endpoint = Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(config),
+        socket,
+        runtime,
+    )
+    .map_err(|err| Error::Transport(format!("用已有 socket 创建 QUIC 端点失败: {err}")))?;
+
+    endpoint.set_default_client_config(client_config()?);
+    Ok(endpoint)
+}
+
+/// 创建服务端端点，绑定到 `bind`。
+pub fn server_endpoint(bind: SocketAddr) -> Result<Endpoint> {
+    install_crypto_provider();
+    Endpoint::server(server_config()?, bind)
+        .map_err(|err| Error::Transport(format!("绑定 {bind} 失败: {err}")))
+}
+
+/// 创建客户端端点，绑定到 `bind`（通常写 `0.0.0.0:0`）。
+pub fn client_endpoint(bind: SocketAddr) -> Result<Endpoint> {
+    install_crypto_provider();
     let mut endpoint = Endpoint::client(bind)
         .map_err(|err| Error::Transport(format!("绑定 {bind} 失败: {err}")))?;
-    endpoint.set_default_client_config(config);
+    endpoint.set_default_client_config(client_config()?);
     Ok(endpoint)
 }
 
@@ -191,6 +231,62 @@ mod tests {
     fn 传输参数合法() {
         // 字段是 crate 私有的，只能确认构造本身不失败。
         assert!(transport_config().is_ok());
+    }
+
+    #[tokio::test]
+    async fn 端点保持原有本地端口() {
+        // 这是打洞能生效的前提：交给 QUIC 的必须是刚打过洞的那个本地端口，
+        // 换了端口就等于换了 NAT 映射，洞白打。
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let expected = socket.local_addr().unwrap();
+        let endpoint = endpoint_from_socket(socket).unwrap();
+        assert_eq!(
+            endpoint.local_addr().unwrap(),
+            expected,
+            "必须复用同一个本地端口"
+        );
+    }
+
+    #[tokio::test]
+    async fn 用现成_socket_建的端点能连上() {
+        let server_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+        let server = endpoint_from_socket(server_socket).unwrap();
+
+        let client_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client = endpoint_from_socket(client_socket).unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let incoming = server.accept().await.expect("应当收到连接");
+            let connection = incoming.await.expect("握手应当成功");
+
+            let (mut send, mut recv) = connection.accept_bi().await.expect("应当收到流");
+            let request = read_frame(&mut recv).await.unwrap().unwrap();
+            assert_eq!(request, ControlMessage::KeepAlive);
+
+            write_frame(&mut send, &ControlMessage::Ready)
+                .await
+                .unwrap();
+            send.finish().unwrap();
+
+            connection.closed().await;
+            server.wait_idle().await;
+        });
+
+        let connection = connect(&client, server_addr, "127.0.0.1").await.unwrap();
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        write_frame(&mut send, &ControlMessage::KeepAlive)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            read_frame(&mut recv).await.unwrap().unwrap(),
+            ControlMessage::Ready
+        );
+
+        connection.close(0u32.into(), b"bye");
+        client.wait_idle().await;
+        server_task.await.unwrap();
     }
 
     #[tokio::test]

@@ -52,6 +52,13 @@ pub enum ControlMessage {
     /// 全部收完，回报根哈希。
     Complete { root_hash: ChunkHash },
 
+    /// 请求转发一条 TCP 连接到 `target`（形如 `127.0.0.1:22`）。
+    TunnelOpen { target: String },
+    /// 隧道已就绪，可以开始搬字节了。
+    TunnelReady,
+    /// 隧道建立失败。
+    TunnelError { reason: String },
+
     /// 保活，维持 NAT 映射和 QUIC 连接。
     KeepAlive,
     /// 出错了，附带原因。
@@ -82,6 +89,9 @@ impl ControlMessage {
             Self::Chunk { .. } => "Chunk",
             Self::ChunkAck { .. } => "ChunkAck",
             Self::Complete { .. } => "Complete",
+            Self::TunnelOpen { .. } => "TunnelOpen",
+            Self::TunnelReady => "TunnelReady",
+            Self::TunnelError { .. } => "TunnelError",
             Self::KeepAlive => "KeepAlive",
             Self::Abort { .. } => "Abort",
             Self::Bye => "Bye",
@@ -140,6 +150,13 @@ mod tests {
             ControlMessage::Chunk {
                 index: 42,
                 data: vec![0xab; 1024],
+            },
+            ControlMessage::TunnelOpen {
+                target: "127.0.0.1:22".into(),
+            },
+            ControlMessage::TunnelReady,
+            ControlMessage::TunnelError {
+                reason: "目标拒绝连接".into(),
             },
             ControlMessage::KeepAlive,
             ControlMessage::Abort {

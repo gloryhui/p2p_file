@@ -4,4 +4,7 @@ pub mod handshake;
 pub mod quic;
 
 pub use handshake::{HandshakeOutcome, handshake_initiator, handshake_responder};
-pub use quic::{ALPN, client_endpoint, connect, install_crypto_provider, server_endpoint};
+pub use quic::{
+    ALPN, KEEP_ALIVE_INTERVAL, MAX_IDLE_TIMEOUT, client_endpoint, connect, endpoint_from_socket,
+    install_crypto_provider, server_endpoint,
+};

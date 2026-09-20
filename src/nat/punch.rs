@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
 
@@ -17,6 +18,47 @@ use crate::error::{Error, Result};
 
 /// 探测包的魔术前缀，用来把自己发的包和别人的数据区分开。
 pub const PROBE_MAGIC: &[u8] = b"P2PF-PUNCH/1";
+
+/// 探测包的长度：魔术前缀 + 令牌 + 随机填充。
+const PROBE_TOKEN_LEN: usize = 16;
+
+/// 打洞令牌。
+///
+/// 由信令服务器为一对节点随机生成，双方各拿一份。作用是让「接受来自任意
+/// 地址的探测包」这件事变得安全：不知道令牌的人发的包一律丢掉。
+///
+/// # 为什么必须允许「任意地址」
+///
+/// 很多 NAT（地址相关映射，ADM）的公网端口是**按目标 IP 分配**的：向 STUN
+/// 服务器发包时拿到的是端口 A，向对端发包时 NAT 会另分配端口 B。于是
+/// 双方互相发往「信令里公布的那个端口 A」的包都会被打掉。
+///
+/// 但这时对端的探测包仍然能到达我们（因为我们发给它的包已经打开了它那一侧
+/// 的映射），只是**源端口是 B 而不是 A**。所以要打通 ADM，就必须认这个
+/// 「意料之外」的源地址，把它当作对端真正的地址。令牌就是为这个兜底设计的。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct PunchToken([u8; PROBE_TOKEN_LEN]);
+
+impl PunchToken {
+    pub fn random() -> Self {
+        Self(rand::random())
+    }
+
+    pub fn from_bytes(bytes: [u8; PROBE_TOKEN_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; PROBE_TOKEN_LEN] {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for PunchToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 只显示前 4 字节，够用来对日志，又不会把令牌泄得到处都是。
+        write!(f, "{}", hex::encode(&self.0[..4]))
+    }
+}
 
 /// 打洞参数。
 #[derive(Clone, Copy, Debug)]
@@ -38,60 +80,120 @@ impl Default for PunchConfig {
 }
 
 /// 构造一个探测包。
-pub fn probe_packet() -> Vec<u8> {
+pub fn probe_packet(token: &PunchToken) -> Vec<u8> {
     let mut packet = PROBE_MAGIC.to_vec();
+    packet.extend_from_slice(token.as_bytes());
+    // 随机填充：避免被中间设备按固定内容去重或缓存。
     let padding: [u8; 16] = rand::random();
     packet.extend_from_slice(&padding);
     packet
 }
 
-/// 判断是不是本协议的探测包。
+/// 判断是不是本协议的探测包（只看前缀）。
 pub fn is_probe(data: &[u8]) -> bool {
     data.starts_with(PROBE_MAGIC)
 }
 
+/// 判断是不是**带着正确令牌**的探测包。
+pub fn is_probe_with_token(data: &[u8], token: &PunchToken) -> bool {
+    let expected = PROBE_MAGIC.len();
+    data.len() >= expected + PROBE_TOKEN_LEN
+        && data.starts_with(PROBE_MAGIC)
+        && &data[expected..expected + PROBE_TOKEN_LEN] == token.as_bytes()
+}
+
 /// 向 `remote` 打洞，直到收到回应。
 ///
-/// 返回实际收到回包的那个地址（正常情况下等于 `remote`）。
-///
-/// `socket` 必须是**已经确定了本地端口**的那个 socket——映射是按本地端口
-/// 分配的，临时新建一个 socket 问出来的地址对打洞没有意义。
+/// 返回实际收到回包的那个地址。ADM 型 NAT 下这个地址**不等于** `remote`，
+/// 那正是我们要的：它才是对端真实的映射端口。
 pub async fn simultaneous_open(
     socket: &UdpSocket,
     remote: SocketAddr,
+    token: &PunchToken,
     config: &PunchConfig,
 ) -> Result<SocketAddr> {
-    let probe = probe_packet();
+    simultaneous_open_any(socket, &[remote], token, config).await
+}
+
+/// 向一组候选地址同时打洞，返回第一个真正回应我们的地址。
+///
+/// 对端通常有多个候选（公网映射、局域网地址、手动指定的映射地址），
+/// 我们不知道哪个能通，所以每一轮都往**所有**候选发探测包。
+///
+/// 收到回包就说明「我们发给它的包穿过了它的 NAT，它发给我们的包也穿过了
+/// 我们的 NAT」，也就是双向的洞都通了，可以直接开始传数据。
+///
+/// 注意这里**不要求**回包来自候选列表：ADM 型 NAT 下对端的真实源端口和
+/// 公布的端口不同，只有认下这个源地址才能打通。安全性由令牌保证。
+pub async fn simultaneous_open_any(
+    socket: &UdpSocket,
+    candidates: &[SocketAddr],
+    token: &PunchToken,
+    config: &PunchConfig,
+) -> Result<SocketAddr> {
+    if candidates.is_empty() {
+        return Err(Error::Transport("没有可用的候选地址，无法打洞".into()));
+    }
+
+    let probe = probe_packet(token);
     let mut buffer = vec![0u8; 2048];
 
     for attempt in 0..config.attempts {
-        socket.send_to(&probe, remote).await?;
+        // 每轮把所有候选都打一遍：候选一般只有几个，代价可以忽略。
+        for candidate in candidates {
+            if let Err(err) = socket.send_to(&probe, candidate).await {
+                // 某个候选不可达不该拖垮整轮，继续试其他的。
+                tracing::trace!(%candidate, error = %err, "发送探测包失败");
+            }
+        }
 
-        match tokio::time::timeout(config.interval, socket.recv_from(&mut buffer)).await {
-            // 收到包了。判断是不是我们期待的一方。
-            Ok(Ok((len, from))) => {
-                if from == remote {
-                    if is_probe(&buffer[..len]) {
-                        tracing::debug!(%remote, attempt, "打洞成功，收到对端探测包");
+        let deadline = tokio::time::Instant::now() + config.interval;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+
+            match tokio::time::timeout(remaining, socket.recv_from(&mut buffer)).await {
+                Ok(Ok((len, from))) => {
+                    let data = &buffer[..len];
+
+                    if !is_probe(data) {
+                        // 不是探测包（可能是迟到的 STUN 响应），继续等。
+                        tracing::trace!(%from, "忽略非探测包");
+                        continue;
+                    }
+                    if !is_probe_with_token(data, token) {
+                        // 令牌不对：可能是别人在扫端口，也可能是别的会话的探测包。
+                        tracing::debug!(%from, "探测包令牌不匹配，忽略");
+                        continue;
+                    }
+
+                    let advertised = candidates.contains(&from);
+                    if advertised {
+                        tracing::info!(%from, attempt, "打洞成功（命中公布的候选地址）");
                     } else {
-                        tracing::debug!(%remote, attempt, "打洞成功，收到对端数据包");
+                        tracing::info!(
+                            %from,
+                            attempt,
+                            "打洞成功（对端真实端口和公布的候选不同，多半是地址相关映射型 NAT）"
+                        );
                     }
                     return Ok(from);
                 }
-                // 别人发来的包（比如 STUN 响应）不是成功信号，继续等。
-                tracing::trace!(%from, "忽略来自非目标地址的包");
-            }
-            Ok(Err(err)) => return Err(err.into()),
-            // 超时，再试一次。
-            Err(_) => {
-                tracing::trace!(%remote, attempt, "本次探测无响应");
+                Ok(Err(err)) => return Err(err.into()),
+                Err(_) => break,
             }
         }
+
+        tracing::trace!(attempt, candidates = candidates.len(), "本轮探测无响应");
     }
 
     Err(Error::Transport(format!(
-        "打洞失败：向 {remote} 尝试 {} 次（{:?}）都没收到回应",
-        config.attempts, config.interval
+        "打洞失败：向 {} 个候选地址各尝试 {} 次（{:?}）都没收到带正确令牌的回应",
+        candidates.len(),
+        config.attempts,
+        config.interval
     )))
 }
 
@@ -102,10 +204,11 @@ pub async fn simultaneous_open(
 pub async fn keepalive_loop(
     socket: Arc<UdpSocket>,
     remote: SocketAddr,
+    token: PunchToken,
     interval: Duration,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    let probe = probe_packet();
+    let probe = probe_packet(&token);
 
     loop {
         tokio::select! {
@@ -127,15 +230,43 @@ pub async fn keepalive_loop(
 mod tests {
     use super::*;
 
+    fn token() -> PunchToken {
+        PunchToken::from_bytes([0x42; 16])
+    }
+
     #[test]
     fn 探测包可识别() {
-        let probe = probe_packet();
+        let probe = probe_packet(&token());
         assert!(is_probe(&probe));
         assert!(probe.len() > PROBE_MAGIC.len());
         assert!(!is_probe(b"hello"));
         assert!(!is_probe(b""));
         // 每次的填充不同，避免被中间设备按固定内容去重或缓存。
-        assert_ne!(probe_packet(), probe_packet());
+        assert_ne!(probe_packet(&token()), probe_packet(&token()));
+    }
+
+    #[test]
+    fn 令牌不对的探测包不认() {
+        let mine = token();
+        let other = PunchToken::from_bytes([0x99; 16]);
+
+        assert!(is_probe_with_token(&probe_packet(&mine), &mine));
+        assert!(!is_probe_with_token(&probe_packet(&other), &mine));
+        assert!(!is_probe_with_token(b"P2PF-PUNCH/1", &mine));
+        assert!(!is_probe_with_token(b"", &mine));
+        // 前缀对但令牌只有一半，也不能认。
+        let mut truncated = PROBE_MAGIC.to_vec();
+        truncated.extend_from_slice(&[0x42; 8]);
+        assert!(!is_probe_with_token(&truncated, &mine));
+    }
+
+    #[test]
+    fn 令牌随机且可显示() {
+        let a = PunchToken::random();
+        let b = PunchToken::random();
+        assert_ne!(a, b, "每次配对的令牌必须不同");
+        assert_eq!(a.to_string().len(), 8, "展示用短令牌是 4 字节十六进制");
+        assert_eq!(PunchToken::from_bytes(*a.as_bytes()), a);
     }
 
     #[tokio::test]
@@ -150,9 +281,10 @@ mod tests {
             attempts: 20,
         };
 
+        let shared = token();
         let (result_a, result_b) = tokio::join!(
-            simultaneous_open(&a, b_addr, &config),
-            simultaneous_open(&b, a_addr, &config),
+            simultaneous_open(&a, b_addr, &shared, &config),
+            simultaneous_open(&b, a_addr, &shared, &config),
         );
 
         assert_eq!(result_a.unwrap(), b_addr);
@@ -173,7 +305,7 @@ mod tests {
         };
         // 收不到回应，或者收到 ICMP 端口不可达，两种都算失败。
         assert!(
-            simultaneous_open(&socket, dead_addr, &config)
+            simultaneous_open(&socket, dead_addr, &token(), &config)
                 .await
                 .is_err()
         );
@@ -202,7 +334,7 @@ mod tests {
             loop {
                 let (len, from) = target.recv_from(&mut buffer).await.unwrap();
                 if is_probe(&buffer[..len]) {
-                    let _ = target.send_to(&probe_packet(), from).await;
+                    let _ = target.send_to(&probe_packet(&token()), from).await;
                     break;
                 }
             }
@@ -212,7 +344,7 @@ mod tests {
             interval: Duration::from_millis(50),
             attempts: 30,
         };
-        let result = simultaneous_open(&socket, target_addr, &config)
+        let result = simultaneous_open(&socket, target_addr, &token(), &config)
             .await
             .unwrap();
         assert_eq!(result, target_addr);
@@ -220,6 +352,122 @@ mod tests {
 
         noise.abort();
         responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn 多候选里能打通活的那个() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // 两个死地址 + 一个活的，活的那个排在最后。
+        let dead_one = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dead_one_addr = dead_one.local_addr().unwrap();
+        drop(dead_one);
+        let dead_two = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dead_two_addr = dead_two.local_addr().unwrap();
+        drop(dead_two);
+
+        let alive = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let alive_addr = alive.local_addr().unwrap();
+
+        let responder = tokio::spawn(async move {
+            let mut buffer = [0u8; 256];
+            loop {
+                let (len, from) = alive.recv_from(&mut buffer).await.unwrap();
+                if is_probe(&buffer[..len]) {
+                    let _ = alive.send_to(&probe_packet(&token()), from).await;
+                    break;
+                }
+            }
+        });
+
+        let candidates = vec![dead_one_addr, dead_two_addr, alive_addr];
+        let config = PunchConfig {
+            interval: Duration::from_millis(80),
+            attempts: 20,
+        };
+
+        let result = simultaneous_open_any(&socket, &candidates, &token(), &config)
+            .await
+            .unwrap();
+        assert_eq!(result, alive_addr, "应当认出真正能通的那个候选");
+
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn 公布的候选不对时仍能靠令牌认下对端真实地址() {
+        // 这是地址相关映射（ADM）型 NAT 的关键场景：STUN 探到的端口只对
+        // STUN 服务器有效，真正发给对端时 NAT 会换一个端口。对端发来的
+        // 探测包源端口因此**不在候选列表里**，但必须认下来。
+        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = a.local_addr().unwrap();
+        let b_addr = b.local_addr().unwrap();
+        let shared = token();
+
+        // A 手上的候选是错的：指向一个没人用的端口。
+        let bogus: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+        let sender = tokio::spawn(async move {
+            let probe = probe_packet(&shared);
+            for _ in 0..20 {
+                let _ = b.send_to(&probe, a_addr).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+
+        let config = PunchConfig {
+            interval: Duration::from_millis(100),
+            attempts: 30,
+        };
+        let learned = simultaneous_open_any(&a, &[bogus], &shared, &config)
+            .await
+            .expect("应当靠令牌认下对端真实的源地址");
+
+        assert_eq!(learned, b_addr, "学到的必须是对端真实地址，不是公布的那个");
+        assert_ne!(learned, bogus);
+
+        sender.abort();
+    }
+
+    #[tokio::test]
+    async fn 令牌不对的探测包打不通() {
+        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = a.local_addr().unwrap();
+        let b_addr = b.local_addr().unwrap();
+
+        let mine = PunchToken::from_bytes([0x11; 16]);
+        let theirs = PunchToken::from_bytes([0x22; 16]);
+
+        let sender = tokio::spawn(async move {
+            let probe = probe_packet(&theirs);
+            for _ in 0..10 {
+                let _ = b.send_to(&probe, a_addr).await;
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        });
+
+        let config = PunchConfig {
+            interval: Duration::from_millis(50),
+            attempts: 3,
+        };
+        // 地址是对的，但令牌不对，不能算打通。
+        let err = simultaneous_open_any(&a, &[b_addr], &mine, &config)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Transport(_)), "实际 {err:?}");
+
+        sender.abort();
+    }
+
+    #[tokio::test]
+    async fn 没有候选时直接报错() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let err = simultaneous_open_any(&socket, &[], &token(), &PunchConfig::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Transport(_)), "实际 {err:?}");
     }
 
     #[tokio::test]
@@ -232,6 +480,7 @@ mod tests {
         let handle = tokio::spawn(keepalive_loop(
             sender,
             remote,
+            token(),
             Duration::from_millis(50),
             stop_rx,
         ));
