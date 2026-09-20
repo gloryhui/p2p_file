@@ -1,25 +1,18 @@
 # p2p_file
 
-点对点（P2P）文件传输工具。
+点对点（P2P）文件传输工具。**Rust** 实现，目标是**公网 NAT 穿透直连**，中继只作为兜底。
 
-## 目标
+## 状态
 
-在两台设备之间直接传输文件，不经过中心服务器中继（或仅用服务器做信令/发现）。
-
-## 待定 / TODO
-
-- [ ] 选择技术栈
-- [ ] 传输协议设计（分片、校验、断点续传）
-- [ ] 节点发现方式（局域网广播 / DHT / 信令服务器）
-- [ ] NAT 穿透（打洞 / 中继回退）
-- [ ] 加密与身份校验
-- [ ] CLI 或 GUI 界面
+仓库已初始化，尚未写代码。架构见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
 
 ## 开发
 
 ```bash
-git clone <repo>
-cd p2p_file
-```
+# 需要 Rust 工具链（尚未安装）
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
 
-（技术栈确定后补充构建与运行说明）
+cargo build
+cargo run -- --help
+```
