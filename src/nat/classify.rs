@@ -58,6 +58,24 @@ pub enum MappingBehavior {
 }
 
 impl MappingBehavior {
+    /// 给人看的中文描述。全项目只有这一处措辞，日志、`stun` 命令、
+    /// 文档里说的必须是同一句话。
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::EndpointIndependent => "端点无关（最容易打洞）",
+            Self::AddressDependent => "地址相关（可以打洞）",
+            Self::AddressAndPortDependent => "地址端口相关/对称型（很难打洞）",
+            Self::Unknown => "未知（STUN 样本不足）",
+        }
+    }
+
+    /// 这种 NAT 下打洞值不值得试。
+    pub fn punchable(self) -> bool {
+        matches!(self, Self::EndpointIndependent | Self::AddressDependent)
+    }
+}
+
+impl MappingBehavior {
     /// 这种 NAT 下直接打洞有没有希望。
     pub fn is_punchable(self) -> bool {
         matches!(self, Self::EndpointIndependent | Self::AddressDependent)

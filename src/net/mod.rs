@@ -194,7 +194,7 @@ impl DirectLink {
         format!(
             "本地端口 {}，NAT 映射行为 {}，公网映射 {}，对端候选 [{}]，首选 {}（打洞{}）",
             self.local_port,
-            describe_mapping(self.mapping),
+            self.mapping.describe(),
             self.public_addr
                 .map(|addr| addr.to_string())
                 .unwrap_or_else(|| "未知".into()),
@@ -214,15 +214,6 @@ const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 打洞未确认时，每个候选地址试探的时长。
 const FALLBACK_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
-
-fn describe_mapping(mapping: MappingBehavior) -> &'static str {
-    match mapping {
-        MappingBehavior::EndpointIndependent => "端点无关（最容易打洞）",
-        MappingBehavior::AddressDependent => "地址相关（可以打洞）",
-        MappingBehavior::AddressAndPortDependent => "地址端口相关/对称型（很难打洞）",
-        MappingBehavior::Unknown => "未知（STUN 样本不足）",
-    }
-}
 
 /// 建立到 `config.peer` 的直连。
 pub async fn establish(identity: &Identity, config: &DirectConfig) -> Result<DirectLink> {
@@ -406,7 +397,7 @@ async fn probe_public_addr(
             "STUN 观测"
         );
     }
-    info!(%public_addr, behavior = describe_mapping(mapping), "本机在公网上的样子");
+    info!(%public_addr, behavior = mapping.describe(), "本机在公网上的样子");
 
     Ok((Some(public_addr), mapping))
 }
@@ -577,7 +568,7 @@ mod tests {
             MappingBehavior::AddressAndPortDependent,
             MappingBehavior::Unknown,
         ] {
-            assert!(!describe_mapping(mapping).is_empty());
+            assert!(!mapping.describe().is_empty());
         }
     }
 }

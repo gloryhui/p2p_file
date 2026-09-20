@@ -5,6 +5,6 @@ pub mod portmap;
 pub mod punch;
 pub mod stun;
 
-pub use classify::{MappingBehavior, StunObservation, classify_mapping};
+pub use classify::{MappingBehavior, StunObservation, classify_mapping, observe};
 pub use punch::{PunchConfig, PunchToken, simultaneous_open, simultaneous_open_any};
-pub use stun::{StunResult, query_binding};
+pub use stun::{StunResult, query_binding, resolve_server};

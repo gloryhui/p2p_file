@@ -17,7 +17,7 @@ use crate::protocol::manifest::DEFAULT_CHUNK_SIZE;
 #[command(
     name = "p2p_file",
     version,
-    about = "点对点文件传输",
+    about = "点对点直连：NAT 穿透 + 文件传输 + 通用 TCP 隧道",
     propagate_version = true
 )]
 pub struct Cli {
@@ -99,13 +99,9 @@ pub enum Command {
 
     /// 查 STUN，看看本机在公网上是什么样子
     Stun {
-        /// STUN 服务器
-        #[arg(
-            long,
-            default_value = "stun.l.google.com:19302",
-            value_name = "HOST:PORT"
-        )]
-        server: String,
+        /// STUN 服务器，可重复指定。给多个才能判断 NAT 类型
+        #[arg(long, value_name = "HOST:PORT")]
+        server: Vec<String>,
 
         /// 超时（秒）
         #[arg(long, default_value_t = 3, value_name = "SECONDS")]
@@ -248,7 +244,7 @@ mod tests {
         ]);
         match cli.command {
             Command::Stun { server, timeout } => {
-                assert_eq!(server, "stun.example.com:3478");
+                assert_eq!(server, vec!["stun.example.com:3478".to_string()]);
                 assert_eq!(timeout, 7);
             }
             other => panic!("解析结果不对: {other:?}"),

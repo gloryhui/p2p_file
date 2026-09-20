@@ -14,7 +14,6 @@ use p2p_file::discovery::{LanDiscovery, parse_announcement};
 use p2p_file::error::{Error, Result};
 use p2p_file::identity::Identity;
 use p2p_file::nat::punch::PunchConfig;
-use p2p_file::nat::stun::{query_binding, resolve_server};
 use p2p_file::net::{DirectConfig, establish};
 use p2p_file::transfer::{receive_file, send_file};
 use p2p_file::transport::quic::{client_endpoint, connect, server_endpoint};
@@ -95,26 +94,75 @@ fn cmd_id(key_file: &Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_stun(server: &str, timeout_secs: u64) -> Result<()> {
-    let address = resolve_server(server).await?;
-    println!("查询 {address} ...");
+async fn cmd_stun(servers: &[String], timeout_secs: u64) -> Result<()> {
+    use p2p_file::nat::{classify_mapping, observe, resolve_server};
 
-    let result = query_binding(address, Duration::from_secs(timeout_secs)).await?;
+    // 没指定就用默认的那几个。要判断 NAT 类型至少需要两个不同的观测点。
+    let specs: Vec<String> = if servers.is_empty() {
+        p2p_file::net::DEFAULT_STUN_SERVERS
+            .iter()
+            .map(|spec| spec.to_string())
+            .collect()
+    } else {
+        servers.to_vec()
+    };
 
-    println!("公网映射:   {}", result.mapped_addr);
-    if let Some(origin) = result.response_origin {
-        println!("响应来源:   {origin}");
+    let mut addrs = Vec::new();
+    for spec in &specs {
+        match resolve_server(spec).await {
+            Ok(addr) => addrs.push(addr),
+            Err(err) => println!("跳过 {spec}：{err}"),
+        }
     }
-    if let Some(other) = result.other_address {
-        println!("备用地址:   {other}");
+    if addrs.is_empty() {
+        return Err(Error::Discovery("没有一个 STUN 服务器能解析出地址".into()));
     }
-    if let Some(software) = result.software {
-        println!("服务器软件: {software}");
+
+    // 所有查询必须共用同一个 socket。换个 socket 就是换个本地端口，
+    // 也就换了一个 NAT 映射，观测结果之间就没法比较了。
+    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+    println!(
+        "本地端口 {}，向 {} 个 STUN 服务器查询 ...",
+        socket.local_addr()?.port(),
+        addrs.len()
+    );
+    println!();
+
+    let timeout = Duration::from_secs(timeout_secs);
+    let observations = observe(&socket, &addrs, timeout).await?;
+    if observations.is_empty() {
+        return Err(Error::Discovery(
+            "所有 STUN 服务器都没有响应（网络不通或者被防火墙挡了）".into(),
+        ));
+    }
+
+    for obs in &observations {
+        println!(
+            "  {:<28} 看到的是 {}",
+            obs.server.to_string(),
+            obs.mapped_addr
+        );
+    }
+
+    let behavior = classify_mapping(&observations);
+    println!();
+    println!("NAT 映射行为: {}", behavior.describe());
+
+    if observations.len() < 2 {
+        println!("（只成功查到 1 个服务器，判断不准。多给几个 --server 会更可靠）");
+    } else if behavior.punchable() {
+        println!("这个类型可以打洞，直接按 README 的步骤部署即可。");
+    } else {
+        println!();
+        println!("这个类型打洞基本没戏。两条路：");
+        println!("  1. 在路由器上把 UDP 端口映射到本机，然后用 --advertise 指定对外地址");
+        println!("  2. 等中继（TURN / relay）支持——目前还没做");
     }
 
     println!();
-    println!("这只是「这一次查询」看到的映射。要用来打洞必须复用同一个本地端口，");
-    println!("否则 NAT 给出的会是另一个映射。");
+    println!("注意：以上端口只是「这一次查询」看到的。打洞必须复用同一个本地端口，");
+    println!("否则 NAT 给出的会是另一个映射——这也是本项目把打洞和 QUIC 绑在同一个");
+    println!("socket 上的原因。");
     Ok(())
 }
 
