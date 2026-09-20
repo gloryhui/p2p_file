@@ -1,0 +1,46 @@
+# ---- 通用 ----
+*.log
+*.tmp
+*.swp
+.DS_Store
+Thumbs.db
+.env
+.env.*
+!.env.example
+
+# ---- Node.js / 前端 ----
+node_modules/
+dist/
+build/
+out/
+coverage/
+.vite/
+.next/
+*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Go ----
+/bin/
+*.test
+*.out
+
+# ---- Rust ----
+target/
+
+# ---- 编辑器 / IDE ----
+.idea/
+.vscode/
+*.code-workspace
