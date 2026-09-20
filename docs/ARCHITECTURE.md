@@ -32,13 +32,20 @@ src/
 | 关注点 | 选择 | 理由 |
 | --- | --- | --- |
 | 异步运行时 | `tokio` | 生态标准，QUIC / UDP 都基于它 |
-| 数据通道 | `quinn`（QUIC） | 多路复用流、天然流控、内建 TLS 加密；适合多分片并行传输 |
-| 加密 / 身份 | QUIC 自带 `rustls`；身份用 `ed25519-dalek` | 用证书指纹绑定节点 ID，防中间人 |
+| 数据通道 | `quinn` 0.11 | 多路复用流、天然流控、内建 TLS 加密；适合多分片并行传输 |
+| TLS 后端 | `rustls` 0.23（经 `quinn::rustls` 复用） | 用 quinn 重新导出的版本，避免和 quinn 内部的 rustls 撞版本 |
+| 自签证书 | `rcgen` 0.14 | 服务端每次启动生成一张，身份不靠它 |
+| 加密 / 身份 | `ed25519-dalek` 3.0 | 公钥 → 节点 ID 自证，不需要 CA |
 | 分片校验 | `blake3` | 快，支持增量 / 树形哈希，便于分片级校验 |
-| 序列化 | `serde` + `postcard` 或 `bincode` | 控制消息体积小、无 schema 依赖 |
-| 端口映射 | `igd`（UPnP）、`natpmp` | 能直接映射时省掉打洞，成功率最高 |
-| 底层 UDP | `tokio::net::UdpSocket` + `socket2` | 打洞需要 SO_REUSEADDR / 固定本地端口 |
-| 依赖版本 | 写代码时再定 | 避免抄到过时版本，以 `cargo add` 实际解析为准 |
+| 序列化 | `serde` + `postcard`（`alloc`） | 控制消息体积小、无 schema 依赖 |
+| 局域网发现 | `mdns-sd` 0.21 | 自己搓 DNS 报文解析性价比太低，握手和 STUN 才是重点 |
+| 网卡枚举 | `if-addrs` 0.15 | 取本机非环回地址，供 mDNS 公告与候选排序 |
+| 命令行 | `clap` 4（derive） | 标准选择 |
+| 日志 | `tracing` + `tracing-subscriber` | 结构化日志，`RUST_LOG` 可覆盖 |
+| 端口映射 | `igd`（UPnP）、NAT-PMP | **尚未引入**，见 M3；先不占依赖 |
+
+实际锁定的版本以 `Cargo.toml` 和 `Cargo.lock` 为准（`Cargo.lock` 应当提交，
+因为这是二进制程序）。
 
 ### 备选路线
 
@@ -87,11 +94,52 @@ src/
 
 ## 6. 里程碑
 
-- **M0** 工具链 + cargo 项目骨架，能 `cargo run`
-- **M1** 局域网：mDNS 发现 + QUIC 直连，传单个文件，校验与续传跑通
-- **M2** 公网：STUN 获取映射 → 信令交换候选 → 同时打洞 → QUIC 握手成功
-- **M3** 兜底：对称 NAT 下走中继；UPnP / NAT-PMP 主动映射
-- **M4** 完善：身份认证、多文件 / 目录、进度条、断点续传状态管理
+- **M0** ✅ 工具链 + cargo 项目骨架，能 `cargo run`
+- **M1** ✅ 局域网：mDNS 发现 + QUIC 直连，传单个文件，校验与续传跑通
+- **M2** 🚧 公网：STUN 获取映射已完成，**信令交换候选与打洞串联尚未实现**
+- **M3** ⛔ 兜底：对称 NAT 下走中继；UPnP / NAT-PMP 主动映射
+- **M4** ⛔ 完善：多文件 / 目录、进度条、断点续传状态管理
+
+### 实现进度与验证情况
+
+已完整实现并通过测试的部分：
+
+| 模块 | 说明 |
+| --- | --- |
+| `identity` | 密钥生成/加载/保存（0600）、节点 ID 推导、签名校验 |
+| `protocol::manifest` | 分片哈希、根哈希、清单序列化与篡改检测、文件名清洗 |
+| `protocol::message` / `frame` | 控制消息、握手签名载荷（与角色无关）、长度前缀帧 |
+| `transport::handshake` | 双向认证，挡住冒用节点 ID 与错误签名 |
+| `transport::quic` | 自签证书 + 跳过 TLS 校验 + 应用层身份；keepalive 10s / 空闲 30s |
+| `storage` | `.part` + 位图、原子写位图、长度不符则重来、同名不覆盖 |
+| `transfer` | 拉模型分片传输（窗口 16）、坏片拒收、收尾核对根哈希 |
+| `nat::stun` | 手写 RFC 5389 子集，含 XOR-MAPPED-ADDRESS 与 FINGERPRINT |
+| `nat::classify` | 由多次观测推断映射行为 |
+| `nat::punch` | 同时开启探测循环 + keepalive |
+
+真实验证过的行为（不只是单测）：
+
+- 两个真实进程之间传输 3.8 MB 文件，15 个分片，sha256 一致，无 `.part`/`.bitmap` 残留，Ctrl-C 正常退出。
+- 手写 STUN 对 `stun.l.google.com`、`stun.miwifi.com`、`stun.fitauto.ru`、`stun.cloudflare.com` 均成功取回公网映射。其中 Cloudflare **必须带 FINGERPRINT** 才应答，这也是补上指纹校验的原因。
+- 密钥文件权限确认为 `0600`。
+
+### STUN 实现说明
+
+- 只实现 Binding 请求/响应，不做认证（用不着：认证在应用层握手）。
+- **总是**附带 FINGERPRINT（`0x8028`），CRC-32/ISO-HDLC 后与 `0x5354554E` 异或，必须是最后一个属性。
+- 收到带 FINGERPRINT 的报文会强制校验；不带指纹的报文仍然接受（兼容老服务器）。
+- 地址属性同时支持 IPv4 与 IPv6 的 XOR 编码。
+- 校验时按事务 ID 过滤，避免把别的报文（比如打洞探测包）当成 STUN 响应。
+
+### 已知问题 / 下一步
+
+1. **信令未实现**，所以跨公网还不能自动对接（M2 的主要缺口）。
+2. 打洞缺少中继协助对齐时机，也没有端口预测，对称 NAT 下会失败。
+3. `classify` 只判映射行为，没判过滤行为（需要 `CHANGE-REQUEST` 支持）。
+4. 文件读写用的是同步 IO，跑在大文件时会阻塞异步执行器，应挪进 `spawn_blocking`。
+5. 分片数据和控制消息共用一条流，应拆成独立单向流。
+6. `transport::quic` 跳过证书校验是**有意**的，前提是每次连接都必须跑完应用层握手；这个约束不能破坏。
+
 
 ## 7. 待定问题
 
