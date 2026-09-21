@@ -16,7 +16,11 @@ pub use sender::{SendReport, send_file};
 mod tests {
     use super::*;
     use crate::identity::Identity;
+    use crate::protocol::frame::{read_frame, write_frame};
     use crate::protocol::manifest::MIN_CHUNK_SIZE;
+    use crate::protocol::message::ControlMessage;
+    use crate::transport::handshake::handshake_responder;
+    use crate::transport::quic::ChannelBinding;
     use crate::transport::quic::{client_endpoint, connect, server_endpoint};
     use std::fs;
     use std::io::Write;
@@ -332,6 +336,68 @@ mod tests {
         );
         assert!(!recv_dir.join("finalize.bin").is_file());
 
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 没有 finalize 成功证明时，receiver 发送 Bye 不能让 sender 假报成功。
+    #[tokio::test]
+    async fn receiver_only_sends_bye_sender_fails() {
+        let dir = temp_dir("sender_bye_without_complete");
+        let source = dir.join("payload.bin");
+        fs::write(&source, vec![0x37u8; MIN_CHUNK_SIZE as usize]).unwrap();
+
+        let sender_identity = Identity::generate();
+        let receiver_identity = Identity::generate();
+        let server = server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let receiver_task = tokio::spawn(async move {
+            let incoming = server.accept().await.unwrap();
+            let connection = incoming.await.unwrap();
+            let binding = ChannelBinding::from_connection(&connection).unwrap();
+            let (mut handshake_send, mut handshake_recv) = connection.accept_bi().await.unwrap();
+            handshake_responder(
+                &mut handshake_send,
+                &mut handshake_recv,
+                &receiver_identity,
+                &binding,
+            )
+            .await
+            .unwrap();
+            let _ = handshake_send.finish();
+
+            let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+            let manifest = match read_frame(&mut recv).await.unwrap().unwrap() {
+                ControlMessage::Manifest(manifest) => *manifest,
+                other => panic!("sender 应先发送 Manifest，实际 {}", other.kind()),
+            };
+            write_frame(
+                &mut send,
+                &ControlMessage::Resume {
+                    have: ChunkBitmap::new(manifest.chunk_count()).to_bytes(),
+                },
+            )
+            .await
+            .unwrap();
+            write_frame(&mut send, &ControlMessage::Bye).await.unwrap();
+            let _ = send.finish();
+            connection.closed().await;
+        });
+
+        let client = client_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let connection = connect(&client, server_addr, "127.0.0.1").await.unwrap();
+        let result = send_file(&connection, &sender_identity, &source, MIN_CHUNK_SIZE).await;
+        let error = result.expect_err("没有 Complete 时 sender 必须失败");
+        assert!(
+            error.to_string().contains("Complete"),
+            "应明确说明缺少 Complete，实际: {error}"
+        );
+        connection.close(0u32.into(), b"test complete required");
+        client.wait_idle().await;
+        tokio::time::timeout(Duration::from_secs(10), receiver_task)
+            .await
+            .expect("伪 receiver 应在 10 秒内结束")
+            .unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }
 }

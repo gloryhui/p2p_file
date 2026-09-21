@@ -8,15 +8,16 @@ use crate::protocol::manifest::{ChunkHash, FileManifest};
 
 /// 协议版本。不兼容改动时递增。
 ///
-/// v2：握手签名载荷加入 TLS 会话绑定值（见 [`handshake_payload`]）。v1 节点与
-/// 本版本签名载荷不同，双方会在握手阶段以明确的版本错误互相拒绝。
-pub const PROTOCOL_VERSION: u32 = 2;
+/// v3：文件传输的 `Complete` 只在接收端 finalize 成功后发送；同时保留 v2 的
+/// TLS 会话绑定握手。v2 节点仍使用 finalize 前的 Complete 语义，必须在握手阶段
+/// 以明确的版本错误拒绝，不能静默互通。
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// 握手签名的用途标签，避免签名被挪用到别处。
 ///
-/// 载荷格式在 v2 改成了「双方公钥 + 双方随机数 + 会话绑定值」，标签同步升到 v2，
-/// 让两种签名方案在域上就分开。
-pub const HANDSHAKE_DOMAIN: &[u8] = b"p2p_file/handshake/v2";
+/// 载荷格式在 v2 改成了「双方公钥 + 双方随机数 + 会话绑定值」。v3 的传输完成
+/// 语义也不与旧节点混用，因此握手域同步升到 v3。
+pub const HANDSHAKE_DOMAIN: &[u8] = b"p2p_file/handshake/v3";
 
 /// 握手/传输通道上流动的消息。
 ///

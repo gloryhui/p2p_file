@@ -299,8 +299,9 @@ A、B 的签名和随机数各自自洽，验证全过，但业务流量实际�
 `ChannelBinding::from_connection`（生产代码里没有别的构造方式）。所有握手调用点都必须先
 从**当前连接**导出绑定值，不能传常量、空值或自己生成的随机数。
 
-**兼容性。** 载荷格式变了，`PROTOCOL_VERSION` 从 1 升到 2，`HANDSHAKE_DOMAIN` 同步升到
-`p2p_file/handshake/v2`。新旧节点在 `Hello`/`HelloAck` 里都会先校验版本并**明确拒绝**
+**兼容性。** 会话绑定载荷变更时 `PROTOCOL_VERSION` 从 1 升到 2；本次文件传输完成
+语义改为 finalize 成功后才发送 `Complete`，因此再从 2 升到 3，`HANDSHAKE_DOMAIN`
+同步为 `p2p_file/handshake/v3`。新旧节点在 `Hello`/`HelloAck` 里都会先校验版本并**明确拒绝**
 （`协议版本不兼容`），不会走到签名校验再报含糊错误；mDNS 公告也会按版本过滤。
 
 ## 5. 文件传输协议要点

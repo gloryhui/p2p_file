@@ -151,7 +151,9 @@ pub async fn send_file_after_handshake(
             ControlMessage::Abort { reason } => {
                 return Err(Error::Protocol(format!("对端中止传输: {reason}")));
             }
-            ControlMessage::Bye => break,
+            ControlMessage::Bye => {
+                return Err(Error::Protocol("对端在发送 Complete 前结束传输".into()));
+            }
             other => {
                 return Err(Error::Protocol(format!(
                     "发送过程中收到意外消息 {}",
