@@ -39,6 +39,7 @@ use crate::protocol::message::ControlMessage;
 use crate::transfer::receiver::receive_file_on_stream;
 use crate::transfer::sender::{SendReport, send_file_after_handshake};
 use crate::transport::handshake::{handshake_initiator, handshake_responder};
+use crate::transport::quic::ChannelBinding;
 
 /// 空闲多久后重新打洞（默认 2 分钟，比常见的 NAT 映射超时短一些）。
 pub const DEFAULT_RE_PUNCH_AFTER: Duration = Duration::from_secs(120);
@@ -190,12 +191,15 @@ async fn serve_connection(
 ) -> Result<()> {
     let remote = connection.remote_address();
 
-    // 第一条流用于应用层握手，确认对端身份。
+    // 第一条流用于应用层握手，确认对端身份。会话绑定值取自这条连接：
+    // 签名因此被钉死在这条 TLS 会话上，转发到别的会话必然验不过。
+    let binding = ChannelBinding::from_connection(&connection)?;
     let (mut handshake_send, mut handshake_recv) = connection
         .accept_bi()
         .await
         .map_err(|err| Error::Transport(format!("接受握手流失败: {err}")))?;
-    let outcome = handshake_responder(&mut handshake_send, &mut handshake_recv, identity).await?;
+    let outcome =
+        handshake_responder(&mut handshake_send, &mut handshake_recv, identity, &binding).await?;
     let _ = handshake_send.finish();
 
     let peer_id = outcome.peer_node_id;
@@ -441,11 +445,13 @@ async fn open_session(link: &DirectLink, identity: &Identity) -> Result<Connecti
     // 按候选顺序尝试连接，而不是只试打洞确认过的那个。
     let connection = link.connect().await?;
 
+    // 绑定值必须来自刚建立的这条连接，不能复用别的会话。
+    let binding = ChannelBinding::from_connection(&connection)?;
     let (mut send, mut recv) = connection
         .open_bi()
         .await
         .map_err(|err| Error::Transport(format!("打开握手流失败: {err}")))?;
-    let outcome = handshake_initiator(&mut send, &mut recv, identity).await?;
+    let outcome = handshake_initiator(&mut send, &mut recv, identity, &binding).await?;
     let _ = send.finish();
 
     if outcome.peer_node_id != link.peer_node_id {

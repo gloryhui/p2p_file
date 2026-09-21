@@ -44,7 +44,7 @@ src/
         │   UDP 同时打洞（同一 socket）
         └────────────┬────────────┘
                      │
-          QUIC 直连（TLS 1.3 + 应用层双向认证）
+          QUIC 直连（TLS 1.3 + Ed25519 双向认证，签名绑定当前会话）
                      │
         ┌────────────┴────────────┐
    文件流（Manifest）        隧道流（TunnelOpen → 转发到白名单目标）
@@ -58,6 +58,7 @@ src/
 | 数据通道 | `quinn` 0.11 | 多路复用流、天然流控、内建 TLS 加密；适合多分片并行传输 |
 | TLS 后端 | `rustls` 0.23（经 `quinn::rustls` 复用） | 用 quinn 重新导出的版本，避免和 quinn 内部的 rustls 撞版本 |
 | 自签证书 | `rcgen` 0.14 | 服务端每次启动生成一张，身份不靠它 |
+| 会话绑定 | TLS exporter（RFC 5705，`quinn::Connection::export_keying_material`） | 把 Ed25519 签名钉死在这一条 TLS 会话上，堵住透明 MITM 转发握手 |
 | 加密 / 身份 | `ed25519-dalek` 3.0 | 公钥 → 节点 ID 自证，不需要 CA |
 | 分片校验 | `blake3` | 快，支持增量 / 树形哈希，便于分片级校验 |
 | 序列化 | `serde` + `postcard`（`alloc`） | 控制消息体积小、无 schema 依赖 |
@@ -207,6 +208,43 @@ RST（`Err`），提前返回，节点就永远留在「在线」表里——服
 搬运用 `tokio::io::copy_bidirectional` 的等价手写实现（`splice`），
 两个方向各自独立，任一方向结束就关掉这条流。
 
+## 4.7 应用层握手与会话绑定
+
+TLS 证书是自签的，客户端也**有意**跳过证书校验（`SkipServerVerification`）：
+证书不承担身份，身份由第一条双向流上的 Ed25519 应用层握手承担。
+
+```
+发起方                                接收方
+  Hello { id, pubkey, nonce_a }  ──────►
+                                 ◄────── HelloAck { id, pubkey, nonce_b, sig_b }
+  Auth { sig_a }                 ──────►
+                                 ◄────── Ready
+```
+
+签名载荷（`protocol::message::handshake_payload`）：
+
+```
+HANDSHAKE_DOMAIN
++ 双方公钥与随机数（按公钥字节序排序，保证与角色无关）
++ 当前 QUIC/TLS 会话导出的 32 字节 channel binding
+```
+
+**为什么必须带 channel binding。** 只签“双方公钥 + 随机数”时，认证与 TLS 会话是解耦的：
+攻击者可以建立两条独立连接 `A ↔ M`、`M ↔ B`，把 `Hello / HelloAck / Auth` 原样搬运。
+A、B 的签名和随机数各自自洽，验证全过，但业务流量实际经过 M，M 能看到明文、也能改写。
+
+绑定值由 `quinn::Connection::export_keying_material(output, b"p2p_file/channel-binding/v1", b"")`
+从当前会话的 TLS 密钥材料导出。同一条会话两侧导出相同，不同会话导出的是各自独立的
+伪随机值，因此搬运过去的签名必然验不过。
+
+安全约束收敛在类型上：`transport::quic::ChannelBinding` 字段私有，唯一的公开构造入口是
+`ChannelBinding::from_connection`（生产代码里没有别的构造方式）。所有握手调用点都必须先
+从**当前连接**导出绑定值，不能传常量、空值或自己生成的随机数。
+
+**兼容性。** 载荷格式变了，`PROTOCOL_VERSION` 从 1 升到 2，`HANDSHAKE_DOMAIN` 同步升到
+`p2p_file/handshake/v2`。新旧节点在 `Hello`/`HelloAck` 里都会先校验版本并**明确拒绝**
+（`协议版本不兼容`），不会走到签名校验再报含糊错误；mDNS 公告也会按版本过滤。
+
 ## 5. 文件传输协议要点
 
 - **分片**：固定大小分片（建议 256KB ~ 1MB）；每片单独校验、单独重传。
@@ -232,9 +270,9 @@ RST（`Err`），提前返回，节点就永远留在「在线」表里——服
 | --- | --- |
 | `identity` | 密钥生成/加载/保存（0600）、节点 ID 推导、签名校验 |
 | `protocol::manifest` | 分片哈希、根哈希、清单序列化与篡改检测、文件名清洗 |
-| `protocol::message` / `frame` | 控制消息、握手签名载荷（与角色无关）、长度前缀帧 |
-| `transport::handshake` | 双向认证，挡住冒用节点 ID 与错误签名 |
-| `transport::quic` | 自签证书 + 跳过 TLS 校验 + 应用层身份；keepalive 10s / 空闲 30s |
+| `protocol::message` / `frame` | 控制消息、握手签名载荷（与角色无关、含会话绑定值）、长度前缀帧 |
+| `transport::handshake` | 双向认证，挡住冒用节点 ID 与错误签名；签名绑定当前 TLS 会话，挡住透明 MITM 转发 |
+| `transport::quic` | 自签证书 + 跳过 TLS 校验 + 应用层身份 + TLS exporter 会话绑定；keepalive 10s / 空闲 30s |
 | `storage` | `.part` + 位图、原子写位图、长度不符则重来、同名不覆盖 |
 | `transfer` | 拉模型分片传输（窗口 16）、坏片拒收、收尾核对根哈希 |
 | `nat::stun` | 手写 RFC 5389 子集，含 XOR-MAPPED-ADDRESS 与 FINGERPRINT |
@@ -278,8 +316,8 @@ RST（`Err`），提前返回，节点就永远留在「在线」表里——服
 7. `serve` 空闲后会回到「等对端」状态，此时它在自家 NAT 上没有映射。
    这没问题（重新打洞时映射会重建），但意味着对端必须能通过信令唤醒它——
    如果信令服务器挂了，已经建立的隧道会继续工作，但断线后无法重连。
-8. `transport::quic` 跳过证书校验是**有意**的，前提是每次连接都必须跑完应用层握手；
-   这个约束不能破坏。
+8. `transport::quic` 跳过证书校验是**有意**的，前提是每次连接都必须跑完应用层握手，
+   而且握手签名必须覆盖当前会话的绑定值（见 §4.7）；这两个约束都不能破坏。
 9. 信令服务器是单点，且重启后在线表清空（客户端会重新登记，但需要一次重试）。
    另外它对客户端没有鉴权——任何人都能登记节点 ID。这不影响数据安全
    （数据不经过它，且应用层有双向认证），但可以被用来骚扰牵线。

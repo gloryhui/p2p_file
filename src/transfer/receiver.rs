@@ -12,6 +12,7 @@ use crate::protocol::manifest::FileManifest;
 use crate::protocol::message::ControlMessage;
 use crate::storage::PartialDownload;
 use crate::transport::handshake::handshake_responder;
+use crate::transport::quic::ChannelBinding;
 
 /// 同时在途的请求数。
 ///
@@ -40,12 +41,14 @@ pub async fn receive_file(
     identity: &Identity,
     out_dir: &Path,
 ) -> Result<ReceiveReport> {
-    // 1. 握手（对上发送端的第一条双向流）。
+    // 1. 握手（对上发送端的第一条双向流）。会话绑定值取自这条连接本身。
+    let binding = ChannelBinding::from_connection(connection)?;
     let (mut handshake_send, mut handshake_recv) = connection
         .accept_bi()
         .await
         .map_err(|err| Error::Transport(format!("接受握手流失败: {err}")))?;
-    let outcome = handshake_responder(&mut handshake_send, &mut handshake_recv, identity).await?;
+    let outcome =
+        handshake_responder(&mut handshake_send, &mut handshake_recv, identity, &binding).await?;
     let _ = handshake_send.finish();
 
     // 2. 收清单并开数据流。

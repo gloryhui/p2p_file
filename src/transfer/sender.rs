@@ -12,6 +12,7 @@ use crate::protocol::message::ControlMessage;
 use crate::transfer::chunker::{manifest_from_path, read_chunk};
 use crate::transfer::resume::ChunkBitmap;
 use crate::transport::handshake::handshake_initiator;
+use crate::transport::quic::ChannelBinding;
 
 /// 发送结果。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,12 +39,15 @@ pub async fn send_file(
     path: &Path,
     chunk_size: u32,
 ) -> Result<SendReport> {
-    // 1. 握手（占第一条双向流）。
+    // 1. 握手（占第一条双向流）。会话绑定值必须从**这条**连接导出，
+    //    签名才会被钉死在这条 TLS 会话上，挡住透明 MITM 转发。
+    let binding = ChannelBinding::from_connection(connection)?;
     let (mut handshake_send, mut handshake_recv) = connection
         .open_bi()
         .await
         .map_err(|err| Error::Transport(format!("打开握手流失败: {err}")))?;
-    let outcome = handshake_initiator(&mut handshake_send, &mut handshake_recv, identity).await?;
+    let outcome =
+        handshake_initiator(&mut handshake_send, &mut handshake_recv, identity, &binding).await?;
     // 握手流用完就关，让对端的读取干净结束。
     let _ = handshake_send.finish();
 

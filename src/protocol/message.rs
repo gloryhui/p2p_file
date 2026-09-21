@@ -7,10 +7,16 @@ use crate::identity::NodeId;
 use crate::protocol::manifest::{ChunkHash, FileManifest};
 
 /// 协议版本。不兼容改动时递增。
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// v2：握手签名载荷加入 TLS 会话绑定值（见 [`handshake_payload`]）。v1 节点与
+/// 本版本签名载荷不同，双方会在握手阶段以明确的版本错误互相拒绝。
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// 握手签名的用途标签，避免签名被挪用到别处。
-pub const HANDSHAKE_DOMAIN: &[u8] = b"p2p_file/handshake/v1";
+///
+/// 载荷格式在 v2 改成了「双方公钥 + 双方随机数 + 会话绑定值」，标签同步升到 v2，
+/// 让两种签名方案在域上就分开。
+pub const HANDSHAKE_DOMAIN: &[u8] = b"p2p_file/handshake/v2";
 
 /// 握手/传输通道上流动的消息。
 ///
@@ -102,12 +108,22 @@ impl ControlMessage {
 /// 握手签名载荷。
 ///
 /// 双方都要算出**完全相同**的字节串。为避免依赖「谁是发起方」，
-/// 这里按公钥字节序排序后拼接，两侧结果自然一致。
+/// 前四项按公钥字节序排序后拼接，两侧结果自然一致。
+///
+/// `channel_binding` 是当前 QUIC/TLS 会话导出的绑定值（见
+/// [`crate::transport::quic::ChannelBinding`]），附加在末尾。因为两侧会话相同、
+/// 导出的绑定值相同，排序后的角色无关性仍然成立。
+///
+/// 为什么必须带上它：只签「双方公钥 + 随机数」时，中间人可以建两条独立
+/// TLS 会话（A↔M、M↔B），把 A 侧握手的消息原样搬到 B 侧。A、B 的签名和随机数
+/// 都自洽，验证全过，但业务流量实际经过 M。把会话绑定值写进签名载荷后，
+/// 搬运过去的签名用的是**另一条**会话的绑定值，必然验不过。
 pub fn handshake_payload(
     public_key_a: &[u8; 32],
     nonce_a: &[u8; 32],
     public_key_b: &[u8; 32],
     nonce_b: &[u8; 32],
+    channel_binding: &[u8; 32],
 ) -> Vec<u8> {
     let (first, second) = if public_key_a <= public_key_b {
         ((public_key_a, nonce_a), (public_key_b, nonce_b))
@@ -115,12 +131,13 @@ pub fn handshake_payload(
         ((public_key_b, nonce_b), (public_key_a, nonce_a))
     };
 
-    let mut payload = Vec::with_capacity(HANDSHAKE_DOMAIN.len() + 2 * (32 + 32));
+    let mut payload = Vec::with_capacity(HANDSHAKE_DOMAIN.len() + 2 * (32 + 32) + 32);
     payload.extend_from_slice(HANDSHAKE_DOMAIN);
     payload.extend_from_slice(first.0);
     payload.extend_from_slice(first.1);
     payload.extend_from_slice(second.0);
     payload.extend_from_slice(second.1);
+    payload.extend_from_slice(channel_binding);
     payload
 }
 
@@ -186,18 +203,21 @@ mod tests {
         let bob = Identity::generate();
         let nonce_a = [0xaa; 32];
         let nonce_b = [0xbb; 32];
+        let binding = [0xcc; 32];
 
         let from_alice = handshake_payload(
             &alice.public_key_bytes(),
             &nonce_a,
             &bob.public_key_bytes(),
             &nonce_b,
+            &binding,
         );
         let from_bob = handshake_payload(
             &bob.public_key_bytes(),
             &nonce_b,
             &alice.public_key_bytes(),
             &nonce_a,
+            &binding,
         );
         assert_eq!(from_alice, from_bob, "双方算出的握手载荷必须一致");
     }
@@ -206,19 +226,54 @@ mod tests {
     fn 握手载荷对随机数敏感() {
         let alice = Identity::generate();
         let bob = Identity::generate();
+        let binding = [0u8; 32];
         let base = handshake_payload(
             &alice.public_key_bytes(),
             &[1u8; 32],
             &bob.public_key_bytes(),
             &[2u8; 32],
+            &binding,
         );
         let changed = handshake_payload(
             &alice.public_key_bytes(),
             &[1u8; 32],
             &bob.public_key_bytes(),
             &[3u8; 32],
+            &binding,
         );
         assert_ne!(base, changed, "随机数必须进入签名载荷，防重放");
+    }
+
+    #[test]
+    fn 握手载荷对会话绑定敏感() {
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let nonce_a = [1u8; 32];
+        let nonce_b = [2u8; 32];
+
+        let base = handshake_payload(
+            &alice.public_key_bytes(),
+            &nonce_a,
+            &bob.public_key_bytes(),
+            &nonce_b,
+            &[0x11; 32],
+        );
+        // 只翻转 1 bit：载荷必须随之改变，否则绑定形同虚设。
+        let mut flipped = [0x11u8; 32];
+        flipped[7] ^= 0x01;
+        let changed = handshake_payload(
+            &alice.public_key_bytes(),
+            &nonce_a,
+            &bob.public_key_bytes(),
+            &nonce_b,
+            &flipped,
+        );
+        assert_ne!(base, changed, "会话绑定值必须进入签名载荷");
+
+        // 绑定值必须真的被拼进去，而不是被忽略。
+        let mut expected_tail = [0u8; 32];
+        expected_tail.copy_from_slice(&base[base.len() - 32..]);
+        assert_eq!(expected_tail, [0x11u8; 32], "载荷末尾应当是绑定值");
     }
 
     #[test]
@@ -228,12 +283,14 @@ mod tests {
         let mallory = Identity::generate();
         let nonce_a = [7u8; 32];
         let nonce_b = [8u8; 32];
+        let binding = [9u8; 32];
 
         let payload = handshake_payload(
             &alice.public_key_bytes(),
             &nonce_a,
             &bob.public_key_bytes(),
             &nonce_b,
+            &binding,
         );
 
         // Bob 用自己算出的载荷验证 Alice 的签名。
@@ -242,6 +299,7 @@ mod tests {
             &nonce_b,
             &alice.public_key_bytes(),
             &nonce_a,
+            &binding,
         );
         assert_eq!(payload, alice_payload);
 
