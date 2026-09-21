@@ -23,6 +23,8 @@ use crate::transfer::resume::ChunkBitmap;
 const PART_SUFFIX: &str = "part";
 /// 位图文件后缀。
 const BITMAP_SUFFIX: &str = "bitmap";
+/// 正式文件最多尝试的带编号候选数；耗尽后明确失败，绝不回退到原名覆盖。
+const MAX_FINALIZE_SUFFIX: u32 = 10_000;
 
 /// 一个进行中的下载。
 pub struct PartialDownload {
@@ -200,8 +202,11 @@ impl PartialDownload {
         // 先关句柄再改名：Unix 上无所谓，Windows 上文件被占用就改不动。
         self.file = None;
 
-        let target = unique_path(&self.target_path);
-        fs::rename(&self.temp_path, &target)?;
+        // `hard_link` 在目标目录项已存在时原子失败，不会跟随或覆盖普通文件、
+        // symlink 或 Windows reparse point。成功后删除同一目录中的 `.part`，
+        // 从而把已经 sync 的 inode 交给正式文件名；失败时只尝试下一个名字，
+        // 绝不退回到可能覆盖目标的 rename。
+        let target = publish_no_replace(&self.temp_path, &self.target_path)?;
         sync_parent_dir(&target)?;
         remove_file_if_exists(&self.state_path)?;
         sync_parent_dir(&self.state_path)?;
@@ -303,12 +308,10 @@ fn sync_parent_dir(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 目标文件已存在时另找一个名字，避免覆盖用户已有的文件。
-fn unique_path(target: &Path) -> PathBuf {
-    if !target.exists() {
-        return target.to_path_buf();
-    }
-
+/// 生成正式文件候选名。这里不检查存在性；是否可用只能由原子 publish 操作决定。
+fn candidate_paths(target: &Path, max_suffix: u32) -> Vec<PathBuf> {
+    let mut candidates = Vec::with_capacity(max_suffix as usize + 1);
+    candidates.push(target.to_path_buf());
     let dir = target.parent().unwrap_or_else(|| Path::new("."));
     let stem = target
         .file_stem()
@@ -316,24 +319,73 @@ fn unique_path(target: &Path) -> PathBuf {
         .unwrap_or_else(|| "download".to_string());
     let ext = target.extension().map(|s| s.to_string_lossy().into_owned());
 
-    for counter in 1..10_000u32 {
+    for counter in 1..=max_suffix {
         let name = match &ext {
             Some(ext) => format!("{stem} ({counter}).{ext}"),
             None => format!("{stem} ({counter})"),
         };
-        let candidate = dir.join(name);
-        if !candidate.exists() {
-            return candidate;
+        candidates.push(dir.join(name));
+    }
+    candidates
+}
+
+/// 在同一目录内以 no-replace 语义发布临时文件。
+///
+/// `hard_link` 对目标目录项使用原子 create-new 语义：Linux 上对应 `link(2)`，
+/// Windows 上对应 `CreateHardLinkW`。两者都不会替换已存在的目录项，因此普通
+/// 文件、目录、symlink 和 reparse point 都只会被视为“这个名字已占用”。如果底层
+/// 文件系统不支持 hard link，则返回错误；这里绝不能退回 `rename`，否则会重新
+/// 引入跨平台覆盖风险。
+fn publish_no_replace(temp: &Path, target: &Path) -> Result<PathBuf> {
+    publish_no_replace_with(temp, target, MAX_FINALIZE_SUFFIX, |_| {})
+}
+
+fn publish_no_replace_with<F>(
+    temp: &Path,
+    target: &Path,
+    max_suffix: u32,
+    mut before_attempt: F,
+) -> Result<PathBuf>
+where
+    F: FnMut(&Path),
+{
+    for candidate in candidate_paths(target, max_suffix) {
+        before_attempt(&candidate);
+        match fs::hard_link(temp, &candidate) {
+            Ok(()) => {
+                // The link is now the formal name. Removing only our same-directory
+                // temp entry cannot overwrite another file; if removal fails, report
+                // failure and keep the bitmap for recovery instead of claiming success.
+                fs::remove_file(temp)?;
+                return Ok(candidate);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                // Some Windows reparse-point cases surface as PermissionDenied rather
+                // than AlreadyExists. `symlink_metadata` does not follow the name, so
+                // an existing directory entry is still safely treated as occupied.
+                match fs::symlink_metadata(&candidate) {
+                    Ok(_) => continue,
+                    Err(metadata_err) if metadata_err.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(err.into());
+                    }
+                    Err(metadata_err) => return Err(metadata_err.into()),
+                }
+            }
         }
     }
-    // 极端情况下退回原名，交给 rename 覆盖。
-    target.to_path_buf()
+
+    Err(Error::Protocol(format!(
+        "正式文件名已耗尽：{} 个候选均被占用",
+        max_suffix + 1
+    )))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::protocol::manifest::{ChunkHash, MIN_CHUNK_SIZE};
+    use std::sync::{Arc, Barrier};
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -640,6 +692,158 @@ mod tests {
         assert_eq!(fs::read(dir.join("same.bin")).unwrap(), existing);
         assert_eq!(fs::read(&out).unwrap(), content);
 
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn 连续候选被占用时选择下一个名字() {
+        let dir = temp_dir("collide_many");
+        let content = vec![4u8; 8];
+        let manifest = manifest_for(&content, "same.bin");
+        for name in ["same.bin", "same (1).bin", "same (2).bin"] {
+            fs::write(dir.join(name), b"reserved").unwrap();
+        }
+
+        let mut download = PartialDownload::create(&dir, manifest.clone()).unwrap();
+        download.write_chunk(0, &content).unwrap();
+        let out = download.finalize().unwrap();
+
+        assert_eq!(out.file_name().unwrap(), "same (3).bin");
+        for name in ["same.bin", "same (1).bin", "same (2).bin"] {
+            assert_eq!(fs::read(dir.join(name)).unwrap(), b"reserved");
+        }
+        assert_eq!(fs::read(&out).unwrap(), content);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn 两个同名下载并发收尾不会互相覆盖() {
+        let dir = temp_dir("collide_concurrent");
+        let first_content = vec![0x11u8; MIN_CHUNK_SIZE as usize];
+        let second_content = vec![0x22u8; MIN_CHUNK_SIZE as usize];
+        let first_manifest = manifest_for(&first_content, "same.bin");
+        let second_manifest = manifest_for(&second_content, "same.bin");
+
+        let mut first = PartialDownload::create(&dir, first_manifest).unwrap();
+        first.write_chunk(0, &first_content).unwrap();
+        let mut second = PartialDownload::create(&dir, second_manifest).unwrap();
+        second.write_chunk(0, &second_content).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let first_barrier = Arc::clone(&barrier);
+        let second_barrier = Arc::clone(&barrier);
+        let first_task = std::thread::spawn(move || {
+            first_barrier.wait();
+            first.finalize().unwrap()
+        });
+        let second_task = std::thread::spawn(move || {
+            second_barrier.wait();
+            second.finalize().unwrap()
+        });
+        let first_output = first_task.join().unwrap();
+        let second_output = second_task.join().unwrap();
+
+        assert_ne!(first_output, second_output, "并发 publish 必须拿到不同名字");
+        let outputs = [
+            fs::read(&first_output).unwrap(),
+            fs::read(&second_output).unwrap(),
+        ];
+        assert!(outputs.contains(&first_content));
+        assert!(outputs.contains(&second_content));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn candidate在提交瞬间被抢占时不会覆盖抢占者() {
+        let dir = temp_dir("collide_race");
+        let temp = dir.join("incoming.part");
+        let target = dir.join("same.bin");
+        fs::write(&temp, b"downloaded").unwrap();
+        let mut first_attempt = true;
+
+        let output = publish_no_replace_with(&temp, &target, 2, |candidate| {
+            if first_attempt {
+                first_attempt = false;
+                fs::write(candidate, b"racer").unwrap();
+            }
+        })
+        .unwrap();
+
+        assert_eq!(output.file_name().unwrap(), "same (1).bin");
+        assert_eq!(fs::read(&target).unwrap(), b"racer");
+        assert_eq!(fs::read(&output).unwrap(), b"downloaded");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn 名称耗尽返回明确错误且不覆盖已有内容() {
+        let dir = temp_dir("collide_exhausted");
+        let temp = dir.join("incoming.part");
+        let target = dir.join("same.bin");
+        fs::write(&temp, b"downloaded").unwrap();
+        for candidate in candidate_paths(&target, 2) {
+            fs::write(candidate, b"reserved").unwrap();
+        }
+
+        let error = publish_no_replace_with(&temp, &target, 2, |_| {})
+            .expect_err("所有候选占用时必须明确失败");
+        assert!(
+            error.to_string().contains("耗尽"),
+            "错误应说明候选耗尽，实际: {error}"
+        );
+        assert_eq!(fs::read(&temp).unwrap(), b"downloaded");
+        for candidate in candidate_paths(&target, 2) {
+            assert_eq!(fs::read(candidate).unwrap(), b"reserved");
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 已存在_symlink按占名处理且不跟随覆盖() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir("collide_symlink");
+        let real = dir.join("protected.txt");
+        let target = dir.join("same.bin");
+        fs::write(&real, b"protected").unwrap();
+        symlink(&real, &target).unwrap();
+
+        let temp = dir.join("incoming.part");
+        fs::write(&temp, b"downloaded").unwrap();
+        let output = publish_no_replace(&temp, &target).unwrap();
+
+        assert_eq!(output.file_name().unwrap(), "same (1).bin");
+        assert_eq!(fs::read(&real).unwrap(), b"protected");
+        assert_eq!(fs::read(&target).unwrap(), b"protected");
+        assert_eq!(fs::read(&output).unwrap(), b"downloaded");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn 已存在_reparse_point按占名处理() {
+        use std::os::windows::fs::symlink_file;
+
+        let dir = temp_dir("collide_reparse");
+        let real = dir.join("protected.txt");
+        let target = dir.join("same.bin");
+        fs::write(&real, b"protected").unwrap();
+        // GitHub Windows runners normally permit this. If a local runner lacks
+        // SeCreateSymbolicLinkPrivilege, a directory still verifies the crucial
+        // no-replace boundary: hard_link must treat the occupied name as used.
+        let is_symlink = symlink_file(&real, &target).is_ok();
+        if !is_symlink {
+            fs::create_dir(&target).unwrap();
+        }
+
+        let temp = dir.join("incoming.part");
+        fs::write(&temp, b"downloaded").unwrap();
+        let output = publish_no_replace(&temp, &target).unwrap();
+
+        assert_eq!(output.file_name().unwrap(), "same (1).bin");
+        assert_eq!(fs::read(&real).unwrap(), b"protected");
+        assert_eq!(fs::read(&output).unwrap(), b"downloaded");
         fs::remove_dir_all(&dir).unwrap();
     }
 
