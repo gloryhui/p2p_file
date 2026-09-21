@@ -175,19 +175,61 @@ RST（`Err`），提前返回，节点就永远留在「在线」表里——服
 [u32 小端长度][postcard 负载]
 ```
 
+信令跑在明文 TCP 上，任何人都能连上来，所以「登记」必须自证身份。
+`SIGNAL_PROTOCOL_VERSION = 2`（v1 是无认证的 `Register`，两者不兼容：新版对 v1
+的握手会明确拒绝，不会静默降级到无认证路径）：
+
+```
+客户端                                      服务器
+  RegisterHello { ver, id, pubkey }     ───►
+                                        ◄─── RegisterChallenge { ver, nonce }
+  Register { id, pubkey, cands, sig }   ───►
+                                        ◄─── Registered | Error
+```
+
+`sig` 覆盖 `REGISTER_DOMAIN + nonce + node_id + public_key + blake3(postcard(candidates))`：
+
+- `node_id == hash(public_key)` 只说明公钥自洽，**不**证明持有私钥；签名才证明。
+- `nonce` 每条连接新生成、一次性使用（有 TTL），旧连接的 `Register` 重放会失败。
+- 候选地址进签名：明文信令上的中间人因此无法把对端引到别的地址。
+
 | 消息 | 方向 | 用途 |
 | --- | --- | --- |
-| `Register { node_id, public_key, candidates }` | C→S | 登记自己 + 公布候选地址 |
+| `RegisterHello { ver, node_id, public_key }` | C→S | 声明身份，开始注册 |
+| `RegisterChallenge { ver, challenge }` | S→C | 本次连接的注册挑战 |
+| `Register { node_id, public_key, candidates, signature }` | C→S | 带签名的登记 |
 | `Registered` | S→C | 登记完成 |
 | `Lookup { node_id }` | C→S | 查对端 |
 | `PeerCandidates { node_id, candidates, token }` | S→C | 对端已就位，附上打洞令牌 |
 | `PeerPending { node_id }` | S→C | 对端还没上线 |
-| `Ping` / `Pong` | 双向 | 保活 |
+| `Ping` / `Pong` | 双向 | 保活（未登记不允许心跳） |
 | `Error { reason }` | S→C | 出错 |
 
 服务器内存里维护 `peers`（在线节点 → 候选地址 + 发送队列）和 `waiters`
 （谁在等谁上线）。牵线时机有两个：对方登记时唤醒等待者、以及自己主动查询时。
 两处都可能触发，所以同一对节点可能被牵线两次——这也是令牌一致性测试存在的原因。
+
+### 连接所有权与资源上限
+
+信令服务器直接暴露在公网，所以每条连接都被当作敌意输入对待：
+
+- **一条连接一个身份。** 重复 `RegisterHello`、注册中途换人、注册完成后再次注册，
+  一律 `Error` + 断开。旧代码允许一条连接连续登记多个 ID，而断开时只清理最后一个，
+  剩下的就成了永远在线的「幽灵节点」。
+- **连接所有权凭证（`connection_id`）。** 每个 accept 分配一个单调递增 ID 记进
+  `PeerRecord`。断开时只有 `record.connection_id` 与自己的相同时才删记录，所以旧连接
+  的清理不会删掉新连接的登记；被取代的旧连接也不能再 `Lookup`。
+- **有界队列。** 发送端是 `mpsc::channel(outbox_capacity)` 而不是
+  `unbounded_channel`；牵线时两边都用 `try_reserve`，任一边排不下就断开那条连接
+  （既不无限积压，也不把令牌只发给一边）。写超时兜住「只发不读」的客户端。
+- **数量上限。** 单节点候选地址数、在线节点总数、waiter 条目总数、单连接挂起查询数
+  都有上限，超限明确 `Error`；重复 `Lookup` 同一目标会去重。
+- **信令专用帧上限。** 信令用 `MAX_SIGNAL_FRAME_LEN = 64 KiB`，而不是业务分片那
+  16 MiB 的通用上限——长度头必须在分配前检查。
+- **超时。** 首帧、注册应答、登记后的空闲、单帧写入各有超时；未认证连接的窗口短，
+  已登记的宽松（业务数据走 P2P，长时间不碰信令是正常的）。
+
+客户端候选地址超过上限时会先截断再签名，否则会被服务器按超限拒绝。
 
 客户端**必须一直持有**这条连接：一旦 drop，服务器就认为本节点下线，
 对端之后再也查不到我们。`DirectLink` 持有 `SignalingClient` 就是为了这个。
@@ -319,13 +361,13 @@ A、B 的签名和随机数各自自洽，验证全过，但业务流量实际�
 8. `transport::quic` 跳过证书校验是**有意**的，前提是每次连接都必须跑完应用层握手，
    而且握手签名必须覆盖当前会话的绑定值（见 §4.7）；这两个约束都不能破坏。
 9. 信令服务器是单点，且重启后在线表清空（客户端会重新登记，但需要一次重试）。
-   另外它对客户端没有鉴权——任何人都能登记节点 ID。这不影响数据安全
-   （数据不经过它，且应用层有双向认证），但可以被用来骚扰牵线。
+   登记已有私钥挑战认证与资源上限（见 §4.5），但**信令链路本身没有加密**：
+   候选地址和节点 ID 在链路上是明文（签名只保证完整性与身份），服务器仍是可用性单点。
 
 ## 7. 待定问题
 
 - [x] 信令服务器的部署形态与协议 → 极简 TCP + 长度前缀 postcard，systemd 常驻
-- [ ] 信令服务器要不要加鉴权 / 限流
+- [x] 信令服务器要不要加鉴权 / 限流 → 私钥挑战认证 + 有界队列 + 数量上限 + 超时（§4.5）
 - [ ] 是否需要 DHT 去中心化发现，还是先依赖中心信令
 - [ ] 中继自建（TURN）还是复用 libp2p relay
 - [ ] 多对端：现在 `serve` 只接受一个 `--allow`（打洞是点对点的），
