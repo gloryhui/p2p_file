@@ -12,7 +12,10 @@ use crate::protocol::message::ControlMessage;
 use crate::transfer::chunker::{manifest_from_path, read_chunk};
 use crate::transfer::resume::ChunkBitmap;
 use crate::transport::handshake::handshake_initiator;
-use crate::transport::quic::ChannelBinding;
+use crate::transport::quic::{
+    ACCEPT_FIRST_BI_STREAM_TIMEOUT, APPLICATION_HANDSHAKE_TIMEOUT, ChannelBinding,
+    TRANSFER_IDLE_TIMEOUT,
+};
 
 /// 发送结果。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,12 +45,17 @@ pub async fn send_file(
     // 1. 握手（占第一条双向流）。会话绑定值必须从**这条**连接导出，
     //    签名才会被钉死在这条 TLS 会话上，挡住透明 MITM 转发。
     let binding = ChannelBinding::from_connection(connection)?;
-    let (mut handshake_send, mut handshake_recv) = connection
-        .open_bi()
-        .await
-        .map_err(|err| Error::Transport(format!("打开握手流失败: {err}")))?;
-    let outcome =
-        handshake_initiator(&mut handshake_send, &mut handshake_recv, identity, &binding).await?;
+    let (mut handshake_send, mut handshake_recv) =
+        tokio::time::timeout(ACCEPT_FIRST_BI_STREAM_TIMEOUT, connection.open_bi())
+            .await
+            .map_err(|_| Error::Transport("打开握手流超时".into()))?
+            .map_err(|err| Error::Transport(format!("打开握手流失败: {err}")))?;
+    let outcome = tokio::time::timeout(
+        APPLICATION_HANDSHAKE_TIMEOUT,
+        handshake_initiator(&mut handshake_send, &mut handshake_recv, identity, &binding),
+    )
+    .await
+    .map_err(|_| Error::Transport("应用层握手超时".into()))??;
     // 握手流用完就关，让对端的读取干净结束。
     let _ = handshake_send.finish();
 
@@ -74,20 +82,26 @@ pub async fn send_file_after_handshake(
         "开始发送"
     );
 
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .map_err(|err| Error::Transport(format!("打开数据流失败: {err}")))?;
+    let (mut send, mut recv) =
+        tokio::time::timeout(ACCEPT_FIRST_BI_STREAM_TIMEOUT, connection.open_bi())
+            .await
+            .map_err(|_| Error::Transport("打开文件数据流超时".into()))?
+            .map_err(|err| Error::Transport(format!("打开数据流失败: {err}")))?;
 
-    write_frame(
-        &mut send,
-        &ControlMessage::Manifest(Box::new(manifest.clone())),
+    tokio::time::timeout(
+        TRANSFER_IDLE_TIMEOUT,
+        write_frame(
+            &mut send,
+            &ControlMessage::Manifest(Box::new(manifest.clone())),
+        ),
     )
-    .await?;
+    .await
+    .map_err(|_| Error::Protocol("发送 Manifest 超时".into()))??;
 
     // 3. 收对端的续传位图。
-    let resume = read_frame(&mut recv)
-        .await?
+    let resume = tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, read_frame(&mut recv))
+        .await
+        .map_err(|_| Error::Protocol("等待 Resume 超时".into()))??
         .ok_or_else(|| Error::Protocol("对端没有回报续传进度就关闭了连接".into()))?;
     let peer_bitmap = match resume {
         ControlMessage::Resume { have } => ChunkBitmap::from_bytes(manifest.chunk_count(), &have)?,
@@ -113,7 +127,10 @@ pub async fn send_file_after_handshake(
     let mut chunks_sent: u32 = 0;
 
     loop {
-        let message = match read_frame(&mut recv).await? {
+        let message = match tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, read_frame(&mut recv))
+            .await
+            .map_err(|_| Error::Protocol("等待 RequestChunk 或 Complete 超时".into()))??
+        {
             Some(message) => message,
             // 对端直接断了。
             None => {
@@ -134,7 +151,12 @@ pub async fn send_file_after_handshake(
                 }
 
                 let data = read_chunk(&mut file, offset, len)?;
-                write_frame(&mut send, &ControlMessage::Chunk { index, data }).await?;
+                tokio::time::timeout(
+                    TRANSFER_IDLE_TIMEOUT,
+                    write_frame(&mut send, &ControlMessage::Chunk { index, data }),
+                )
+                .await
+                .map_err(|_| Error::Protocol("发送 Chunk 超时".into()))??;
                 chunks_sent += 1;
             }
             ControlMessage::Complete { root_hash } => {

@@ -118,6 +118,18 @@ pub struct DirectLink {
 }
 
 impl DirectLink {
+    /// 消费直连并拆出 QUIC 端点和信令连接。
+    ///
+    /// serve 会话结束时必须先释放信令后台任务和其它 link 状态，再释放
+    /// endpoint；否则上一轮的 socket 可能仍被 link 的内部句柄保留，固定端口
+    /// 的下一轮重建会得到 `Address already in use`。
+    pub fn into_parts(self) -> (quinn::Endpoint, SignalingClient) {
+        let Self {
+            endpoint, signal, ..
+        } = self;
+        (endpoint, signal)
+    }
+
     /// 连到对端，按候选顺序依次尝试。
     ///
     /// 打洞确认过的地址排在最前面，给足时间（QUIC 会自己重传，慢一点没关系）；

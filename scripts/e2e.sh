@@ -91,7 +91,7 @@ pass "两个身份：家=$HOME_ID 本机=$LAPTOP_ID"
 
 step "1. 「家里那台」先启动并常驻等待（此时对端还没上线）"
 mkdir -p "$WORK/recv"
-"$BIN" --key-file "$WORK/home.key" --log info serve \
+RUST_LOG=info "$BIN" --key-file "$WORK/home.key" --log info serve \
     --signal 127.0.0.1:7000 \
     --allow "$LAPTOP_ID" \
     --forward 127.0.0.1:9999 \
@@ -104,7 +104,7 @@ wait_for "$WORK/serve.log" "常驻等待中" 40 || fail "serve 没能进入常�
 pass "serve 已常驻等待对端上线（没有超时退出）"
 
 step "2. 「本机」发起隧道：本地 2222 → 对端 9999"
-"$BIN" --key-file "$WORK/laptop.key" --log info tunnel \
+RUST_LOG=info "$BIN" --key-file "$WORK/laptop.key" --log info tunnel \
     --signal 127.0.0.1:7000 \
     --peer "$HOME_ID" \
     --listen 127.0.0.1:2222 \
@@ -156,7 +156,7 @@ pass "隧道在宽限期后依然可用（空闲计时不会误拆活跃连接�
 
 step "3. 隧道还开着时直推文件（此时 serve 不会再打洞，走候选重试）"
 head -c 2000000 /dev/urandom > "$WORK/big.bin"
-"$BIN" --key-file "$WORK/laptop.key" --log info push \
+RUST_LOG=info "$BIN" --key-file "$WORK/laptop.key" --log info push \
     --signal 127.0.0.1:7000 \
     --peer "$HOME_ID" \
     "$WORK/big.bin" --port 9105 > "$WORK/push.log" 2>&1
@@ -176,7 +176,7 @@ kill "$TUNNEL_PID" 2>/dev/null || true
 wait_for "$WORK/serve.log" "重新打洞" 90 || fail "serve 没有在空闲后重新打洞"
 pass "serve 空闲后已重新进入等待"
 
-"$BIN" --key-file "$WORK/laptop.key" --log info tunnel \
+RUST_LOG=info "$BIN" --key-file "$WORK/laptop.key" --log info tunnel \
     --signal 127.0.0.1:7000 \
     --peer "$HOME_ID" \
     --listen 127.0.0.1:2223 \

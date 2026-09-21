@@ -19,9 +19,12 @@ mod tests {
     use crate::protocol::frame::{read_frame, write_frame};
     use crate::protocol::manifest::MIN_CHUNK_SIZE;
     use crate::protocol::message::ControlMessage;
-    use crate::transport::handshake::handshake_responder;
+    use crate::transport::handshake::{handshake_initiator, handshake_responder};
     use crate::transport::quic::ChannelBinding;
-    use crate::transport::quic::{client_endpoint, connect, server_endpoint};
+    use crate::transport::quic::{
+        ACCEPT_FIRST_BI_STREAM_TIMEOUT, STREAM_FIRST_FRAME_TIMEOUT, TRANSFER_IDLE_TIMEOUT,
+        client_endpoint, connect, server_endpoint,
+    };
     use std::fs;
     use std::io::Write;
     use std::path::PathBuf;
@@ -398,6 +401,120 @@ mod tests {
             .await
             .expect("伪 receiver 应在 10 秒内结束")
             .unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receiver_handshake_silence_times_out() {
+        let dir = temp_dir("receiver_handshake_timeout");
+        let receiver = Identity::generate();
+        let server = server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let recv_dir = dir.clone();
+        let task = tokio::spawn(async move {
+            let incoming = server.accept().await.unwrap();
+            let connection = incoming.await.unwrap();
+            receive_file(&connection, &receiver, &recv_dir).await
+        });
+
+        let client = client_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let connection = connect(&client, server_addr, "127.0.0.1").await.unwrap();
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(ACCEPT_FIRST_BI_STREAM_TIMEOUT + Duration::from_secs(1)).await;
+        let error = task.await.unwrap().expect_err("静默连接必须超时");
+        assert!(error.to_string().contains("握手流超时"));
+        connection.close(0u32.into(), b"timeout");
+        client.wait_idle().await;
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_first_frame_silence_times_out() {
+        let dir = temp_dir("stream_first_frame_timeout");
+        let sender = Identity::generate();
+        let receiver = Identity::generate();
+        let server = server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let recv_dir = dir.clone();
+        let task = tokio::spawn(async move {
+            let incoming = server.accept().await.unwrap();
+            let connection = incoming.await.unwrap();
+            receive_file(&connection, &receiver, &recv_dir).await
+        });
+
+        let client = client_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let connection = connect(&client, server_addr, "127.0.0.1").await.unwrap();
+        let binding = ChannelBinding::from_connection(&connection).unwrap();
+        let (mut handshake_send, mut handshake_recv) = connection.open_bi().await.unwrap();
+        handshake_initiator(&mut handshake_send, &mut handshake_recv, &sender, &binding)
+            .await
+            .unwrap();
+        handshake_send.finish().unwrap();
+        let (_send, _recv) = connection.open_bi().await.unwrap();
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(STREAM_FIRST_FRAME_TIMEOUT + Duration::from_secs(1)).await;
+        let error = task.await.unwrap().expect_err("没有首帧必须超时");
+        assert!(
+            error.to_string().contains("超时"),
+            "应当是首帧阶段超时，实际: {error}"
+        );
+        connection.close(0u32.into(), b"timeout");
+        client.wait_idle().await;
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transfer_silence_times_out_but_is_not_a_total_file_timeout() {
+        let dir = temp_dir("transfer_idle_timeout");
+        let sender = Identity::generate();
+        let receiver = Identity::generate();
+        let source = dir.join("payload.bin");
+        fs::write(&source, vec![0x42u8; MIN_CHUNK_SIZE as usize]).unwrap();
+        let manifest = manifest_from_path(&source, MIN_CHUNK_SIZE).unwrap();
+        let server = server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let recv_dir = dir.clone();
+        let task = tokio::spawn(async move {
+            let incoming = server.accept().await.unwrap();
+            let connection = incoming.await.unwrap();
+            receive_file(&connection, &receiver, &recv_dir).await
+        });
+
+        let client = client_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let connection = connect(&client, server_addr, "127.0.0.1").await.unwrap();
+        let binding = ChannelBinding::from_connection(&connection).unwrap();
+        let (mut handshake_send, mut handshake_recv) = connection.open_bi().await.unwrap();
+        handshake_initiator(&mut handshake_send, &mut handshake_recv, &sender, &binding)
+            .await
+            .unwrap();
+        handshake_send.finish().unwrap();
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        write_frame(&mut send, &ControlMessage::Manifest(Box::new(manifest)))
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_frame(&mut recv).await.unwrap(),
+            Some(ControlMessage::Resume { .. })
+        ));
+        assert!(matches!(
+            read_frame(&mut recv).await.unwrap(),
+            Some(ControlMessage::RequestChunk { .. })
+        ));
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(TRANSFER_IDLE_TIMEOUT + Duration::from_secs(1)).await;
+        let error = task.await.unwrap().expect_err("没有分片流量必须超时");
+        assert!(
+            error.to_string().contains("超时"),
+            "应当是传输空闲超时，实际: {error}"
+        );
+        connection.close(0u32.into(), b"timeout");
+        client.wait_idle().await;
         fs::remove_dir_all(&dir).unwrap();
     }
 }

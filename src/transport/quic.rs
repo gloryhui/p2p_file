@@ -35,7 +35,19 @@ pub const ALPN: &[u8] = b"p2pfile/1";
 pub const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// 空闲超时。超过这个时间没有任何活动就认为连接死了。
-pub const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+pub const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 应用层握手各阶段允许的最大静默时间。
+pub const APPLICATION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 等待一条连接的第一条双向业务流的最大时间。
+pub const ACCEPT_FIRST_BI_STREAM_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 等待业务流首帧的最大时间。
+pub const STREAM_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 文件控制流两帧之间允许的最大静默时间；不是整个文件的总时限。
+pub const TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 导出会话绑定值时使用的 TLS exporter 标签（RFC 5705）。
 ///
@@ -316,6 +328,47 @@ mod tests {
             expected,
             "必须复用同一个本地端口"
         );
+    }
+
+    #[tokio::test]
+    async fn 关闭连接并释放端点后固定端口可以重新绑定() {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let bind = probe.local_addr().unwrap();
+        drop(probe);
+
+        let server = server_endpoint(bind).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = client_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_for_accept = server.clone();
+        let server_accept = tokio::spawn(async move {
+            server_for_accept
+                .accept()
+                .await
+                .expect("服务端应接受连接")
+                .await
+                .expect("服务端 QUIC 握手应成功")
+        });
+        let connection = connect(&client, server_addr, "127.0.0.1").await.unwrap();
+        let server_connection = server_accept.await.unwrap();
+
+        connection.close(0u32.into(), b"release");
+        server_connection.close(0u32.into(), b"release");
+        connection.closed().await;
+        server_connection.closed().await;
+        drop(server_connection);
+        drop(connection);
+        server.close(0u32.into(), b"release endpoint");
+        client.wait_idle().await;
+        server.wait_idle().await;
+        drop(client);
+        drop(server);
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+
+        let rebound = server_endpoint(bind).expect("固定端口必须在完整释放后重新绑定");
+        rebound.close(0u32.into(), b"done");
+        rebound.wait_idle().await;
     }
 
     #[tokio::test]

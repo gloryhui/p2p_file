@@ -439,6 +439,7 @@ async fn cmd_serve(
         forwards: forward,
         recv_dir,
         re_punch_after: Duration::from_secs(re_punch_after),
+        ..ServeConfig::new()
     };
 
     tokio::select! {
