@@ -366,18 +366,81 @@ struct PeerRecord {
     close: watch::Sender<bool>,
 }
 
+/// 一个等待者：哪条**连接**在等（不只是哪个节点在等）。
+///
+/// 必须带 `connection_id`：同一个 NodeId 会重连，如果只记 `requester`，旧连接的
+/// 清理会删掉新连接的等待、新连接也会继承旧连接从未重新发起的查询。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct WaiterKey {
+    requester: NodeId,
+    connection_id: u64,
+}
+
 /// 内存里的在线表。进程重启即清空——客户端会重新登记。
 #[derive(Default)]
 struct Registry {
     peers: HashMap<NodeId, PeerRecord>,
-    /// 谁在等谁上线：`waiters[target] = {requester, ...}`。
-    waiters: HashMap<NodeId, HashSet<NodeId>>,
+    /// 谁在等谁上线：`waiters[target] = { (requester, connection_id), ... }`。
+    waiters: HashMap<NodeId, HashSet<WaiterKey>>,
+    /// 单连接当前**真实**挂起的查询：`pending_by_connection[(requester, conn)] = {target, ...}`。
+    ///
+    /// 这是配额的唯一依据。用独立的索引而不是让 handler 自己记 `HashSet`：
+    /// 目标上线、`try_pair` 消费掉 waiter 时，这里会同步删除，配额随之释放；
+    /// handler 本地记的话就会把「已经完成的历史目标」永久算进配额。
+    pending_by_connection: HashMap<WaiterKey, HashSet<NodeId>>,
 }
 
 impl Registry {
     /// waiter 条目总数（所有集合的大小之和）。
     fn waiter_entries(&self) -> usize {
         self.waiters.values().map(HashSet::len).sum()
+    }
+
+    /// 这条连接当前真正挂起（还没被配对）的查询数。
+    fn pending_count(&self, key: WaiterKey) -> usize {
+        self.pending_by_connection.get(&key).map_or(0, HashSet::len)
+    }
+
+    /// 记下一个挂起等待；返回 `false` 表示本来就在等（去重）。
+    fn add_waiter(&mut self, requester: WaiterKey, target: NodeId) -> bool {
+        let inserted = self.waiters.entry(target).or_default().insert(requester);
+        if inserted {
+            self.pending_by_connection
+                .entry(requester)
+                .or_default()
+                .insert(target);
+        }
+        inserted
+    }
+
+    /// 取走等 `target` 上线的等待者，返回**仍然有效**的 requester 节点。
+    ///
+    /// 两件事必须同时做：
+    /// 1. 从 `pending_by_connection` 里删掉，让配额真正释放；
+    /// 2. 校验 `connection_id` 仍是该 requester 的当前连接——被取代的旧连接
+    ///    留下的 waiter 不能被新连接继承。
+    fn take_waiters_for(&mut self, target: NodeId) -> Vec<NodeId> {
+        let Some(waiters) = self.waiters.remove(&target) else {
+            return Vec::new();
+        };
+
+        let mut live = Vec::new();
+        for key in waiters {
+            if let Some(targets) = self.pending_by_connection.get_mut(&key) {
+                targets.remove(&target);
+                if targets.is_empty() {
+                    self.pending_by_connection.remove(&key);
+                }
+            }
+            let still_current = self
+                .peers
+                .get(&key.requester)
+                .is_some_and(|record| record.connection_id == key.connection_id);
+            if still_current && key.requester != target {
+                live.push(key.requester);
+            }
+        }
+        live
     }
 
     /// 双方都在线就互相推送候选，只推一次。
@@ -438,7 +501,7 @@ impl Registry {
         });
     }
 
-    /// 连接断开：只删除仍然属于自己的记录，并清掉自己在所有 waiter 里的痕迹。
+    /// 连接断开：只删除仍然属于自己的记录，并清掉**这条连接**自己的等待痕迹。
     fn unregister(&mut self, node_id: NodeId, connection_id: u64) {
         let owned = self
             .peers
@@ -449,8 +512,17 @@ impl Registry {
             self.peers.remove(&node_id);
         }
 
-        for waiters in self.waiters.values_mut() {
-            waiters.remove(&node_id);
+        // 只清这条连接登记过的 waiter：旧连接的清理不能删掉新连接创建的等待。
+        let key = WaiterKey {
+            requester: node_id,
+            connection_id,
+        };
+        if let Some(targets) = self.pending_by_connection.remove(&key) {
+            for target in targets {
+                if let Some(waiters) = self.waiters.get_mut(&target) {
+                    waiters.remove(&key);
+                }
+            }
         }
         // 空集合会一直占着 key，是内存 DoS 的入口，及时收掉。
         self.waiters.retain(|_, waiters| !waiters.is_empty());
@@ -543,8 +615,6 @@ async fn handle_signal_client(
     let mut reader = BufReader::new(read_half);
     let mut pending: Option<PendingRegistration> = None;
     let mut active: Option<ActiveRegistration> = None;
-    // 本连接挂起等待的目标，用于去重和上限判断。
-    let mut pending_lookups: HashSet<NodeId> = HashSet::new();
 
     let disconnect_reason: &str = loop {
         // 未登记时给一个较短的窗口，避免匿名连接长期占着资源。
@@ -716,7 +786,7 @@ async fn handle_signal_client(
                 }
 
                 // 认证通过，才允许写进在线表。
-                let waiters = {
+                let (live_waiters, replaced_close) = {
                     let mut reg = registry.lock().await;
                     let is_new = !reg.peers.contains_key(&node_id);
                     if is_new && reg.peers.len() >= config.max_registered_peers {
@@ -724,16 +794,25 @@ async fn handle_signal_client(
                         reject(&outbox, "服务器在线表已满");
                         break "在线表已满";
                     }
-                    reg.peers.insert(
-                        node_id,
-                        PeerRecord {
-                            connection_id,
-                            candidates: candidates.clone(),
-                            outbox: outbox.clone(),
-                            close: close_tx.clone(),
-                        },
-                    );
-                    reg.waiters.remove(&node_id).unwrap_or_default()
+                    // 同 NodeId 的新连接取代旧连接：把旧连接的 close 握在手里，
+                    // 稍后主动断开它。否则旧连接可以靠 Ping 无限续命，堆积
+                    // socket/task，而 `peers` 只算一条、`max_registered_peers` 挡不住。
+                    let replaced_close = reg
+                        .peers
+                        .insert(
+                            node_id,
+                            PeerRecord {
+                                connection_id,
+                                candidates: candidates.clone(),
+                                outbox: outbox.clone(),
+                                close: close_tx.clone(),
+                            },
+                        )
+                        .map(|old| old.close);
+                    // 取走等它上线的 waiter；顺带释放这些 requester 的挂起配额，
+                    // 并过滤掉已经被新连接取代的旧 waiter。
+                    let live = reg.take_waiters_for(node_id);
+                    (live, replaced_close)
                 };
 
                 active = Some(ActiveRegistration {
@@ -744,7 +823,7 @@ async fn handle_signal_client(
                 tracing::info!(
                     node = %node_id.short(),
                     candidates = candidates.len(),
-                    waiters = waiters.len(),
+                    waiters = live_waiters.len(),
                     "节点登记（已通过私钥挑战认证）"
                 );
 
@@ -752,8 +831,14 @@ async fn handle_signal_client(
                     break "待写队列已满";
                 }
 
+                // 旧连接必须在这里被主动踢掉，不能只是「不能再 Lookup」。
+                if let Some(close) = replaced_close {
+                    tracing::info!(node = %node_id.short(), "已被新连接取代，主动断开旧连接");
+                    let _ = close.send(true);
+                }
+
                 // 有人在等它，现在可以牵线了。
-                for waiter in waiters {
+                for waiter in live_waiters {
                     registry.lock().await.try_pair(waiter, node_id);
                 }
             }
@@ -792,19 +877,24 @@ async fn handle_signal_client(
                 }
 
                 if reg.peers.contains_key(&target) {
-                    // 目标在线：直接牵线，顺便清掉可能残留的挂起记录。
-                    pending_lookups.remove(&target);
+                    // 目标在线：直接牵线。若之前挂起等过它，waiter 已在它登记
+                    // 时被 `take_waiters_for` 消费掉、配额也已释放。
                     reg.try_pair(me, target);
                     continue;
                 }
 
                 // 目标不在线：挂起等待，先做去重，再检查上限。
+                // 配额以 Registry 里的**真实 pending**为准，不是 handler 本地的历史集合。
+                let key = WaiterKey {
+                    requester: me,
+                    connection_id: my_connection,
+                };
                 let already_waiting = reg
                     .waiters
                     .get(&target)
-                    .is_some_and(|waiters| waiters.contains(&me));
+                    .is_some_and(|waiters| waiters.contains(&key));
                 if !already_waiting {
-                    if pending_lookups.len() >= config.max_pending_lookups {
+                    if reg.pending_count(key) >= config.max_pending_lookups {
                         drop(reg);
                         if !send_or_close(
                             &outbox,
@@ -831,8 +921,7 @@ async fn handle_signal_client(
                         }
                         continue;
                     }
-                    reg.waiters.entry(target).or_default().insert(me);
-                    pending_lookups.insert(target);
+                    reg.add_waiter(key, target);
                 }
                 drop(reg);
 
@@ -946,20 +1035,79 @@ pub enum LookupOutcome {
     Pending,
 }
 
+/// 客户端自动心跳周期。
+///
+/// 服务器对已登记连接有 `idle_timeout`（默认 180s）。`SignalingClient` 会在这个
+/// 周期内自动发 `Ping`，所以只要 `DirectLink` 还持有客户端，节点就一直在线——
+/// 哪怕 QUIC/隧道长时间活跃、上层根本不去碰信令。
+///
+/// 必须明显小于服务器的 `idle_timeout`；服务器调小了这个值，就用
+/// [`SignalingClient::connect_with_heartbeat`] 指定更短的周期。
+pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// 客户端事件队列容量（reader 任务 → 前台 `lookup`/`wait_for_peer`）。
+const CLIENT_EVENT_CAPACITY: usize = 256;
+/// 客户端单帧写入超时，避免对端不读时 writer 任务无限卡住。
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// 信令客户端。
+///
+/// 登记完成后后台会跑两个任务：
+///
+/// - **writer**：所有出站消息走一条有界 channel，并**周期发心跳**；
+/// - **reader**：持续读帧，`Pong` 直接丢掉（避免长时间不读把 TCP 缓冲撑满），
+///   其余消息投给前台。
+///
+/// 这样上层在跑长时间隧道、完全不碰信令时，连接也不会因为空闲被服务器摘掉。
 pub struct SignalingClient {
     node_id: NodeId,
-    reader: BufReader<OwnedReadHalf>,
-    writer: OwnedWriteHalf,
     server: String,
+    /// 出站消息：前台方法 + 心跳任务都往这里投。
+    outgoing: mpsc::Sender<SignalMessage>,
+    /// reader 任务投递进来的服务器消息。
+    events: mpsc::Receiver<SignalMessage>,
+    /// 只为了在 drop 时一起收掉后台任务（心跳随之停止）。
+    _tasks: ClientTasks,
+}
+
+/// 后台任务句柄；`SignalingClient` drop 时一起收掉，心跳也随之停止。
+struct ClientTasks {
+    writer: tokio::task::JoinHandle<()>,
+    reader: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ClientTasks {
+    fn drop(&mut self) {
+        self.writer.abort();
+        self.reader.abort();
+    }
 }
 
 impl SignalingClient {
-    /// 连上信令服务器，通过 challenge-response 认证完成登记。
+    /// 连上信令服务器，通过 challenge-response 认证完成登记，并启动自动心跳。
     pub async fn connect(
         server: &str,
         identity: &Identity,
         candidates: Vec<Candidate>,
+    ) -> Result<Self> {
+        Self::connect_with_heartbeat(
+            server,
+            identity,
+            candidates,
+            Some(DEFAULT_HEARTBEAT_INTERVAL),
+        )
+        .await
+    }
+
+    /// 与 [`Self::connect`] 相同，但可以指定自动心跳周期（`None` 表示不心跳）。
+    ///
+    /// 测试用很短的周期验证「心跳让长连接跨过多个空闲周期仍在线」「关掉心跳后
+    /// 才会被服务器清理」。
+    pub async fn connect_with_heartbeat(
+        server: &str,
+        identity: &Identity,
+        candidates: Vec<Candidate>,
+        heartbeat_interval: Option<Duration>,
     ) -> Result<Self> {
         // 服务端也会拦，但客户端自己收一下，避免明知超限还去发一个大包。
         let mut candidates = candidates;
@@ -971,6 +1119,8 @@ impl SignalingClient {
             );
             candidates.truncate(MAX_CANDIDATES);
         }
+        // 周期为 0 会 panic，按「不心跳」处理。
+        let heartbeat_interval = heartbeat_interval.filter(|period| !period.is_zero());
 
         let stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(server))
             .await
@@ -991,13 +1141,28 @@ impl SignalingClient {
         .await
         .map_err(|_| Error::Discovery(format!("连接信令服务器 {server} 注册超时")))??;
 
-        tracing::debug!(%server, node = %node_id.short(), "已登记到信令服务器（已通过私钥挑战认证）");
+        tracing::debug!(
+            %server,
+            node = %node_id.short(),
+            heartbeat = ?heartbeat_interval,
+            "已登记到信令服务器（已通过私钥挑战认证）"
+        );
+
+        let (outgoing, outbox) = mpsc::channel::<SignalMessage>(OUTBOX_CAPACITY);
+        let (events_tx, events) = mpsc::channel::<SignalMessage>(CLIENT_EVENT_CAPACITY);
+
+        let writer = tokio::spawn(client_writer_loop(write_half, outbox, heartbeat_interval));
+        let reader_task = tokio::spawn(client_reader_loop(reader, events_tx));
 
         Ok(Self {
             node_id,
-            reader,
-            writer: write_half,
             server: server.to_string(),
+            outgoing,
+            events,
+            _tasks: ClientTasks {
+                writer,
+                reader: reader_task,
+            },
         })
     }
 
@@ -1011,15 +1176,16 @@ impl SignalingClient {
 
     /// 查询对端候选地址。
     pub async fn lookup(&mut self, peer: NodeId) -> Result<LookupOutcome> {
-        let lookup = SignalMessage::Lookup { node_id: peer };
-        write_raw_frame_limited(&mut self.writer, &lookup.encode()?, MAX_SIGNAL_FRAME_LEN).await?;
+        self.send(SignalMessage::Lookup { node_id: peer }).await?;
 
         loop {
-            let payload = read_raw_frame_limited(&mut self.reader, MAX_SIGNAL_FRAME_LEN)
-                .await?
+            let message = self
+                .events
+                .recv()
+                .await
                 .ok_or_else(|| Error::Discovery("等查询结果时信令服务器断开了连接".into()))?;
 
-            match SignalMessage::decode(&payload)? {
+            match message {
                 SignalMessage::PeerCandidates {
                     node_id,
                     candidates,
@@ -1056,19 +1222,15 @@ impl SignalingClient {
                 return Ok(None);
             }
 
-            let payload = match tokio::time::timeout(
-                remaining,
-                read_raw_frame_limited(&mut self.reader, MAX_SIGNAL_FRAME_LEN),
-            )
-            .await
-            {
-                Ok(result) => {
-                    result?.ok_or_else(|| Error::Discovery("信令服务器断开了连接".into()))?
-                }
+            let message = match tokio::time::timeout(remaining, self.events.recv()).await {
                 Err(_) => return Ok(None),
+                Ok(None) => {
+                    return Err(Error::Discovery("信令服务器断开了连接".into()));
+                }
+                Ok(Some(message)) => message,
             };
 
-            match SignalMessage::decode(&payload)? {
+            match message {
                 SignalMessage::PeerCandidates {
                     node_id,
                     candidates,
@@ -1104,15 +1266,112 @@ impl SignalingClient {
         }
     }
 
-    /// 主动发个心跳，顺便确认连接还在。
+    /// 主动发个心跳，顺便确认出站方向还通（连接死了会返回错误）。
+    ///
+    /// 正常情况下不需要手动调用：后台已经在按
+    /// [`DEFAULT_HEARTBEAT_INTERVAL`] 自动心跳。
     pub async fn ping(&mut self) -> Result<()> {
-        write_raw_frame_limited(
-            &mut self.writer,
-            &SignalMessage::Ping.encode()?,
-            MAX_SIGNAL_FRAME_LEN,
+        self.send(SignalMessage::Ping).await
+    }
+
+    /// 往 writer 任务投递一条消息；writer 已经退出说明连接断了。
+    async fn send(&self, message: SignalMessage) -> Result<()> {
+        self.outgoing
+            .send(message)
+            .await
+            .map_err(|_| Error::Discovery("信令连接已断开，无法发送".into()))
+    }
+}
+
+/// 客户端 writer 任务：串行写出站消息，并周期发心跳。
+async fn client_writer_loop(
+    mut writer: OwnedWriteHalf,
+    mut outgoing: mpsc::Receiver<SignalMessage>,
+    heartbeat_interval: Option<Duration>,
+) {
+    let mut heartbeat = heartbeat_interval.map(|period| {
+        let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        // 忙的时候不要补发一堆心跳，延迟到下一次即可。
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval
+    });
+
+    loop {
+        let message = tokio::select! {
+            maybe = outgoing.recv() => match maybe {
+                Some(message) => message,
+                // 所有发送端都没了（客户端被 drop）。
+                None => break,
+            },
+            _ = async {
+                match heartbeat.as_mut() {
+                    Some(interval) => {
+                        interval.tick().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            } => SignalMessage::Ping,
+        };
+
+        let payload = match message.encode() {
+            Ok(payload) => payload,
+            Err(err) => {
+                tracing::warn!(error = %err, "信令消息编码失败");
+                continue;
+            }
+        };
+        match tokio::time::timeout(
+            CLIENT_WRITE_TIMEOUT,
+            write_raw_frame_limited(&mut writer, &payload, MAX_SIGNAL_FRAME_LEN),
         )
-        .await?;
-        Ok(())
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::debug!(error = %err, "信令写失败，连接已结束");
+                return;
+            }
+            Err(_) => {
+                tracing::warn!("信令写超时，连接已结束");
+                return;
+            }
+        }
+    }
+
+    let _ = writer.shutdown().await;
+}
+
+/// 客户端 reader 任务：持续读帧。
+///
+/// 关键在于**一直读**：`Pong` 直接丢掉，避免上层长时间不碰信令时心跳回包把
+/// TCP 缓冲撑满，反过来把服务器的 writer 卡死。任务退出（连接断开）时 sender
+/// 被 drop，前台等待者会看到 `None` 并报「连接已断开」。
+async fn client_reader_loop(
+    mut reader: BufReader<OwnedReadHalf>,
+    events: mpsc::Sender<SignalMessage>,
+) {
+    loop {
+        match read_raw_frame_limited(&mut reader, MAX_SIGNAL_FRAME_LEN).await {
+            Ok(Some(payload)) => match SignalMessage::decode(&payload) {
+                Ok(SignalMessage::Pong) => continue,
+                Ok(message) => {
+                    // 队列满说明前台长期没消费；这里用 try_send 保证读取不被阻塞。
+                    // 丢掉的推送最多是「别人查到了我们」，对端下次查询会重新牵线。
+                    if events.try_send(message).is_err() {
+                        tracing::debug!("客户端事件队列已满，丢弃一条服务器推送");
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "信令消息解析失败，连接已结束");
+                    break;
+                }
+            },
+            Ok(None) => break,
+            Err(err) => {
+                tracing::debug!(error = %err, "信令读取结束");
+                break;
+            }
+        }
     }
 }
 
@@ -1768,9 +2027,25 @@ mod tests {
             "应当拿到重连后的新候选"
         );
 
-        // 旧连接还在，不该把新记录顶掉。
-        client_b.ping().await.unwrap();
-        client_b2.ping().await.unwrap();
+        // 旧连接必须被服务器**主动关闭**：否则拿同一个私钥不停重连，旧连接靠
+        // Ping 就能无限续命，socket/task 无限堆积（`peers` 只算一条，
+        // `max_registered_peers` 完全挡不住）。
+        let ghost = Identity::generate().node_id();
+        let closed = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if client_b.lookup(ghost).await.is_err() {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "被取代的旧连接应当被服务器主动关闭");
+
+        // 新连接继续可用。
+        assert_eq!(
+            client_b2.lookup(ghost).await.unwrap(),
+            LookupOutcome::Pending
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2033,15 +2308,21 @@ mod tests {
         let other = Identity::generate().node_id();
         let mut reg = Registry::default();
 
+        let key_requester = WaiterKey {
+            requester,
+            connection_id: 1,
+        };
         for _ in 0..8 {
-            reg.waiters
-                .entry(Identity::generate().node_id())
-                .or_default()
-                .insert(requester);
+            let target = Identity::generate().node_id();
+            assert!(reg.add_waiter(key_requester, target));
         }
         // 另一个 requester 的等待不该被误删。
         let kept_target = Identity::generate().node_id();
-        reg.waiters.entry(kept_target).or_default().insert(other);
+        let key_other = WaiterKey {
+            requester: other,
+            connection_id: 9,
+        };
+        assert!(reg.add_waiter(key_other, kept_target));
         // 一个从一开始就空的集合。
         reg.waiters
             .entry(Identity::generate().node_id())
@@ -2054,7 +2335,131 @@ mod tests {
             "不该留下空 set"
         );
         assert_eq!(reg.waiter_entries(), 1, "只应剩下 other 的那一条");
-        assert!(reg.waiters.get(&kept_target).unwrap().contains(&other));
+        assert!(reg.waiters.get(&kept_target).unwrap().contains(&key_other));
+        assert_eq!(reg.pending_count(key_requester), 0);
+        assert_eq!(reg.pending_count(key_other), 1);
+    }
+
+    #[test]
+    fn 旧连接的清理不会删除新连接的_waiter() {
+        // A(old) 和 A(new) 都在等不同的目标；A(old) 断开时只能清掉自己那条。
+        let alice = Identity::generate().node_id();
+        let old_key = WaiterKey {
+            requester: alice,
+            connection_id: 1,
+        };
+        let new_key = WaiterKey {
+            requester: alice,
+            connection_id: 2,
+        };
+        let old_target = Identity::generate().node_id();
+        let new_target = Identity::generate().node_id();
+
+        let mut reg = Registry::default();
+        reg.peers.insert(
+            alice,
+            PeerRecord {
+                connection_id: 2,
+                candidates: vec![],
+                outbox: mpsc::channel(1).0,
+                close: watch::channel(false).0,
+            },
+        );
+        assert!(reg.add_waiter(old_key, old_target));
+        assert!(reg.add_waiter(new_key, new_target));
+
+        // 旧连接断开。
+        reg.unregister(alice, 1);
+
+        assert!(
+            !reg.waiters.contains_key(&old_target) || reg.waiters[&old_target].is_empty(),
+            "旧连接自己的 waiter 应当被清掉"
+        );
+        assert_eq!(
+            reg.waiters.get(&new_target).map(HashSet::len),
+            Some(1),
+            "新连接创建的 waiter 不能被旧连接的清理删掉"
+        );
+        assert_eq!(reg.pending_count(new_key), 1);
+        assert_eq!(reg.pending_count(old_key), 0);
+    }
+
+    #[test]
+    fn 旧连接的_waiter_不会被新连接继承() {
+        // A(old) 挂起等 X；A 随后以同 NodeId 重连（覆盖 peers[A]）。
+        // 之后 X 上线，不能把 X 推给从未重新发起查询的新连接。
+        let alice = Identity::generate().node_id();
+        let x = Identity::generate().node_id();
+        let old_key = WaiterKey {
+            requester: alice,
+            connection_id: 1,
+        };
+
+        let mut reg = Registry::default();
+        reg.peers.insert(
+            alice,
+            PeerRecord {
+                connection_id: 1,
+                candidates: vec![],
+                outbox: mpsc::channel(1).0,
+                close: watch::channel(false).0,
+            },
+        );
+        assert!(reg.add_waiter(old_key, x));
+
+        // A(new) 重连，覆盖当前记录。
+        reg.peers.insert(
+            alice,
+            PeerRecord {
+                connection_id: 2,
+                candidates: vec![],
+                outbox: mpsc::channel(1).0,
+                close: watch::channel(false).0,
+            },
+        );
+
+        // X 上线：旧 waiter 的 connection_id 已经不是当前连接，必须被丢掉。
+        let live = reg.take_waiters_for(x);
+        assert!(
+            live.is_empty(),
+            "旧连接的 waiter 不能被新连接继承，实际 {live:?}"
+        );
+        assert_eq!(reg.pending_count(old_key), 0, "配额必须一起释放");
+        assert_eq!(reg.waiter_entries(), 0);
+    }
+
+    #[test]
+    fn waiter_被消费后挂起配额会释放() {
+        let alice = Identity::generate().node_id();
+        let x = Identity::generate().node_id();
+        let key = WaiterKey {
+            requester: alice,
+            connection_id: 1,
+        };
+
+        let mut reg = Registry::default();
+        reg.peers.insert(
+            alice,
+            PeerRecord {
+                connection_id: 1,
+                candidates: vec![],
+                outbox: mpsc::channel(1).0,
+                close: watch::channel(false).0,
+            },
+        );
+        assert!(reg.add_waiter(key, x));
+        assert_eq!(reg.pending_count(key), 1);
+
+        // X 上线，waiter 被消费。
+        let live = reg.take_waiters_for(x);
+        assert_eq!(live, vec![alice]);
+        assert_eq!(reg.pending_count(key), 0, "配对完成后配额必须释放");
+        assert_eq!(reg.waiter_entries(), 0);
+
+        // 同一个 key 可以马上再挂新的等待，不会被历史记录挤掉。
+        let y = Identity::generate().node_id();
+        assert!(reg.add_waiter(key, y));
+        assert_eq!(reg.pending_count(key), 1);
     }
 
     #[tokio::test]
@@ -2231,6 +2636,174 @@ mod tests {
             .expect("不该挂死");
         assert!(closed.is_none(), "空闲超时后应关闭连接");
         wait_for_registry(&registry, |reg| reg.peers.is_empty()).await;
+    }
+
+    #[tokio::test]
+    async fn 同_node_id_重连后旧连接被主动关闭() {
+        // 只靠「旧连接不能再 Lookup」是不够的：旧连接还能 Ping，就能靠心跳
+        // 无限续命，socket/task 无限堆积。服务器必须在登记新连接时主动踢掉旧的。
+        let (addr, registry) = spawn_signal_server_with(SignalServerConfig::default()).await;
+        let alice = Identity::generate();
+
+        let mut old = Raw::connect(addr).await;
+        old.full_register(
+            &alice,
+            vec![candidate(CandidateKind::Host, "192.168.1.1:9000")],
+        )
+        .await;
+
+        let mut new = Raw::connect(addr).await;
+        new.full_register(
+            &alice,
+            vec![candidate(CandidateKind::Host, "192.168.1.1:9100")],
+        )
+        .await;
+
+        // 旧连接必须收到 EOF（服务器没再给它发任何东西，所以 None 就是被关了）。
+        let closed = tokio::time::timeout(Duration::from_secs(3), old.recv())
+            .await
+            .expect("不该挂死");
+        assert!(
+            closed.is_none(),
+            "旧连接必须被服务器主动关闭，实际收到 {closed:?}"
+        );
+
+        // 在线表里是新连接的记录，新连接依然可用。
+        {
+            let reg = registry.lock().await;
+            let record = reg.peers.get(&alice.node_id()).expect("新连接应当在线");
+            assert_eq!(
+                record.candidates,
+                vec![candidate(CandidateKind::Host, "192.168.1.1:9100")]
+            );
+        }
+        new.send(&SignalMessage::Ping).await;
+        assert!(matches!(new.recv().await, Some(SignalMessage::Pong)));
+    }
+
+    #[tokio::test]
+    async fn 自动心跳让长连接跨过多个空闲周期仍在线() {
+        // idle 给得比心跳周期宽裕（4 倍），避免并行跑测试时调度抖动导致误判。
+        let idle = Duration::from_millis(400);
+        let config = SignalServerConfig {
+            idle_timeout: idle,
+            ..SignalServerConfig::default()
+        };
+        let (addr, registry) = spawn_signal_server_with(config).await;
+        let alice = Identity::generate();
+
+        // 心跳周期明显小于 idle_timeout。
+        let interval = Duration::from_millis(100);
+        let mut client = SignalingClient::connect_with_heartbeat(
+            &addr.to_string(),
+            &alice,
+            vec![],
+            Some(interval),
+        )
+        .await
+        .unwrap();
+
+        // 期间上层完全不碰信令，睡过好几个 idle_timeout 周期。
+        let mut elapsed = Duration::ZERO;
+        while elapsed < idle * 5 {
+            tokio::time::sleep(interval).await;
+            elapsed += interval;
+            assert!(
+                registry.lock().await.peers.contains_key(&alice.node_id()),
+                "自动心跳期间必须保持在线（已过 {elapsed:?}）"
+            );
+        }
+
+        // 连接仍然可用。
+        let ghost = Identity::generate().node_id();
+        assert_eq!(client.lookup(ghost).await.unwrap(), LookupOutcome::Pending);
+    }
+
+    #[tokio::test]
+    async fn 停止心跳后会被服务器清理() {
+        // 关掉自动心跳：只有注册，之后再没有任何帧。
+        // 证明「保持在线」靠的确实是心跳，而不是别的什么。
+        let idle = Duration::from_millis(300);
+        let config = SignalServerConfig {
+            idle_timeout: idle,
+            ..SignalServerConfig::default()
+        };
+        let (addr, registry) = spawn_signal_server_with(config).await;
+        let alice = Identity::generate();
+
+        let mut client =
+            SignalingClient::connect_with_heartbeat(&addr.to_string(), &alice, vec![], None)
+                .await
+                .unwrap();
+        assert!(
+            registry.lock().await.peers.contains_key(&alice.node_id()),
+            "刚登记时应当在线"
+        );
+
+        // 没有任何心跳，服务器最终按空闲超时把它摘掉。
+        wait_for_registry(&registry, |reg| !reg.peers.contains_key(&alice.node_id())).await;
+
+        // 连接也会被服务器关掉。
+        let ghost = Identity::generate().node_id();
+        let closed = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if client.lookup(ghost).await.is_err() {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "停掉心跳后连接最终应被服务器关闭");
+    }
+
+    #[tokio::test]
+    async fn waiter_完成后挂起配额会释放() {
+        // 配额必须反映「当前真实挂起」，不能把已经配对完成的历史目标也算进去。
+        let config = SignalServerConfig {
+            max_pending_lookups: 1,
+            ..SignalServerConfig::default()
+        };
+        let (addr, _registry) = spawn_signal_server_with(config).await;
+        let alice = Identity::generate();
+        let mut client = SignalingClient::connect(&addr.to_string(), &alice, vec![])
+            .await
+            .unwrap();
+
+        let target = Identity::generate();
+        let blocked = Identity::generate();
+
+        // 用满唯一一个配额。
+        assert_eq!(
+            client.lookup(target.node_id()).await.unwrap(),
+            LookupOutcome::Pending
+        );
+        assert!(
+            client.lookup(blocked.node_id()).await.is_err(),
+            "配额用满时新查询应当被拒"
+        );
+
+        // target 上线 → waiter 被消费 → 配额释放。
+        let mut target_client = SignalingClient::connect(&addr.to_string(), &target, vec![])
+            .await
+            .unwrap();
+        let offer = client
+            .wait_for_peer(target.node_id(), Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert!(offer.is_some(), "对方上线后应当收到推送");
+
+        // 现在可以继续查询新目标。
+        assert_eq!(
+            client.lookup(blocked.node_id()).await.unwrap(),
+            LookupOutcome::Pending,
+            "已完成的等待必须释放配额"
+        );
+
+        // target 侧也能正常查询，连接没被前一步影响。
+        assert_eq!(
+            target_client.lookup(blocked.node_id()).await.unwrap(),
+            LookupOutcome::Pending
+        );
     }
 
     #[tokio::test]
