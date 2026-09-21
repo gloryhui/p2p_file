@@ -40,6 +40,9 @@ pub const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// 应用层握手各阶段允许的最大静默时间。
 pub const APPLICATION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// 等待 QUIC transport handshake 完成的最大时间；与应用层四阶段握手分开计时。
+pub const QUIC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// 等待一条连接的第一条双向业务流的最大时间。
 pub const ACCEPT_FIRST_BI_STREAM_TIMEOUT: Duration = Duration::from_secs(10);
 

@@ -13,8 +13,7 @@ use crate::transfer::chunker::{manifest_from_path, read_chunk};
 use crate::transfer::resume::ChunkBitmap;
 use crate::transport::handshake::handshake_initiator;
 use crate::transport::quic::{
-    ACCEPT_FIRST_BI_STREAM_TIMEOUT, APPLICATION_HANDSHAKE_TIMEOUT, ChannelBinding,
-    TRANSFER_IDLE_TIMEOUT,
+    ACCEPT_FIRST_BI_STREAM_TIMEOUT, ChannelBinding, TRANSFER_IDLE_TIMEOUT,
 };
 
 /// 发送结果。
@@ -50,12 +49,8 @@ pub async fn send_file(
             .await
             .map_err(|_| Error::Transport("打开握手流超时".into()))?
             .map_err(|err| Error::Transport(format!("打开握手流失败: {err}")))?;
-    let outcome = tokio::time::timeout(
-        APPLICATION_HANDSHAKE_TIMEOUT,
-        handshake_initiator(&mut handshake_send, &mut handshake_recv, identity, &binding),
-    )
-    .await
-    .map_err(|_| Error::Transport("应用层握手超时".into()))??;
+    let outcome =
+        handshake_initiator(&mut handshake_send, &mut handshake_recv, identity, &binding).await?;
     // 握手流用完就关，让对端的读取干净结束。
     let _ = handshake_send.finish();
 

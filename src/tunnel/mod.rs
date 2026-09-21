@@ -23,14 +23,14 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use quinn::{Connection, RecvStream, SendStream};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
@@ -43,7 +43,7 @@ use crate::transfer::receiver::receive_file_on_stream;
 use crate::transfer::sender::{SendReport, send_file_after_handshake};
 use crate::transport::handshake::{handshake_initiator, handshake_responder};
 use crate::transport::quic::{
-    ACCEPT_FIRST_BI_STREAM_TIMEOUT, APPLICATION_HANDSHAKE_TIMEOUT, ChannelBinding,
+    ACCEPT_FIRST_BI_STREAM_TIMEOUT, ChannelBinding, QUIC_HANDSHAKE_TIMEOUT,
     STREAM_FIRST_FRAME_TIMEOUT, TRANSFER_IDLE_TIMEOUT,
 };
 
@@ -159,25 +159,41 @@ pub async fn serve_session(
     info!("直连已就绪，等待对端接入：{}", link.describe());
 
     let (endpoint, _signal) = link.into_parts();
-    let active = Arc::new(AtomicUsize::new(0));
+    let active = Arc::new(ActiveState::new());
     let pending = Arc::new(Semaphore::new(config.max_pending_handshakes));
     let file_receives = Arc::new(Semaphore::new(config.max_file_receives));
     let connections = Arc::new(Mutex::new(ConnectionRegistry::default()));
     let grace = config.re_punch_after;
-    let mut idle_deadline = tokio::time::Instant::now() + grace;
+    let mut idle_changes = active.idle_changes.subscribe();
+    let mut idle_deadline = active.idle_deadline(grace);
     let mut connection_tasks = JoinSet::new();
 
     loop {
         let incoming = tokio::select! {
             incoming = endpoint.accept() => incoming,
             _ = tokio::time::sleep_until(idle_deadline) => {
-                if active.load(Ordering::Relaxed) == 0 {
+                if active.count.load(Ordering::Relaxed) == 0 {
+                    // active 刚刚结束时，Drop 会记录真实的 idle 起点。即使
+                    // deadline 分支和 watch 通知同时就绪，也不能提前 re-punch。
+                    let refreshed = active.idle_deadline(grace);
+                    if refreshed > tokio::time::Instant::now() {
+                        idle_deadline = refreshed;
+                        continue;
+                    }
                     debug!("空闲超时，准备重新打洞");
                     break;
                 }
-                // 只有真正的认证连接仍在服务时才推进 deadline；incoming 和
-                // task completion 不会把 service idle 计时器重置。
+                // 真正 active 的服务仍在运行时，只推进检查点；pending/失败
+                // 握手和普通 task completion 都不会触碰这个 deadline。
                 idle_deadline = tokio::time::Instant::now() + grace;
+                continue;
+            },
+            changed = idle_changes.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                // 最后一个 active session 结束的瞬间才进入新的 idle grace。
+                idle_deadline = active.idle_deadline(grace);
                 continue;
             },
             result = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
@@ -207,18 +223,17 @@ pub async fn serve_session(
         let file_receives = Arc::clone(&file_receives);
         let connections = Arc::clone(&connections);
         connection_tasks.spawn(async move {
-            let connection =
-                match tokio::time::timeout(APPLICATION_HANDSHAKE_TIMEOUT, incoming).await {
-                    Ok(Ok(connection)) => connection,
-                    Ok(Err(err)) => {
-                        warn!(error = %err, "有连接进来但 QUIC 握手失败");
-                        return;
-                    }
-                    Err(_) => {
-                        warn!("QUIC 握手超时");
-                        return;
-                    }
-                };
+            let connection = match tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, incoming).await {
+                Ok(Ok(connection)) => connection,
+                Ok(Err(err)) => {
+                    warn!(error = %err, "有连接进来但 QUIC 握手失败");
+                    return;
+                }
+                Err(_) => {
+                    warn!("QUIC 握手超时");
+                    return;
+                }
+            };
             let connection_id = connections.lock().unwrap().insert(connection.clone());
             if let Err(err) =
                 serve_connection(connection, &identity, config, active, file_receives, permit).await
@@ -299,18 +314,50 @@ impl<T> ConnectionRegistry<T> {
     }
 }
 
-struct ActiveSession(Arc<AtomicUsize>);
+struct ActiveState {
+    count: AtomicUsize,
+    idle_since: Mutex<Option<tokio::time::Instant>>,
+    idle_generation: AtomicU64,
+    idle_changes: watch::Sender<u64>,
+}
+
+impl ActiveState {
+    fn new() -> Self {
+        let (idle_changes, _) = watch::channel(0);
+        Self {
+            count: AtomicUsize::new(0),
+            idle_since: Mutex::new(Some(tokio::time::Instant::now())),
+            idle_generation: AtomicU64::new(0),
+            idle_changes,
+        }
+    }
+
+    fn idle_deadline(&self, grace: Duration) -> tokio::time::Instant {
+        self.idle_since.lock().unwrap().map_or_else(
+            || tokio::time::Instant::now() + grace,
+            |since| since + grace,
+        )
+    }
+}
+
+struct ActiveSession(Arc<ActiveState>);
 
 impl ActiveSession {
-    fn new(active: Arc<AtomicUsize>) -> Self {
-        active.fetch_add(1, Ordering::Relaxed);
+    fn new(active: Arc<ActiveState>) -> Self {
+        if active.count.fetch_add(1, Ordering::Relaxed) == 0 {
+            *active.idle_since.lock().unwrap() = None;
+        }
         Self(active)
     }
 }
 
 impl Drop for ActiveSession {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        if self.0.count.fetch_sub(1, Ordering::Relaxed) == 1 {
+            *self.0.idle_since.lock().unwrap() = Some(tokio::time::Instant::now());
+            let generation = self.0.idle_generation.fetch_add(1, Ordering::Relaxed) + 1;
+            let _ = self.0.idle_changes.send(generation);
+        }
     }
 }
 
@@ -319,7 +366,7 @@ async fn serve_connection(
     connection: Connection,
     identity: &Identity,
     config: ServeConfig,
-    active: Arc<AtomicUsize>,
+    active: Arc<ActiveState>,
     file_receives: Arc<Semaphore>,
     pending_permit: OwnedSemaphorePermit,
 ) -> Result<()> {
@@ -333,12 +380,8 @@ async fn serve_connection(
             .await
             .map_err(|_| Error::Transport("等待应用握手流超时".into()))?
             .map_err(|err| Error::Transport(format!("接受握手流失败: {err}")))?;
-    let outcome = tokio::time::timeout(
-        APPLICATION_HANDSHAKE_TIMEOUT,
-        handshake_responder(&mut handshake_send, &mut handshake_recv, identity, &binding),
-    )
-    .await
-    .map_err(|_| Error::Transport("应用层握手超时".into()))??;
+    let outcome =
+        handshake_responder(&mut handshake_send, &mut handshake_recv, identity, &binding).await?;
     let _ = handshake_send.finish();
 
     let peer_id = outcome.peer_node_id;
@@ -701,12 +744,7 @@ async fn open_session(link: &DirectLink, identity: &Identity) -> Result<Connecti
             .await
             .map_err(|_| Error::Transport("打开握手流超时".into()))?
             .map_err(|err| Error::Transport(format!("打开握手流失败: {err}")))?;
-    let outcome = tokio::time::timeout(
-        APPLICATION_HANDSHAKE_TIMEOUT,
-        handshake_initiator(&mut send, &mut recv, identity, &binding),
-    )
-    .await
-    .map_err(|_| Error::Transport("应用层握手超时".into()))??;
+    let outcome = handshake_initiator(&mut send, &mut recv, identity, &binding).await?;
     let _ = send.finish();
 
     if outcome.peer_node_id != link.peer_node_id {
@@ -1028,6 +1066,29 @@ mod tests {
             .expect("serve task 不应 panic")
             .expect("serve session 应正常结束");
         connection.close(0u32.into(), b"test done");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active结束后完整_grace重新计算() {
+        let state = Arc::new(ActiveState::new());
+        let grace = Duration::from_secs(10);
+        let initial_deadline = state.idle_deadline(grace);
+        let active = ActiveSession::new(Arc::clone(&state));
+
+        // active 跨过原始 deadline；它仍然不应被当作 idle。
+        tokio::time::advance(grace + Duration::from_secs(1)).await;
+        assert_eq!(state.count.load(Ordering::Relaxed), 1);
+
+        let ended_at = tokio::time::Instant::now();
+        drop(active);
+        let new_deadline = state.idle_deadline(grace);
+        assert!(new_deadline > initial_deadline);
+        assert_eq!(new_deadline, ended_at + grace);
+
+        tokio::time::advance(grace - Duration::from_secs(1)).await;
+        assert!(tokio::time::Instant::now() < new_deadline);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(tokio::time::Instant::now() >= new_deadline);
     }
 
     /// 全链路：信令牵线 → 双方打洞 → QUIC 直连 → TCP 隧道转发。

@@ -13,8 +13,8 @@ use crate::protocol::message::ControlMessage;
 use crate::storage::PartialDownload;
 use crate::transport::handshake::handshake_responder;
 use crate::transport::quic::{
-    ACCEPT_FIRST_BI_STREAM_TIMEOUT, APPLICATION_HANDSHAKE_TIMEOUT, ChannelBinding,
-    STREAM_FIRST_FRAME_TIMEOUT, TRANSFER_IDLE_TIMEOUT,
+    ACCEPT_FIRST_BI_STREAM_TIMEOUT, ChannelBinding, STREAM_FIRST_FRAME_TIMEOUT,
+    TRANSFER_IDLE_TIMEOUT,
 };
 
 /// 同时在途的请求数。
@@ -78,12 +78,8 @@ pub async fn receive_file(
             .await
             .map_err(|_| Error::Transport("等待握手流超时".into()))?
             .map_err(|err| Error::Transport(format!("接受握手流失败: {err}")))?;
-    let outcome = tokio::time::timeout(
-        APPLICATION_HANDSHAKE_TIMEOUT,
-        handshake_responder(&mut handshake_send, &mut handshake_recv, identity, &binding),
-    )
-    .await
-    .map_err(|_| Error::Transport("应用层握手超时".into()))??;
+    let outcome =
+        handshake_responder(&mut handshake_send, &mut handshake_recv, identity, &binding).await?;
     let _ = handshake_send.finish();
 
     // 2. 收清单并开数据流。

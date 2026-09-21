@@ -32,7 +32,7 @@ use crate::identity::{
 };
 use crate::protocol::frame::{read_frame, write_frame};
 use crate::protocol::message::{ControlMessage, PROTOCOL_VERSION, handshake_payload};
-use crate::transport::quic::ChannelBinding;
+use crate::transport::quic::{APPLICATION_HANDSHAKE_TIMEOUT, ChannelBinding};
 
 /// 握手成功后拿到的对端信息。
 #[derive(Clone, Debug)]
@@ -59,7 +59,7 @@ where
 {
     let nonce: [u8; 32] = rand::random();
 
-    write_frame(
+    write_handshake_frame(
         send,
         &ControlMessage::Hello {
             protocol_version: PROTOCOL_VERSION,
@@ -67,12 +67,11 @@ where
             public_key: identity.public_key_bytes(),
             nonce,
         },
+        "发送 Hello",
     )
     .await?;
 
-    let reply = read_frame(recv)
-        .await?
-        .ok_or_else(|| Error::Protocol("对端在 Hello 之后没回应就关闭了连接".into()))?;
+    let reply = read_handshake_frame(recv, "等待 HelloAck").await?;
 
     let (peer_nonce, peer_public_key, peer_node_id, signature) = match reply {
         ControlMessage::HelloAck {
@@ -119,11 +118,12 @@ where
 
     // 回签，让对端也确认我们的身份。
     let our_signature = identity.sign(&payload);
-    write_frame(
+    write_handshake_frame(
         send,
         &ControlMessage::Auth {
             signature: our_signature.to_bytes().to_vec(),
         },
+        "发送 Auth",
     )
     .await?;
 
@@ -148,9 +148,7 @@ where
     S: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
-    let hello = read_frame(recv)
-        .await?
-        .ok_or_else(|| Error::Protocol("对端在发 Hello 之前就关闭了连接".into()))?;
+    let hello = read_handshake_frame(recv, "等待 Hello").await?;
 
     let (peer_nonce, peer_public_key, peer_node_id) = match hello {
         ControlMessage::Hello {
@@ -183,7 +181,7 @@ where
     );
 
     let our_signature = identity.sign(&payload);
-    write_frame(
+    write_handshake_frame(
         send,
         &ControlMessage::HelloAck {
             protocol_version: PROTOCOL_VERSION,
@@ -193,12 +191,11 @@ where
             peer_nonce,
             signature: our_signature.to_bytes().to_vec(),
         },
+        "发送 HelloAck",
     )
     .await?;
 
-    let auth = read_frame(recv)
-        .await?
-        .ok_or_else(|| Error::Protocol("对端没有回签就关闭了连接".into()))?;
+    let auth = read_handshake_frame(recv, "等待 Auth").await?;
 
     match auth {
         ControlMessage::Auth { signature } => {
@@ -216,7 +213,7 @@ where
         }
     }
 
-    write_frame(send, &ControlMessage::Ready).await?;
+    write_handshake_frame(send, &ControlMessage::Ready, "发送 Ready").await?;
 
     Ok(HandshakeOutcome {
         peer_node_id,
@@ -249,9 +246,7 @@ async fn expect_ready<R>(recv: &mut R) -> Result<()>
 where
     R: AsyncRead + Unpin,
 {
-    let message = read_frame(recv)
-        .await?
-        .ok_or_else(|| Error::Protocol("等待 Ready 时连接被关闭".into()))?;
+    let message = read_handshake_frame(recv, "等待 Ready").await?;
 
     match message {
         ControlMessage::Ready => Ok(()),
@@ -261,6 +256,26 @@ where
             other.kind()
         ))),
     }
+}
+
+async fn read_handshake_frame<R>(recv: &mut R, phase: &str) -> Result<ControlMessage>
+where
+    R: AsyncRead + Unpin,
+{
+    tokio::time::timeout(APPLICATION_HANDSHAKE_TIMEOUT, read_frame(recv))
+        .await
+        .map_err(|_| Error::Protocol(format!("{phase}超时")))??
+        .ok_or_else(|| Error::Protocol(format!("{phase}时连接被关闭")))
+}
+
+async fn write_handshake_frame<S>(send: &mut S, message: &ControlMessage, phase: &str) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    tokio::time::timeout(APPLICATION_HANDSHAKE_TIMEOUT, write_frame(send, message))
+        .await
+        .map_err(|_| Error::Protocol(format!("{phase}超时")))??;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -284,6 +299,82 @@ mod tests {
         ChannelBinding::from_bytes_for_test([0x5a; 32])
     }
 
+    async fn delayed_responder(
+        send: &mut (impl AsyncWrite + Unpin),
+        recv: &mut (impl AsyncRead + Unpin),
+        identity: &Identity,
+        binding: &ChannelBinding,
+        delay: std::time::Duration,
+    ) -> Result<()> {
+        tokio::time::sleep(delay).await;
+        let hello = read_frame(recv)
+            .await?
+            .ok_or_else(|| Error::Protocol("测试 responder 未收到 Hello".into()))?;
+        let (peer_nonce, peer_public_key, _peer_node_id) = match hello {
+            ControlMessage::Hello {
+                protocol_version,
+                node_id,
+                public_key,
+                nonce,
+            } => {
+                check_version(protocol_version)?;
+                let key = public_key_from_bytes(&public_key)?;
+                check_node_id(&key, node_id)?;
+                (nonce, key, node_id)
+            }
+            other => {
+                return Err(Error::Protocol(format!(
+                    "测试 responder 收到 {}",
+                    other.kind()
+                )));
+            }
+        };
+        let our_nonce: [u8; 32] = rand::random();
+        let payload = handshake_payload(
+            &peer_public_key.to_bytes(),
+            &peer_nonce,
+            &identity.public_key_bytes(),
+            &our_nonce,
+            binding.as_bytes(),
+        );
+        let signature = identity.sign(&payload);
+        write_frame(
+            send,
+            &ControlMessage::HelloAck {
+                protocol_version: PROTOCOL_VERSION,
+                node_id: identity.node_id(),
+                public_key: identity.public_key_bytes(),
+                nonce: our_nonce,
+                peer_nonce,
+                signature: signature.to_bytes().to_vec(),
+            },
+        )
+        .await?;
+
+        tokio::time::sleep(delay).await;
+        let auth = read_frame(recv)
+            .await?
+            .ok_or_else(|| Error::Protocol("测试 responder 未收到 Auth".into()))?;
+        match auth {
+            ControlMessage::Auth { signature } => {
+                verify_signature(
+                    &peer_public_key,
+                    &payload,
+                    &signature_from_bytes(&signature)?,
+                )?;
+            }
+            other => {
+                return Err(Error::Protocol(format!(
+                    "测试 responder 收到 {}",
+                    other.kind()
+                )));
+            }
+        }
+
+        tokio::time::sleep(delay).await;
+        write_frame(send, &ControlMessage::Ready).await
+    }
+
     #[tokio::test]
     async fn 双向握手成功并互相确认身份() {
         let alice = Identity::generate();
@@ -303,6 +394,66 @@ mod tests {
         assert_eq!(bob_outcome.peer_node_id, alice.node_id());
         assert_eq!(alice_outcome.peer_public_key, bob.public_key());
         assert_eq!(bob_outcome.peer_public_key, alice.public_key());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn 握手每阶段都有独立_idle_timeout() {
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let binding = test_binding();
+        let ((mut a_recv, mut a_send), (mut b_recv, mut b_send)) = split_pair();
+
+        let initiator = tokio::spawn(async move {
+            handshake_initiator(&mut a_send, &mut a_recv, &alice, &binding).await
+        });
+        let responder = tokio::spawn(async move {
+            delayed_responder(
+                &mut b_send,
+                &mut b_recv,
+                &bob,
+                &binding,
+                std::time::Duration::from_secs(4),
+            )
+            .await
+        });
+
+        // 三个阶段各消耗 4 秒，总耗时 12 秒，已经超过一个 10 秒 timeout；
+        // 但任一阶段的静默都没有超过自己的 10 秒窗口。
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..3 {
+            tokio::time::advance(std::time::Duration::from_secs(4)).await;
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        assert!(initiator.await.unwrap().is_ok());
+        assert!(responder.await.unwrap().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn 握手任一阶段静默超过_timeout会失败() {
+        let alice = Identity::generate();
+        let binding = test_binding();
+        let ((mut a_recv, mut a_send), (mut b_recv, mut b_send)) = split_pair();
+        let silent_peer = tokio::spawn(async move {
+            let _keep_alive = (&mut b_recv, &mut b_send);
+            std::future::pending::<()>().await;
+        });
+        let initiator = tokio::spawn(async move {
+            handshake_initiator(&mut a_send, &mut a_recv, &alice, &binding).await
+        });
+
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(APPLICATION_HANDSHAKE_TIMEOUT + std::time::Duration::from_secs(1))
+            .await;
+        let error = initiator.await.unwrap().expect_err("静默阶段必须超时");
+        assert!(error.to_string().contains("超时"));
+        silent_peer.abort();
     }
 
     #[tokio::test]
