@@ -279,10 +279,9 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// finalize/rename 失败时，接收端只能发送 Abort；发送端绝不能收到成功报告。
+    /// finalize/publish 失败时，接收端只能发送 Abort；发送端绝不能收到成功报告。
     ///
-    /// 让 unique_path 穷尽候选名后把 `.part` 改名到一个目录，稳定地产生 rename
-    /// 失败，不依赖运行用户是否有权限修改目录。
+    /// 让候选名穷尽后稳定地产生 publish 失败，不依赖运行用户是否有权限修改目录。
     #[tokio::test]
     async fn finalize失败时发送端能感知失败() {
         let dir = temp_dir("finalize_failure");
@@ -296,7 +295,7 @@ mod tests {
         fs::write(&source, &content).unwrap();
 
         fs::create_dir(recv_dir.join("finalize.bin")).unwrap();
-        for counter in 1..10_000u32 {
+        for counter in 1..=10_000u32 {
             fs::create_dir(recv_dir.join(format!("finalize ({counter}).bin"))).unwrap();
         }
 
@@ -336,6 +335,8 @@ mod tests {
         assert!(
             receive_error.to_string().contains("I/O")
                 || receive_error.to_string().contains("os error")
+                || receive_error.to_string().contains("耗尽"),
+            "receiver 应保留 publish 失败原因，实际: {receive_error}"
         );
         assert!(!recv_dir.join("finalize.bin").is_file());
 
