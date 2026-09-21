@@ -5,7 +5,8 @@
 //! QUIC 的 TLS 证书用自签名证书，信任链换成了「公钥 → 节点 ID」这一步。
 
 use std::fmt;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -151,8 +152,11 @@ impl Identity {
             Ok(identity) => Ok(identity),
             Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
                 let identity = Self::generate();
-                identity.save(path)?;
-                Ok(identity)
+                let temp = write_key_temp(path, &identity.secret_bytes())?;
+                match publish_key_no_replace(&temp, path)? {
+                    true => Ok(identity),
+                    false => Self::load(path),
+                }
             }
             Err(err) => Err(err),
         }
@@ -160,6 +164,7 @@ impl Identity {
 
     /// 从密钥文件读取身份。
     pub fn load(path: &Path) -> Result<Self> {
+        reject_unsafe_key_target(path)?;
         let raw = fs::read(path)?;
         let seed: [u8; SECRET_KEY_LEN] = raw.as_slice().try_into().map_err(|_| {
             Error::Identity(format!(
@@ -171,19 +176,151 @@ impl Identity {
         Ok(Self::from_secret_bytes(&seed))
     }
 
-    /// 把私钥写入文件，权限 0600（Unix）。
+    /// 把私钥安全地写入一个新文件，权限 0600（Unix），拒绝覆盖已有目标。
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+        let temp = write_key_temp(path, &self.secret_bytes())?;
+        if publish_key_no_replace(&temp, path)? {
+            Ok(())
+        } else {
+            Err(Error::Identity(format!(
+                "密钥文件已存在，拒绝覆盖: {}",
+                path.display()
+            )))
         }
-        fs::write(path, self.secret_bytes())?;
+    }
+}
+
+fn parent_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn temp_key_path(path: &Path, nonce: u128) -> Result<PathBuf> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| Error::Identity(format!("密钥路径没有有效文件名: {}", path.display())))?;
+    let temp_name = format!(".{}.{}.tmp", file_name.to_string_lossy(), nonce);
+    Ok(parent_dir(path).join(temp_name))
+}
+
+/// 从创建时就以安全权限写满临时 key，并把文件内容 sync 到稳定存储。
+fn write_key_temp(path: &Path, secret: &[u8; SECRET_KEY_LEN]) -> Result<PathBuf> {
+    fs::create_dir_all(parent_dir(path))?;
+
+    for _ in 0..32 {
+        let temp = temp_key_path(path, rand::random())?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
-        Ok(())
+
+        let mut file = match options.open(&temp) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        };
+
+        let result = (|| {
+            file.write_all(secret)?;
+            file.sync_all()?;
+            Ok::<(), std::io::Error>(())
+        })();
+        if let Err(err) = result {
+            let _ = fs::remove_file(&temp);
+            return Err(err.into());
+        }
+        return Ok(temp);
     }
+
+    Err(Error::Identity("无法创建唯一的临时密钥文件".into()))
+}
+
+/// 以同目录 hard-link 提供 create-new/no-replace 发布；不回退到 rename。
+///
+/// 返回 true 表示本调用发布成功，false 表示正式路径已被其他调用占用。临时
+/// 文件在两种结果下都会清理；正式路径只在完整 key 已 sync 后才出现。
+fn publish_key_no_replace(temp: &Path, target: &Path) -> Result<bool> {
+    match fs::hard_link(temp, target) {
+        Ok(()) => {
+            fs::remove_file(temp)?;
+            sync_parent_dir(target)?;
+            Ok(true)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            fs::remove_file(temp)?;
+            Ok(false)
+        }
+        Err(err) => {
+            // Windows may report an occupied reparse point as PermissionDenied. Do not
+            // follow it and do not turn any other error into an unsafe replacement.
+            match fs::symlink_metadata(target) {
+                Ok(_) => {
+                    fs::remove_file(temp)?;
+                    Ok(false)
+                }
+                Err(metadata_err) if metadata_err.kind() == std::io::ErrorKind::NotFound => {
+                    let _ = fs::remove_file(temp);
+                    Err(err.into())
+                }
+                Err(metadata_err) => {
+                    let _ = fs::remove_file(temp);
+                    Err(metadata_err.into())
+                }
+            }
+        }
+    }
+}
+
+/// 拒绝 symlink、Windows reparse point 和非普通文件。
+///
+/// `symlink_metadata` 本身不跟随链接；随后 `fs::read` 与此检查之间仍存在
+/// 检查后替换竞态。标准库没有可移植的 no-follow read API，因此这里明确只承诺
+/// 拒绝稳定存在的链接/异常目标；首次创建的 publish 路径不受该竞态影响。
+fn reject_unsafe_key_target(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    let is_link = metadata.file_type().is_symlink() || is_reparse_point(&metadata);
+    if is_link {
+        return Err(Error::Identity(format!(
+            "拒绝从 symlink/reparse-point 加载密钥: {}",
+            path.display()
+        )));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(Error::Identity(format!(
+            "密钥路径必须是普通文件: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    File::open(parent_dir(path))?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> Result<()> {
+    // Windows has no portable std equivalent for syncing a directory handle. The key
+    // file is synced before publish; an uncommitted directory entry is retried safely.
+    Ok(())
 }
 
 impl fmt::Debug for Identity {
@@ -219,6 +356,15 @@ pub fn signature_from_bytes(bytes: &[u8]) -> Result<Signature> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
+
+    fn test_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "p2p_file_identity_{tag}_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ))
+    }
 
     #[test]
     fn 节点_id_由公钥唯一确定() {
@@ -302,6 +448,138 @@ mod tests {
         fs::write(&path, b"too short").unwrap();
         assert!(Identity::load(&path).is_err());
         let _ = fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 宽松_umask下新建密钥仍从第一刻就是_0600() {
+        const CHILD: &str = "P2P_FILE_UMASK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let exe = std::env::current_exe().unwrap();
+            let output = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    "umask 000; exec \"$@\"",
+                    "sh",
+                    exe.to_str().unwrap(),
+                    "--exact",
+                    "identity::tests::宽松_umask下新建密钥仍从第一刻就是_0600",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "子进程在 umask 000 下失败: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        use std::os::unix::fs::PermissionsExt;
+        let dir = test_dir("umask");
+        let path = dir.join("identity.key");
+        Identity::generate().save(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn 并发首次创建最终都读取同一个完整密钥() {
+        let dir = test_dir("concurrent");
+        let path = Arc::new(dir.join("identity.key"));
+        let barrier = Arc::new(Barrier::new(16));
+        let mut tasks = Vec::new();
+
+        for _ in 0..16 {
+            let path = Arc::clone(&path);
+            let barrier = Arc::clone(&barrier);
+            tasks.push(std::thread::spawn(move || {
+                barrier.wait();
+                Identity::load_or_create(&path)
+            }));
+        }
+
+        let identities: Vec<_> = tasks
+            .into_iter()
+            .map(|task| task.join().unwrap().unwrap())
+            .collect();
+        let node_id = identities[0].node_id();
+        assert!(
+            identities
+                .iter()
+                .all(|identity| identity.node_id() == node_id)
+        );
+        assert_eq!(fs::read(&*path).unwrap().len(), SECRET_KEY_LEN);
+        assert_eq!(Identity::load(&path).unwrap().node_id(), node_id);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn save拒绝覆盖已有正常密钥() {
+        let dir = test_dir("save_existing");
+        let path = dir.join("identity.key");
+        let first = Identity::generate();
+        let second = Identity::generate();
+        first.save(&path).unwrap();
+        assert!(second.save(&path).is_err());
+        assert_eq!(Identity::load(&path).unwrap().node_id(), first.node_id());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink占名不能覆盖目标也不能被加载() {
+        use std::os::unix::fs::symlink;
+
+        let dir = test_dir("symlink");
+        fs::create_dir_all(&dir).unwrap();
+        let protected = dir.join("protected.key");
+        let path = dir.join("identity.key");
+        fs::write(&protected, [0xabu8; SECRET_KEY_LEN]).unwrap();
+        symlink(&protected, &path).unwrap();
+
+        assert!(Identity::generate().save(&path).is_err());
+        assert!(Identity::load_or_create(&path).is_err());
+        assert_eq!(fs::read(&protected).unwrap(), [0xabu8; SECRET_KEY_LEN]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn 已存在异常目标明确失败() {
+        let dir = test_dir("abnormal");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("identity.key");
+        fs::create_dir(&path).unwrap();
+
+        assert!(Identity::load(&path).is_err());
+        assert!(Identity::load_or_create(&path).is_err());
+        assert!(Identity::generate().save(&path).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reparse_point占名不能覆盖目标() {
+        use std::os::windows::fs::symlink_file;
+
+        let dir = test_dir("reparse");
+        fs::create_dir_all(&dir).unwrap();
+        let protected = dir.join("protected.key");
+        let path = dir.join("identity.key");
+        fs::write(&protected, [0xabu8; SECRET_KEY_LEN]).unwrap();
+        if symlink_file(&protected, &path).is_err() {
+            // Local Windows runners may lack SeCreateSymbolicLinkPrivilege. A
+            // directory still verifies that create-new never follows an occupied name.
+            fs::create_dir(&path).unwrap();
+        }
+
+        assert!(Identity::generate().save(&path).is_err());
+        assert!(Identity::load_or_create(&path).is_err());
+        assert_eq!(fs::read(&protected).unwrap(), [0xabu8; SECRET_KEY_LEN]);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
