@@ -7,7 +7,20 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::discovery::signal::DEFAULT_SIGNAL_PORT;
 use crate::identity::NodeId;
-use crate::protocol::manifest::DEFAULT_CHUNK_SIZE;
+use crate::protocol::manifest::{DEFAULT_CHUNK_SIZE, validate_chunk_size};
+
+/// clap 的 `--chunk-size` 解析器。
+///
+/// 在这里就拒绝非法值：等进了 `manifest_from_reader` 再报错的话，`0` 之外的
+/// 超大值（例如 4 GiB）会先触发一次真实的大分配。放在 value parser 里，
+/// 参数一解析完进程就退出，什么都不会分配。
+fn parse_chunk_size(raw: &str) -> std::result::Result<u32, String> {
+    let value: u32 = raw
+        .parse()
+        .map_err(|_| format!("分片大小必须是 0..={} 的整数，收到 {raw}", u32::MAX))?;
+    validate_chunk_size(value).map_err(|err| err.to_string())?;
+    Ok(value)
+}
 
 /// 点对点文件传输。
 ///
@@ -92,8 +105,13 @@ pub enum Command {
         #[arg(value_name = "HOST:PORT")]
         peer: SocketAddr,
 
-        /// 分片大小（字节）
-        #[arg(long, default_value_t = DEFAULT_CHUNK_SIZE, value_name = "BYTES")]
+        /// 分片大小（字节），必须在 16 KiB..=16 MiB 之间
+        #[arg(
+            long,
+            default_value_t = DEFAULT_CHUNK_SIZE,
+            value_name = "BYTES",
+            value_parser = parse_chunk_size
+        )]
         chunk_size: u32,
     },
 
@@ -183,8 +201,13 @@ pub enum Command {
         #[arg(value_name = "FILE")]
         file: PathBuf,
 
-        /// 分片大小（字节）
-        #[arg(long, default_value_t = DEFAULT_CHUNK_SIZE, value_name = "BYTES")]
+        /// 分片大小（字节），必须在 16 KiB..=16 MiB 之间
+        #[arg(
+            long,
+            default_value_t = DEFAULT_CHUNK_SIZE,
+            value_name = "BYTES",
+            value_parser = parse_chunk_size
+        )]
         chunk_size: u32,
     },
 }
@@ -441,5 +464,64 @@ mod tests {
             .is_err(),
             "缺少 --listen / --to 应当报错"
         );
+    }
+
+    /// Issue #3：非法的 `--chunk-size` 必须在参数解析阶段就失败，
+    /// 不能等到发送端 `vec![0u8; chunk_size as usize]` 去申请 4 GiB。
+    #[test]
+    fn 非法分片大小在解析阶段就被拒绝() {
+        for bad in [
+            "0",
+            "1",
+            "16383",
+            "16777217",
+            "4294967295",
+            "abc",
+            "-1",
+            "99999999999999999999",
+        ] {
+            let send = Cli::try_parse_from([
+                "p2p_file",
+                "send",
+                "/tmp/a.bin",
+                "203.0.113.7:9000",
+                "--chunk-size",
+                bad,
+            ]);
+            assert!(send.is_err(), "send --chunk-size {bad} 应当被拒绝");
+
+            let push = Cli::try_parse_from([
+                "p2p_file",
+                "push",
+                "--signal",
+                "1.2.3.4:7000",
+                "--peer",
+                "00112233445566778899aabbccddeeff",
+                "/tmp/b.bin",
+                "--chunk-size",
+                bad,
+            ]);
+            assert!(push.is_err(), "push --chunk-size {bad} 应当被拒绝");
+        }
+    }
+
+    #[test]
+    fn 合法分片大小能被解析() {
+        use crate::protocol::manifest::{MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
+
+        for good in [MIN_CHUNK_SIZE, 65536, MAX_CHUNK_SIZE] {
+            let cli = Cli::parse_from([
+                "p2p_file",
+                "send",
+                "/tmp/a.bin",
+                "203.0.113.7:9000",
+                "--chunk-size",
+                &good.to_string(),
+            ]);
+            match cli.command {
+                Command::Send { chunk_size, .. } => assert_eq!(chunk_size, good),
+                other => panic!("解析结果不对: {other:?}"),
+            }
+        }
     }
 }

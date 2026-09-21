@@ -244,6 +244,20 @@ async fn serve_streams(connection: Connection, peer_id: NodeId, config: ServeCon
             }
 
             Some(ControlMessage::Manifest(manifest)) => {
+                // `read_frame` 已经在解码时校验过，这里是显式的 trust-boundary
+                // 复查：清单一旦进了接收流程就会决定临时文件长度和分片下标。
+                if let Err(err) = manifest.validate() {
+                    warn!(peer = %peer_id.short(), error = %err, "清单非法，拒绝接收");
+                    let _ = write_frame(
+                        &mut send,
+                        &ControlMessage::Abort {
+                            reason: format!("清单非法: {err}"),
+                        },
+                    )
+                    .await;
+                    let _ = send.finish();
+                    continue;
+                }
                 let Some(recv_dir) = config.recv_dir.clone() else {
                     warn!(peer = %peer_id.short(), "收到文件但没配置接收目录，拒绝");
                     let _ = send.finish();
@@ -915,5 +929,83 @@ mod tests {
                 "错误信息应当能说明原因，实际: {text}"
             );
         }
+    }
+
+    /// Issue #3 全链路回归：网络来的畸形清单必须止步于信任边界。
+    ///
+    /// 旧代码里 `chunk_size = 0` 的清单会被接收端接受：服务端回一个 `Resume`
+    /// 进入接收流程，随后在写第一片时 `chunk_count(total_len, 0)` 除零 panic。
+    /// 修复后服务端要么在解码时直接报错、要么显式回 `Abort`，绝不会回 `Resume`，
+    /// 也不会在接收目录里留下任何文件。
+    #[tokio::test]
+    async fn 畸形清单在信任边界被拒绝() {
+        use crate::protocol::manifest::{ChunkHash, FileManifest};
+
+        let signal_addr = spawn_signal_server().await;
+        let server_identity = Identity::generate();
+        let client_identity = Identity::generate();
+
+        let (server_link, client_link) =
+            establish_pair(signal_addr, &server_identity, &client_identity).await;
+
+        let recv_dir =
+            std::env::temp_dir().join(format!("p2p_file_evil_manifest_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&recv_dir);
+        std::fs::create_dir_all(&recv_dir).unwrap();
+
+        let serve_task = tokio::spawn(serve_session(
+            server_link,
+            server_identity.clone(),
+            ServeConfig {
+                allowed_peers: vec![client_identity.node_id()],
+                forwards: vec![],
+                recv_dir: Some(recv_dir.clone()),
+                ..ServeConfig::new()
+            },
+        ));
+
+        let connection = open_session(&client_link, &client_identity).await.unwrap();
+
+        // total_len > 0 且 chunk_size = 0 —— 正是旧代码会 panic 的形状。
+        let evil = FileManifest {
+            file_name: "evil.bin".into(),
+            total_len: 1024,
+            chunk_size: 0,
+            chunks: vec![ChunkHash::of(b"x")],
+            root_hash: ChunkHash::of(b"y"),
+        };
+
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        write_frame(&mut send, &ControlMessage::Manifest(Box::new(evil)))
+            .await
+            .unwrap();
+
+        let reply = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut recv))
+            .await
+            .expect("服务端不该挂死");
+
+        match reply {
+            // 解码阶段就被拒绝：流被关（读失败或 EOF 都算正常拒绝）。
+            Ok(None) | Err(_) => {}
+            // 显式 trust-boundary 复查拒绝：必须说明是清单问题。
+            Ok(Some(ControlMessage::Abort { reason })) => {
+                assert!(reason.contains("清单"), "拒绝原因应说明清单非法: {reason}");
+            }
+            Ok(Some(other)) => panic!(
+                "畸形清单被接收流程接受了（收到 {}），说明信任边界没拦住",
+                other.kind()
+            ),
+        }
+
+        // 关键断言：没有进入接收流程（不会回 Resume），也没落任何文件。
+        assert!(
+            std::fs::read_dir(&recv_dir).unwrap().next().is_none(),
+            "畸形清单不应在接收目录里创建任何文件"
+        );
+
+        connection.close(0u32.into(), b"done");
+        let _ = client_link.endpoint.wait_idle().await;
+        serve_task.abort();
+        let _ = std::fs::remove_dir_all(&recv_dir);
     }
 }

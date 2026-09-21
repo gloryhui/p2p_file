@@ -4,8 +4,10 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use crate::error::Result;
-use crate::protocol::manifest::{ChunkHash, DEFAULT_CHUNK_SIZE, FileManifest};
+use crate::error::{Error, Result};
+use crate::protocol::manifest::{
+    ChunkHash, DEFAULT_CHUNK_SIZE, FileManifest, MAX_CHUNK_SIZE, validate_chunk_size,
+};
 
 /// 边读边算，由一个读取器生成文件清单。
 ///
@@ -15,6 +17,11 @@ pub fn manifest_from_reader<R: Read>(
     chunk_size: u32,
     reader: &mut R,
 ) -> Result<FileManifest> {
+    // 必须在分配缓冲区之前校验：`chunk_size` 直接来自用户/CLI，写成 4 GiB
+    // 会让下面这一行真的去申请 4 GiB，在 `FileManifest::new` 有机会报错之前
+    // 就把进程打爆。
+    validate_chunk_size(chunk_size)?;
+
     let mut buffer = vec![0u8; chunk_size as usize];
     let mut chunks: Vec<ChunkHash> = Vec::new();
     let mut total_len: u64 = 0;
@@ -55,6 +62,14 @@ pub fn manifest_from_path_default(path: &Path) -> Result<FileManifest> {
 /// 从文件里读出指定分片的数据。发送端每个分片调用一次。
 pub fn read_chunk(file: &mut File, offset: u64, len: u32) -> Result<Vec<u8>> {
     use std::io::{Seek, SeekFrom};
+
+    // `len` 通常来自已校验的清单，但这里是「按长度分配」的地方，再挡一道：
+    // 不允许任何调用方用它申请超过单片上限的缓冲。
+    if len > MAX_CHUNK_SIZE {
+        return Err(Error::Protocol(format!(
+            "请求的分片长度 {len} 超过单片上限 {MAX_CHUNK_SIZE}"
+        )));
+    }
 
     file.seek(SeekFrom::Start(offset))?;
     let mut buffer = vec![0u8; len as usize];
@@ -175,6 +190,58 @@ mod tests {
                 "第 {index} 片读出来对不上"
             );
         }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Issue #3：`chunk_size` 必须在分配缓冲区**之前**被拒绝。
+    ///
+    /// 旧代码先 `vec![0u8; chunk_size as usize]` 再交给 `FileManifest::new`
+    /// 检查，所以 `--chunk-size 4294967295` 会真的去申请 4 GiB。
+    #[test]
+    fn 非法分片大小在分配缓冲区之前被拒绝() {
+        use crate::error::Error;
+        use crate::protocol::manifest::{MAX_CHUNK_SIZE, validate_chunk_size};
+
+        for bad in [0u32, 1, MIN_CHUNK_SIZE - 1, MAX_CHUNK_SIZE + 1, u32::MAX] {
+            let mut cursor = std::io::Cursor::new(vec![0xabu8; 128]);
+            let err = manifest_from_reader("t.bin", bad, &mut cursor).unwrap_err();
+            assert!(
+                matches!(err, Error::Protocol(_)),
+                "chunk_size={bad} 应返回协议错误，实际 {err:?}"
+            );
+            // 同一个判断也单独暴露出来给 CLI / 其它调用方复用。
+            assert!(validate_chunk_size(bad).is_err());
+        }
+
+        // 合法值照常工作，边界值也算合法。
+        for good in [MIN_CHUNK_SIZE, DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE] {
+            let mut cursor = std::io::Cursor::new(vec![0xabu8; 128]);
+            let manifest = manifest_from_reader("t.bin", good, &mut cursor).unwrap();
+            assert_eq!(manifest.total_len, 128);
+            assert_eq!(manifest.chunk_size, good);
+        }
+    }
+
+    /// `read_chunk` 是「按长度分配」的地方，超过单片上限必须直接拒绝。
+    #[test]
+    fn 读取超过单片上限的长度会被拒绝() {
+        use crate::error::Error;
+        use crate::protocol::manifest::MAX_CHUNK_SIZE;
+
+        let dir = std::env::temp_dir().join(format!("p2p_file_readlimit_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("small.bin");
+        std::fs::write(&path, b"hello").unwrap();
+        let mut file = File::open(&path).unwrap();
+
+        let err = read_chunk(&mut file, 0, MAX_CHUNK_SIZE + 1).unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "实际 {err:?}");
+        // u32::MAX 也不能触发大分配。
+        assert!(read_chunk(&mut file, 0, u32::MAX).is_err());
+
+        // 正常长度仍然能读。
+        assert_eq!(read_chunk(&mut file, 0, 5).unwrap(), b"hello");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -78,8 +78,18 @@ impl ControlMessage {
         Ok(postcard::to_allocvec(self)?)
     }
 
+    /// 解码控制消息。
+    ///
+    /// `Manifest` 是「不可信字节直接变成一个会被大量使用的结构体」的唯一入口，
+    /// 所以在这里就把清单完整校验掉：解码成功的 `ControlMessage::Manifest`
+    /// **一定**已经通过 [`FileManifest::validate`]，下游不必再怀疑它。这样
+    /// 未来新增的接收路径也不会因为忘记校验而踩到畸形清单。
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        Ok(postcard::from_bytes(bytes)?)
+        let message: Self = postcard::from_bytes(bytes)?;
+        if let Self::Manifest(manifest) = &message {
+            manifest.validate()?;
+        }
+        Ok(message)
     }
 
     /// 便于日志阅读的简短名字。
@@ -195,6 +205,67 @@ mod tests {
         let message = ControlMessage::Manifest(Box::new(manifest));
         let decoded = ControlMessage::decode(&message.encode().unwrap()).unwrap();
         assert_eq!(message, decoded);
+    }
+
+    /// Issue #3：畸形清单必须在解码这一层就被拒绝。
+    ///
+    /// 旧代码 `decode` 只是 `postcard::from_bytes`，攻击者可以自己算出根哈希，
+    /// 却把 `chunk_size` 写成 0 —— 解出来的清单一路走到接收端才 `div_ceil(0)` panic。
+    #[test]
+    fn 畸形清单在解码时就被拒绝() {
+        use crate::error::Error;
+        use crate::protocol::manifest::{ChunkHash, MIN_CHUNK_SIZE, root_hash_of};
+
+        // chunk_size = 0，但根哈希是自洽的（攻击者自己算的）。
+        let zero_chunk_size = {
+            let chunks = vec![ChunkHash::of(b"x")];
+            let root_hash = root_hash_of("evil.bin", 1024, 0, &chunks);
+            FileManifest {
+                file_name: "evil.bin".into(),
+                total_len: 1024,
+                chunk_size: 0,
+                chunks,
+                root_hash,
+            }
+        };
+        let bytes = ControlMessage::Manifest(Box::new(zero_chunk_size.clone()))
+            .encode()
+            .unwrap();
+        // postcard 自己能解出来，说明「能解码」不代表「可用」。
+        assert!(postcard::from_bytes::<ControlMessage>(&bytes).is_ok());
+        let err = ControlMessage::decode(&bytes).unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "实际 {err:?}");
+
+        // 分片数与 total_len 不符：根哈希同样自洽。
+        let mismatched = {
+            let chunks = vec![ChunkHash::of(b"a")];
+            let root_hash = root_hash_of("a.bin", 10_000_000, MIN_CHUNK_SIZE, &chunks);
+            FileManifest {
+                file_name: "a.bin".into(),
+                total_len: 10_000_000,
+                chunk_size: MIN_CHUNK_SIZE,
+                chunks,
+                root_hash,
+            }
+        };
+        let bytes = ControlMessage::Manifest(Box::new(mismatched))
+            .encode()
+            .unwrap();
+        assert!(matches!(
+            ControlMessage::decode(&bytes).unwrap_err(),
+            Error::Protocol(_)
+        ));
+
+        // 根哈希根本不对。
+        let mut bad_root = FileManifest::new("b.bin", 0, MIN_CHUNK_SIZE, vec![]).unwrap();
+        bad_root.root_hash = ChunkHash::of(b"nope");
+        let bytes = ControlMessage::Manifest(Box::new(bad_root))
+            .encode()
+            .unwrap();
+        assert!(matches!(
+            ControlMessage::decode(&bytes).unwrap_err(),
+            Error::Protocol(_)
+        ));
     }
 
     #[test]
