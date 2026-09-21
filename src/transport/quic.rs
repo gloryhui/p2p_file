@@ -9,7 +9,13 @@
 //! 成立的前提是：**任何连接都必须先跑完应用层握手**。QUIC 提供的是加密和
 //! 完整性，握手提供的是身份确认；少了握手，中间人就挡不住了。
 //! 这条约束不能省。
+//!
+//! 但「跑了握手」还不够：如果签名载荷不含任何和当前 TLS 会话相关的东西，
+//! 攻击者可以建立两条独立连接（A↔M、M↔B）原样转发握手消息，让 A、B 各自
+//! 都验证通过。为此应用层握手必须把 [`ChannelBinding`]（由当前连接的 TLS
+//! exporter 导出）纳入签名载荷，见 [`crate::transport::handshake`]。
 
+use std::fmt;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -30,6 +36,69 @@ pub const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// 空闲超时。超过这个时间没有任何活动就认为连接死了。
 pub const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 导出会话绑定值时使用的 TLS exporter 标签（RFC 5705）。
+///
+/// 标签是固定的：只要双方在同一条 TLS 会话上、传同样的标签和 context，
+/// 就会导出完全相同的字节。
+pub const CHANNEL_BINDING_LABEL: &[u8] = b"p2p_file/channel-binding/v1";
+
+/// 会话绑定值长度。32 字节足够，且不会触发 exporter 的长度限制。
+pub const CHANNEL_BINDING_LEN: usize = 32;
+
+/// 当前 QUIC/TLS 会话的通道绑定值（channel binding）。
+///
+/// 这是把应用层 Ed25519 认证钉死在**这一条** TLS 会话上的关键：绑定值由
+/// [`quinn::Connection::export_keying_material`] 从当前会话的 TLS 密钥材料派生，
+/// 不同 TLS 会话（哪怕对端、参数完全相同）导出的是各自独立的伪随机值。
+///
+/// 因此中间人无法建立 A↔M、M↔B 两条连接后原样转发应用层握手：A 用 A↔M 的
+/// 绑定值签名，B 用 M↔B 的绑定值校验，签名必然对不上。
+///
+/// 安全约束：绑定值**只能**来自当前连接。本类型字段私有，唯一的公开构造入口
+/// 是 [`ChannelBinding::from_connection`]，从类型上杜绝调用方传常量、空值或
+/// 自己随机出来的值。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ChannelBinding([u8; CHANNEL_BINDING_LEN]);
+
+impl ChannelBinding {
+    /// 从当前 QUIC/TLS 会话导出绑定值。
+    ///
+    /// 必须在 TLS 握手完成后调用；调用方拿到 [`quinn::Connection`] 时握手
+    /// 已经完成，所以正常路径不会失败，失败会得到明确错误而不是 panic。
+    pub fn from_connection(connection: &quinn::Connection) -> Result<Self> {
+        let mut binding = [0u8; CHANNEL_BINDING_LEN];
+        connection
+            .export_keying_material(&mut binding, CHANNEL_BINDING_LABEL, b"")
+            .map_err(|_| {
+                Error::Transport("导出 TLS 会话绑定值失败：TLS 握手尚未完成或连接已失效".into())
+            })?;
+        Ok(Self(binding))
+    }
+
+    /// 供签名载荷使用。
+    pub fn as_bytes(&self) -> &[u8; CHANNEL_BINDING_LEN] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ChannelBinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // 绑定值是会话相关的伪随机串，不是长期密钥，但也没有进日志的必要。
+        f.write_str("ChannelBinding(<32 bytes>)")
+    }
+}
+
+/// 仅测试用：直接指定绑定值。
+///
+/// 用来模拟「不同会话导出不同绑定值」以及「翻转 1 bit」这类场景；
+/// 生产代码拿不到这个入口（`cfg(test)`），只能从真实连接导出。
+#[cfg(test)]
+impl ChannelBinding {
+    pub(crate) fn from_bytes_for_test(bytes: [u8; CHANNEL_BINDING_LEN]) -> Self {
+        Self(bytes)
+    }
+}
 
 static CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
 
@@ -218,8 +287,10 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::Identity;
     use crate::protocol::frame::{read_frame, write_frame};
     use crate::protocol::message::ControlMessage;
+    use crate::transport::handshake::{handshake_initiator, handshake_responder};
 
     #[test]
     fn 加密后端可以重复安装() {
@@ -338,5 +409,118 @@ mod tests {
         connection.close(0u32.into(), b"bye");
         client.wait_idle().await;
         server_task.await.unwrap();
+    }
+
+    /// 同一条 QUIC/TLS 会话上，两侧导出的绑定值必须一致，握手才能成功。
+    ///
+    /// 这是 channel binding 的基本前提：TLS exporter 是对称的。若两侧拿到的
+    /// 绑定值不同，签名载荷就不同，正常握手都会被拒。
+    #[tokio::test]
+    async fn 同一条连接两侧绑定值一致且能完成握手() {
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let bob_id = bob.node_id();
+
+        let server = server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let incoming = server.accept().await.expect("应当收到连接");
+            let connection = incoming.await.expect("握手应当成功");
+
+            // 绑定值只能从当前会话导出，双方各导一份。
+            let binding = ChannelBinding::from_connection(&connection).expect("导出绑定值");
+            let (mut send, mut recv) = connection.accept_bi().await.expect("应当收到握手流");
+            let outcome = handshake_responder(&mut send, &mut recv, &bob, &binding)
+                .await
+                .expect("接收方认证应当成功");
+            let _ = send.finish();
+
+            connection.closed().await;
+            server.wait_idle().await;
+            (binding, outcome)
+        });
+
+        let client = client_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let connection = connect(&client, server_addr, "127.0.0.1").await.unwrap();
+        let client_binding = ChannelBinding::from_connection(&connection).expect("导出绑定值");
+
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        let outcome = handshake_initiator(&mut send, &mut recv, &alice, &client_binding)
+            .await
+            .expect("发起方认证应当成功");
+        let _ = send.finish();
+
+        connection.close(0u32.into(), b"bye");
+        client.wait_idle().await;
+
+        let (server_binding, server_outcome) = server_task.await.unwrap();
+
+        assert_eq!(
+            client_binding.as_bytes(),
+            server_binding.as_bytes(),
+            "同一条连接两侧导出的绑定值必须一致"
+        );
+        assert_eq!(outcome.peer_node_id, bob_id);
+        assert_eq!(server_outcome.peer_node_id, alice.node_id());
+    }
+
+    /// 两条不同的 QUIC/TLS 会话必须导出不同的绑定值。
+    ///
+    /// 这是防透明 MITM 的核心：攻击者的 A↔M、M↔B 是两条独立会话，绑定值不同，
+    /// 原样转发的签名必然验不过。
+    #[tokio::test]
+    async fn 不同连接导出的绑定值不同() {
+        let server = server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let first = server.accept().await.expect("应当收到第一条连接");
+            let first = first.await.expect("第一条握手应当成功");
+            let first_binding = ChannelBinding::from_connection(&first).expect("导出第一条绑定值");
+
+            let second = server.accept().await.expect("应当收到第二条连接");
+            let second = second.await.expect("第二条握手应当成功");
+            let second_binding =
+                ChannelBinding::from_connection(&second).expect("导出第二条绑定值");
+
+            first.closed().await;
+            second.closed().await;
+            server.wait_idle().await;
+            (first_binding, second_binding)
+        });
+
+        let client = client_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let first = connect(&client, server_addr, "127.0.0.1").await.unwrap();
+        let first_binding = ChannelBinding::from_connection(&first).expect("导出绑定值");
+        let second = connect(&client, server_addr, "127.0.0.1").await.unwrap();
+        let second_binding = ChannelBinding::from_connection(&second).expect("导出绑定值");
+
+        assert_ne!(
+            first_binding.as_bytes(),
+            second_binding.as_bytes(),
+            "不同会话必须导出不同的绑定值"
+        );
+
+        first.close(0u32.into(), b"bye");
+        second.close(0u32.into(), b"bye");
+        client.wait_idle().await;
+
+        let (server_first, server_second) = server_task.await.unwrap();
+        assert_eq!(
+            first_binding.as_bytes(),
+            server_first.as_bytes(),
+            "第一条连接两侧绑定值必须一致"
+        );
+        assert_eq!(
+            second_binding.as_bytes(),
+            server_second.as_bytes(),
+            "第二条连接两侧绑定值必须一致"
+        );
+        assert_ne!(
+            server_first.as_bytes(),
+            server_second.as_bytes(),
+            "服务端侧两条会话的绑定值也必须不同"
+        );
     }
 }
