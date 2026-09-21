@@ -36,6 +36,7 @@ pub const TRANSACTION_ID_LEN: usize = 12;
 const METHOD_BINDING: u16 = 0x0001;
 
 const ATTR_MAPPED_ADDRESS: u16 = 0x0001;
+const ATTR_CHANGE_REQUEST: u16 = 0x0003;
 const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 const ATTR_SOFTWARE: u16 = 0x8022;
 const ATTR_FINGERPRINT: u16 = 0x8028;
@@ -90,6 +91,11 @@ pub enum Method {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Attribute {
     MappedAddress(SocketAddr),
+    /// RFC 5780 CHANGE-REQUEST flags: change IP and/or port of the response.
+    ChangeRequest {
+        change_ip: bool,
+        change_port: bool,
+    },
     XorMappedAddress(SocketAddr),
     ResponseOrigin(SocketAddr),
     OtherAddress(SocketAddr),
@@ -113,11 +119,27 @@ pub struct Message {
 impl Message {
     /// 生成一个 Binding 请求。
     pub fn binding_request(transaction_id: [u8; TRANSACTION_ID_LEN]) -> Self {
+        Self::binding_request_with_change(transaction_id, false, false)
+    }
+
+    /// 生成一个带 RFC 5780 CHANGE-REQUEST 的 Binding 请求。
+    pub fn binding_request_with_change(
+        transaction_id: [u8; TRANSACTION_ID_LEN],
+        change_ip: bool,
+        change_port: bool,
+    ) -> Self {
         Self {
             method: Method::Binding,
             class: MessageClass::Request,
             transaction_id,
-            attributes: Vec::new(),
+            attributes: if change_ip || change_port {
+                vec![Attribute::ChangeRequest {
+                    change_ip,
+                    change_port,
+                }]
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -341,6 +363,21 @@ fn encode_attribute(
         Attribute::MappedAddress(addr) => {
             encode_address_attribute(out, ATTR_MAPPED_ADDRESS, *addr, false, transaction_id)
         }
+        Attribute::ChangeRequest {
+            change_ip,
+            change_port,
+        } => {
+            let mut flags = 0u32;
+            if *change_ip {
+                flags |= 0x04;
+            }
+            if *change_port {
+                flags |= 0x02;
+            }
+            out.extend_from_slice(&ATTR_CHANGE_REQUEST.to_be_bytes());
+            out.extend_from_slice(&4u16.to_be_bytes());
+            out.extend_from_slice(&flags.to_be_bytes());
+        }
         Attribute::XorMappedAddress(addr) => {
             encode_address_attribute(out, ATTR_XOR_MAPPED_ADDRESS, *addr, true, transaction_id)
         }
@@ -485,6 +522,19 @@ fn decode_attribute(
         ATTR_SOFTWARE => Ok(Attribute::Software(
             String::from_utf8_lossy(value).into_owned(),
         )),
+        ATTR_CHANGE_REQUEST => {
+            if value.len() != 4 {
+                return Err(Error::Stun(format!(
+                    "CHANGE-REQUEST 长度应为 4，实际 {}",
+                    value.len()
+                )));
+            }
+            let flags = u32::from_be_bytes(value.try_into().unwrap());
+            Ok(Attribute::ChangeRequest {
+                change_ip: flags & 0x04 != 0,
+                change_port: flags & 0x02 != 0,
+            })
+        }
         _ => Ok(Attribute::Unknown {
             kind,
             value: value.to_vec(),
@@ -568,8 +618,20 @@ pub async fn query_binding_with(
     server: SocketAddr,
     timeout: Duration,
 ) -> Result<StunResult> {
+    query_binding_with_change(socket, server, timeout, false, false).await
+}
+
+/// 用指定 socket 发 Binding 请求，可选携带 RFC 5780 CHANGE-REQUEST。
+pub async fn query_binding_with_change(
+    socket: &UdpSocket,
+    server: SocketAddr,
+    timeout: Duration,
+    change_ip: bool,
+    change_port: bool,
+) -> Result<StunResult> {
     let transaction_id: [u8; TRANSACTION_ID_LEN] = rand::random();
-    let request = Message::binding_request(transaction_id).encode();
+    let request =
+        Message::binding_request_with_change(transaction_id, change_ip, change_port).encode();
 
     socket.send_to(&request, server).await?;
 
@@ -687,6 +749,19 @@ mod tests {
         let tail = &encoded[HEADER_LEN..];
         assert_eq!(u16::from_be_bytes([tail[0], tail[1]]), ATTR_FINGERPRINT);
         assert_eq!(u16::from_be_bytes([tail[2], tail[3]]), 4);
+    }
+
+    #[test]
+    fn rfc5780_change_request往返() {
+        let message = Message::binding_request_with_change([0xAB; 12], true, true);
+        let decoded = roundtrip(&message);
+        assert_eq!(
+            decoded.attributes,
+            vec![Attribute::ChangeRequest {
+                change_ip: true,
+                change_port: true,
+            }]
+        );
     }
 
     #[test]

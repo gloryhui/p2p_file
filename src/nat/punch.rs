@@ -29,13 +29,13 @@ const PROBE_TOKEN_LEN: usize = 16;
 ///
 /// # 为什么必须允许「任意地址」
 ///
-/// 很多 NAT（地址相关映射，ADM）的公网端口是**按目标 IP 分配**的：向 STUN
-/// 服务器发包时拿到的是端口 A，向对端发包时 NAT 会另分配端口 B。于是
-/// 双方互相发往「信令里公布的那个端口 A」的包都会被打掉。
+/// 某些 NAT 的公网端口是**按目标 IP 分配**的：向 STUN 服务器发包时拿到的是端口 A，
+/// 向对端发包时 NAT 可能另分配端口 B。于是双方互相发往「信令里公布的那个端口 A」的
+/// 包可能被打掉。
 ///
 /// 但这时对端的探测包仍然能到达我们（因为我们发给它的包已经打开了它那一侧
-/// 的映射），只是**源端口是 B 而不是 A**。所以要打通 ADM，就必须认这个
-/// 「意料之外」的源地址，把它当作对端真正的地址。令牌就是为这个兜底设计的。
+/// 的映射），只是**源端口是 B 而不是 A**。探测器因此允许在令牌认证通过后记录
+/// 意外源地址，但这不是对任何 ADM NAT 都能穿透的保证。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct PunchToken([u8; PROBE_TOKEN_LEN]);
 
@@ -104,8 +104,8 @@ pub fn is_probe_with_token(data: &[u8], token: &PunchToken) -> bool {
 
 /// 向 `remote` 打洞，直到收到回应。
 ///
-/// 返回实际收到回包的那个地址。ADM 型 NAT 下这个地址**不等于** `remote`，
-/// 那正是我们要的：它才是对端真实的映射端口。
+/// 返回实际收到回包的那个地址。某些地址相关 mapping 下这个地址可能**不等于**
+/// `remote`；探测包实际到达只是连通性证据，不是 NAT 类型或 filtering 的证明。
 pub async fn simultaneous_open(
     socket: &UdpSocket,
     remote: SocketAddr,
@@ -123,8 +123,8 @@ pub async fn simultaneous_open(
 /// 收到回包就说明「我们发给它的包穿过了它的 NAT，它发给我们的包也穿过了
 /// 我们的 NAT」，也就是双向的洞都通了，可以直接开始传数据。
 ///
-/// 注意这里**不要求**回包来自候选列表：ADM 型 NAT 下对端的真实源端口和
-/// 公布的端口不同，只有认下这个源地址才能打通。安全性由令牌保证。
+/// 注意这里**不要求**回包来自候选列表：某些 NAT 会让真实源端口与公布端口不同。
+/// 安全性由令牌提供，但令牌不保证 NAT 穿透。
 pub async fn simultaneous_open_any(
     socket: &UdpSocket,
     candidates: &[SocketAddr],
@@ -176,10 +176,18 @@ pub async fn simultaneous_open_any(
                         tracing::info!(
                             %from,
                             attempt,
-                            "打洞成功（对端真实端口和公布的候选不同，多半是地址相关映射型 NAT）"
+                        "打洞成功（对端真实源地址和公布的候选不同；令牌已认证本次探测）"
                         );
                     }
                     return Ok(from);
+                }
+                Ok(Err(err)) if is_transient_udp_error(&err) => {
+                    // Windows reports an ICMP Port Unreachable for a dead UDP
+                    // candidate as WSAECONNRESET. It is a per-candidate signal,
+                    // not a failure of the punch session; keep probing the live
+                    // candidates in this round.
+                    tracing::debug!(error = %err, "忽略候选地址的瞬时 UDP 错误");
+                    continue;
                 }
                 Ok(Err(err)) => return Err(err.into()),
                 Err(_) => break,
@@ -195,6 +203,15 @@ pub async fn simultaneous_open_any(
         config.attempts,
         config.interval
     )))
+}
+
+fn is_transient_udp_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::NotConnected
+    )
 }
 
 /// 保活循环：定期发探测包，维持 NAT 映射不被回收。
@@ -395,10 +412,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 公布的候选不对时仍能靠令牌认下对端真实地址() {
-        // 这是地址相关映射（ADM）型 NAT 的关键场景：STUN 探到的端口只对
-        // STUN 服务器有效，真正发给对端时 NAT 会换一个端口。对端发来的
-        // 探测包源端口因此**不在候选列表里**，但必须认下来。
+    async fn 未知源地址但令牌正确时可识别探测包() {
+        // 令牌只证明探测包属于本次会话：即使源地址不在候选列表里，也可以
+        // 记录实际源地址。这个 localhost 测试不声称模拟或证明真实 ADM NAT。
         let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let a_addr = a.local_addr().unwrap();
