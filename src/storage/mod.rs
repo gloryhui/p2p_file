@@ -57,7 +57,12 @@ impl PartialDownload {
     /// 开始（或继续）一个下载。
     ///
     /// 临时文件与位图已存在且自洽时自动续传。
+    ///
+    /// 入口先做一次完整 [`FileManifest::validate`]：这个结构体会按
+    /// `manifest.total_len` 直接 `set_len` 出文件、按 `chunk_count` 分配位图，
+    /// 是「不可信清单」最危险的下游。校验不通过就什么都不碰。
     pub fn create(dir: &Path, manifest: FileManifest) -> Result<Self> {
+        manifest.validate()?;
         fs::create_dir_all(dir)?;
 
         let target_path = Self::target_path_for(dir, &manifest);
@@ -427,6 +432,70 @@ mod tests {
 
         assert!(!temp.exists());
         assert!(!PartialDownload::state_path_for(&dir, &manifest).exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Issue #3：畸形清单必须在**碰文件系统之前**被拒绝。
+    ///
+    /// `PartialDownload::create` 会按 `total_len` 直接 `set_len`、按
+    /// `chunk_count` 分配位图，是畸形清单最危险的下游。旧代码在这里不校验，
+    /// 后面的 `write_chunk -> verify_chunk -> chunk_len -> div_ceil(0)` 会 panic。
+    #[test]
+    fn 畸形清单在创建下载前被拒绝() {
+        let dir = temp_dir("evil_manifest");
+
+        let cases = vec![
+            // chunk_size = 0：旧代码会在写第一片时除零 panic。
+            FileManifest {
+                file_name: "evil.bin".into(),
+                total_len: 1024,
+                chunk_size: 0,
+                chunks: vec![ChunkHash::of(b"x")],
+                root_hash: ChunkHash::of(b"y"),
+            },
+            // 分片数与 total_len 不符。
+            FileManifest {
+                file_name: "evil.bin".into(),
+                total_len: 10_000_000,
+                chunk_size: MIN_CHUNK_SIZE,
+                chunks: vec![ChunkHash::of(b"x")],
+                root_hash: ChunkHash::of(b"y"),
+            },
+            // 根哈希不对。
+            FileManifest {
+                file_name: "evil.bin".into(),
+                total_len: 0,
+                chunk_size: MIN_CHUNK_SIZE,
+                chunks: vec![],
+                root_hash: ChunkHash::of(b"y"),
+            },
+            // 极端 total_len：不能让 set_len 被拉到一个天文数字。
+            FileManifest {
+                file_name: "evil.bin".into(),
+                total_len: u64::MAX,
+                chunk_size: MIN_CHUNK_SIZE,
+                chunks: vec![ChunkHash::of(b"x")],
+                root_hash: ChunkHash::of(b"y"),
+            },
+        ];
+
+        for (index, manifest) in cases.into_iter().enumerate() {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                PartialDownload::create(&dir, manifest.clone())
+            }));
+            let result =
+                outcome.unwrap_or_else(|_| panic!("第 {index} 个畸形清单把 create 打 panic 了"));
+            let err = result.expect_err("畸形清单必须被拒绝");
+            assert!(
+                matches!(err, Error::Protocol(_)),
+                "第 {index} 个: 实际 {err:?}"
+            );
+            assert!(
+                fs::read_dir(&dir).unwrap().next().is_none(),
+                "第 {index} 个畸形清单不该创建任何文件"
+            );
+        }
+
         fs::remove_dir_all(&dir).unwrap();
     }
 }

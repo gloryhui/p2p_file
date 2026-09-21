@@ -305,9 +305,26 @@ A、B 的签名和随机数各自自洽，验证全过，但业务流量实际�
 
 ## 5. 文件传输协议要点
 
-- **分片**：固定大小分片（建议 256KB ~ 1MB）；每片单独校验、单独重传。
+- **分片**：固定大小分片（`MIN_CHUNK_SIZE` 16 KiB ~ `MAX_CHUNK_SIZE` 16 MiB，默认
+  `DEFAULT_CHUNK_SIZE` 256 KiB）；每片单独校验、单独重传。
 - **清单（manifest）**：文件名、大小、分片大小、每片 BLAKE3、整文件根哈希。
   接收端拿到根哈希后先确认，再开始收数据。
+- **清单校验（信任边界）**：根哈希覆盖全部字段，所以它能检出**链路中间**的篡改，
+  但**不防发送端本身**——对端可以自己算一个自洽的根哈希，却把 `chunk_size` 写成 0、
+  或把分片数写成与 `total_len` 对不上。因此所有来自网络的清单必须先过
+  `FileManifest::validate()`：分片大小范围、分片数 `<= u32::MAX`、分片数与
+  `total_len / chunk_size` **精确一致**、根哈希自洽，任一项不过都只返回
+  `Error::Protocol`。
+  - `FileManifest::from_bytes()` 走完整 `validate()`（不再只查根哈希）；
+  - `ControlMessage::decode()` 在解码时就校验清单，所以「能解出来的 Manifest 一定合法」；
+  - `receive_file()` / `serve_streams()` / `receive_file_on_stream()` 与
+    `PartialDownload::create()` 再各自显式复查一次，未来新增调用点不会漏；
+  - `chunk_count()` / `chunk_len_at()` / `chunk_offset()` 对 `chunk_size == 0`
+    和极端 `total_len` 都不会 panic（`div_ceil(0)` 与乘法溢出都被挡住）；
+  - 发送端 `manifest_from_reader()` 在 `vec![0u8; chunk_size]` **之前**校验，
+    CLI 也用 clap value parser 提前拒绝非法 `--chunk-size`。
+  - 有效上限：分片数受 `MAX_FRAME_LEN`（16 MiB，每片 32 字节哈希）限制在约 52 万，
+    因此单文件实际上限约 8 TiB；这是帧格式的既有约束，不是新加的静默限制。
 - **断点续传**：接收端持久化「已校验分片位图」，中断后只补缺失分片。
 - **并行度**：QUIC 多流并行拉取分片，配合流控避免打爆对端。
 - **落盘**：先写临时文件 + 位图，全部校验通过后再改名为目标文件，避免半成品被误用。

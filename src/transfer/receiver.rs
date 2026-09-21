@@ -70,6 +70,10 @@ pub async fn receive_file(
         }
     };
 
+    // `read_frame` 已经通过 `ControlMessage::decode` 校验过，这里再挡一次：
+    // 这条路径将来可能换成别的解码方式，而它下面就是「按清单分配文件」。
+    manifest.validate()?;
+
     receive_file_on_stream(send, recv, manifest, out_dir, outcome.peer_node_id).await
 }
 
@@ -84,6 +88,10 @@ pub async fn receive_file_on_stream(
     out_dir: &Path,
     peer_node_id: NodeId,
 ) -> Result<ReceiveReport> {
+    // 入口防御性校验：这个函数的契约是「只接受已经 validate 过的清单」，
+    // 但它是对外的 pub 入口，未来新增调用点时不应该有踩坑的机会。
+    manifest.validate()?;
+
     tracing::info!(
         peer = %peer_node_id.short(),
         file = %manifest.file_name,

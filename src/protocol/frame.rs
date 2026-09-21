@@ -54,15 +54,33 @@ where
 /// 读一帧原始载荷，并指定这一层协议自己的长度上限。
 ///
 /// 长度头必须先于分配被检查：超限直接报错，绝不按对端声称的长度去 `Vec` 分配。
+///
+/// 长度头要区分「一个字节都没读到」和「读到一半」：前者是对端干净关闭，返回
+/// `Ok(None)`；后者是帧中间断流，属于协议错误。用 `read_exact` 做不到这个区分
+/// ——它两种情况都报 `UnexpectedEof`。
 pub async fn read_raw_frame_limited<R>(reader: &mut R, max_len: u32) -> Result<Option<Vec<u8>>>
 where
     R: AsyncRead + Unpin,
 {
     let mut len_bytes = [0u8; 4];
-    match reader.read_exact(&mut len_bytes).await {
-        Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(err) => return Err(err.into()),
+    let mut filled = 0usize;
+    while filled < len_bytes.len() {
+        match reader.read(&mut len_bytes[filled..]).await {
+            // 对端关闭：已经读到的字节数决定这是干净关闭还是半截帧。
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    if filled == 0 {
+        return Ok(None);
+    }
+    if filled < len_bytes.len() {
+        return Err(Error::Protocol(format!(
+            "帧长度头只读到 {filled}/4 字节连接就断了"
+        )));
     }
 
     let len = u32::from_le_bytes(len_bytes);
@@ -167,6 +185,44 @@ mod tests {
             matches!(err, Error::Protocol(_)),
             "应报协议错误，实际 {err:?}"
         );
+    }
+
+    /// 长度头读到 1~3 字节就断流：必须是协议错误，不能当成「对端干净关闭」。
+    ///
+    /// 旧代码用 `read_exact` 读长度头，`UnexpectedEof` 一律返回 `Ok(None)`，
+    /// 于是「半截帧」被静默当成正常结束——调用方会以为文件传完了。
+    #[tokio::test]
+    async fn 半截长度头报错而不是干净关闭() {
+        for partial in 1..4usize {
+            let (mut a, mut b) = tokio::io::duplex(64);
+            let prefix = vec![0xabu8; partial];
+            tokio::spawn(async move {
+                a.write_all(&prefix).await.unwrap();
+                drop(a);
+            });
+            let got = read_raw_frame(&mut b).await;
+            match got {
+                Err(Error::Protocol(_)) => {}
+                other => panic!("{partial} 字节长度头应报协议错误，实际 {other:?}"),
+            }
+        }
+    }
+
+    /// 0 字节 EOF（连长度头都没开始）才是干净关闭。
+    #[tokio::test]
+    async fn 零字节长度头是干净关闭() {
+        let (a, mut b) = tokio::io::duplex(64);
+        drop(a);
+        assert!(read_raw_frame(&mut b).await.unwrap().is_none());
+
+        // 长度头本身就是全 0 是合法的空帧，不能被误判成关闭。
+        let (mut a, mut b) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            a.write_all(&0u32.to_le_bytes()).await.unwrap();
+            a.flush().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        });
+        assert_eq!(read_raw_frame(&mut b).await.unwrap(), Some(Vec::new()));
     }
 
     #[tokio::test]
