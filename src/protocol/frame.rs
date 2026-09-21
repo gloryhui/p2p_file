@@ -17,10 +17,21 @@ pub async fn write_raw_frame<W>(writer: &mut W, payload: &[u8]) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
+    write_raw_frame_limited(writer, payload, MAX_FRAME_LEN).await
+}
+
+/// 写一帧原始载荷，并指定这一层协议自己的长度上限。
+///
+/// 信令是公网上的小控制消息，不该复用业务分片那 16 MiB 的上限；调用方传一个
+/// 远小的 `max_len`，避免对端用长度头逼着服务端提前分配大缓冲。
+pub async fn write_raw_frame_limited<W>(writer: &mut W, payload: &[u8], max_len: u32) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let len = payload.len();
-    if len > MAX_FRAME_LEN as usize {
+    if len > max_len as usize {
         return Err(Error::Protocol(format!(
-            "帧过大：{len} 字节，上限 {MAX_FRAME_LEN}"
+            "帧过大：{len} 字节，上限 {max_len}"
         )));
     }
     writer.write_all(&(len as u32).to_le_bytes()).await?;
@@ -37,6 +48,16 @@ pub async fn read_raw_frame<R>(reader: &mut R) -> Result<Option<Vec<u8>>>
 where
     R: AsyncRead + Unpin,
 {
+    read_raw_frame_limited(reader, MAX_FRAME_LEN).await
+}
+
+/// 读一帧原始载荷，并指定这一层协议自己的长度上限。
+///
+/// 长度头必须先于分配被检查：超限直接报错，绝不按对端声称的长度去 `Vec` 分配。
+pub async fn read_raw_frame_limited<R>(reader: &mut R, max_len: u32) -> Result<Option<Vec<u8>>>
+where
+    R: AsyncRead + Unpin,
+{
     let mut len_bytes = [0u8; 4];
     match reader.read_exact(&mut len_bytes).await {
         Ok(_) => {}
@@ -45,9 +66,9 @@ where
     }
 
     let len = u32::from_le_bytes(len_bytes);
-    if len > MAX_FRAME_LEN {
+    if len > max_len {
         return Err(Error::Protocol(format!(
-            "帧长度 {len} 超过上限 {MAX_FRAME_LEN}，可能不是本协议的流"
+            "帧长度 {len} 超过上限 {max_len}，可能不是本协议的流"
         )));
     }
 
@@ -157,6 +178,40 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         });
         let err = read_frame(&mut b).await.unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "实际 {err:?}");
+    }
+
+    #[tokio::test]
+    async fn 自定义上限比通用上限更严() {
+        // 信令用小上限：同一个载荷在通用上限下能过，在小上限下必须被拒。
+        let payload = vec![0u8; 1024];
+        let (mut a, mut b) = tokio::io::duplex(4096);
+
+        let outgoing = payload.clone();
+        tokio::spawn(async move {
+            write_raw_frame(&mut a, &outgoing).await.unwrap();
+        });
+        assert!(
+            read_raw_frame_limited(&mut b, 4096)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // 声称 1 KiB 但上限只有 64 字节，必须在分配前报错。
+        let (mut a, mut b) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            a.write_all(&1024u32.to_le_bytes()).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+        let err = read_raw_frame_limited(&mut b, 64).await.unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "实际 {err:?}");
+
+        // 写方向同样受上限约束。
+        let (mut a, _b) = tokio::io::duplex(4096);
+        let err = write_raw_frame_limited(&mut a, &payload, 64)
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::Protocol(_)), "实际 {err:?}");
     }
 

@@ -110,6 +110,10 @@ pub struct DirectLink {
     ///
     /// **必须一直持有**：一旦 drop，服务器就会认为本节点下线，对端之后再也
     /// 查不到我们。常驻的 `serve` 靠它保持「在线」。
+    ///
+    /// 持有期间不需要手动保活：`SignalingClient` 后台会按
+    /// `DEFAULT_HEARTBEAT_INTERVAL` 自动心跳，所以即使 QUIC/隧道长时间活跃、
+    /// 上层完全不碰信令，服务器也不会因为空闲把本节点摘掉。
     signal: SignalingClient,
 }
 
