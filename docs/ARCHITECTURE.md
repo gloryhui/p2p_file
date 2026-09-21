@@ -19,7 +19,7 @@ src/
     signal.rs       信令服务器 + 客户端（公网交换候选地址与打洞令牌）
   nat/            NAT 穿透
     stun.rs         STUN Binding 请求，获取公网映射地址
-    classify.rs     NAT 类型判定（EIM / 对称型）
+    classify.rs     NAT mapping 判定（EIM / ADM / APDM / 证据不足）
     punch.rs       打洞状态机（同时开启 + 令牌鉴权）
     portmap.rs     UPnP IGD / NAT-PMP 主动端口映射（空壳）
   net/            把上面这些串起来：STUN → 候选收集 → 信令 → 打洞 → QUIC 端点
@@ -107,10 +107,13 @@ src/
 - **安全**：打洞只解决连通性，不提供身份保证。必须靠密钥指纹 / 预共享码
   （类似短认证字符串 SAS）确认对面是不是目标节点，否则会把文件发给攻击者。
 
-### 地址相关映射（ADM）：一个必须正面处理的坑
+### 地址相关映射（ADM）：只有 RFC 5780 证据完整时才可判定
 
-实测本机所在网络就是这种：向三个 STUN 服务器探测，拿到的公网 IP 相同但**端口不同**，
-`classify` 判定为「地址相关（可以打洞）」。这意味着：
+ADM 需要同一目标 IP 的不同目标端口保持相同映射，同时换目标 IP 后映射发生变化。
+仅向多个不同 IP 各查询一次，即使映射端口不同，也不足以区分 ADM 与 APDM，必须报告
+证据不足。RFC 5780 probing 使用同一个本地 socket 依次访问 primary IP+port、
+alternate IP+primary port、alternate IP+alternate port；服务器不提供 `OTHER-ADDRESS`
+或备用目标失败时，不输出确定的 mapping 类型。
 
 > STUN 探到的那个公网端口，**只对那台 STUN 服务器有效**。拿它去连对端，
 > NAT 会另分配一个端口，对端看到的源地址和我们公布的对不上。
@@ -118,7 +121,7 @@ src/
 天真的实现（只在「源地址 == 候选地址」时才认下探测包）在这里必然失败，
 而且失败得很隐蔽：日志显示打洞超时，看不出原因。
 
-**解法：令牌鉴权 + 接受任意来源。**
+**探测与令牌的边界：**
 
 1. 信令服务器为每一对节点生成一个 128 位随机令牌（`PunchToken`），随候选地址
    一起下发给双方，两边拿到的必须是同一个。
@@ -127,8 +130,9 @@ src/
 3. 收到探测包时，**只要令牌对得上就认**，不管源地址在不在候选列表里；
    并把包里的**实际源地址**当作对端的真实地址记下来。
 
-因为令牌是服务器发的、每次牵线都换新，所以「接受任意来源」不会变成
-「接受任意人」——不知道令牌的扫描包一律丢弃。
+因为令牌是服务器发的、每次牵线都换新，所以「接受任意来源」不会变成「接受任意人」；
+但令牌只认证探测包属于本次会话，不保证某类 NAT 一定能穿透，也不替代 mapping 或
+filtering behavior 的证据。当前实现明确把 filtering 标记为未测量。
 
 令牌一致性由 `同一对节点拿到的令牌必须一致` 这条测试盯着：`try_pair` 必须
 把**同一个**令牌发给两边，否则双方各认一个，谁也打不通谁。
@@ -359,9 +363,9 @@ A、B 的签名和随机数各自自洽，验证全过，但业务流量实际�
 | `transport::quic` | 自签证书 + 跳过 TLS 校验 + 应用层身份 + TLS exporter 会话绑定；keepalive 10s / 空闲 30s |
 | `storage` | `.part` + 经磁盘哈希复核的提示位图、跨平台 checkpoint、长度不符则重来、同名不覆盖 |
 | `transfer` | 拉模型分片传输（窗口 16）、坏片拒收、收尾核对根哈希 |
-| `nat::stun` | 手写 RFC 5389 子集，含 XOR-MAPPED-ADDRESS 与 FINGERPRINT |
-| `nat::classify` | 由多次观测推断映射行为 |
-| `nat::punch` | 同时开启探测循环 + keepalive + 令牌鉴权（支持地址相关映射） |
+| `nat::stun` | 手写 RFC 5389 子集，含 XOR-MAPPED-ADDRESS、FINGERPRINT 与 RFC 5780 属性 |
+| `nat::classify` | RFC 5780 三点证据下推断 mapping；证据不足返回 Unknown |
+| `nat::punch` | 同时开启探测循环 + keepalive + 令牌鉴权；令牌不保证 NAT 穿透 |
 | `discovery::signal` | 牵线服务器与客户端，长度前缀 postcard，含下线清理 |
 | `net` | 把 STUN / 候选收集 / 信令 / 打洞 / QUIC 端点串成 `establish()` |
 | `tunnel` | 通用 TCP 端口转发 + 文件直推 + 空闲重打洞 |
@@ -374,13 +378,14 @@ A、B 的签名和随机数各自自洽，验证全过，但业务流量实际�
 - `scripts/e2e.sh` 起三个真实进程（信令服务器 / serve / tunnel）跑完整链路：
   打洞成功 → 隧道转发 1MB 随机数据无损 → 直推 2MB 文件 sha256 一致 →
   断开后 serve 重新打洞 → 再连一次仍然成功。全部通过。
-- 实测本机 NAT 为「地址相关（可以打洞）」，正是需要令牌鉴权才能打通的类型。
+- 现在只在 RFC 5780 三点证据完整时报告 mapping 分类；未测 filtering，不把分类结果宣称为最终可打洞。
 - 实测 `serve` 正在服务隧道时不再打洞，对端靠「候选顺序重试」兜底连上
   （日志确认走到了这条路径）。
 
 ### STUN 实现说明
 
-- 只实现 Binding 请求/响应，不做认证（用不着：认证在应用层握手）。
+- 实现 Binding 请求/响应及 RFC 5780 CHANGE-REQUEST/OTHER-ADDRESS 属性解析；mapping probing
+  使用同一个 socket 访问 primary 与两个 alternate 目标，不把 filtering 结果混入 mapping。
 - **总是**附带 FINGERPRINT（`0x8028`），CRC-32/ISO-HDLC 后与 `0x5354554E` 异或，必须是最后一个属性。
 - 收到带 FINGERPRINT 的报文会强制校验；不带指纹的报文仍然接受（兼容老服务器）。
 - 地址属性同时支持 IPv4 与 IPv6 的 XOR 编码。
@@ -390,7 +395,7 @@ A、B 的签名和随机数各自自洽，验证全过，但业务流量实际�
 
 1. **对称型 NAT 无解**，必须做中继（M3）。目前只能靠路由器手工端口映射 +
    `--advertise` 绕过。
-2. `classify` 只判映射行为，没判过滤行为（需要 `CHANGE-REQUEST` 支持）。
+2. `classify` 只判映射行为，没判过滤行为；CLI 会明确显示 filtering 未测量。
 3. 只绑 IPv4。候选地址里的 IPv6 链路本地地址已被过滤掉（出了路由器没用），
    全局 IPv6 要等双栈监听做完才能真正用上——而 IPv6 通常没有 NAT，
    能直连就省掉大半麻烦，值得优先做。

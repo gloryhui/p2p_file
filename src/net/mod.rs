@@ -28,7 +28,7 @@ use crate::discovery::signal::{
 };
 use crate::error::{Error, Result};
 use crate::identity::{Identity, NodeId};
-use crate::nat::classify::{MappingBehavior, classify_mapping, observe};
+use crate::nat::classify::{MappingBehavior, MappingEvidence, probe_rfc5780};
 use crate::nat::punch::{PunchConfig, simultaneous_open_any};
 use crate::nat::stun::resolve_server;
 use crate::transport::quic::endpoint_from_socket;
@@ -368,7 +368,7 @@ async fn resolve_peer_waiting(
     }
 }
 
-/// 跑一遍 STUN，拿到公网映射和 NAT 映射行为。
+/// 跑 RFC 5780 mapping probing，拿到公网映射和有证据支撑的 NAT 映射行为。
 async fn probe_public_addr(
     socket: &UdpSocket,
     config: &DirectConfig,
@@ -386,24 +386,49 @@ async fn probe_public_addr(
         }
     }
 
-    let observations = observe(socket, &servers, config.stun_timeout).await?;
-    if observations.is_empty() {
-        warn!("所有 STUN 服务器都没有响应，拿不到公网映射");
-        return Ok((None, MappingBehavior::Unknown));
+    let mut fallback = None;
+    for server in servers {
+        match probe_rfc5780(socket, server, config.stun_timeout).await {
+            Ok(probe) => {
+                for observation in &probe.observations {
+                    info!(
+                        server = %observation.server,
+                        mapped = %observation.mapped_addr,
+                        "STUN mapping 观测"
+                    );
+                }
+                let Some(first) = probe.observations.first() else {
+                    continue;
+                };
+                if fallback.is_none() {
+                    fallback = Some((first.mapped_addr, probe.mapping));
+                }
+                info!(
+                    primary = %server,
+                    evidence = probe.evidence.describe(),
+                    filtering = probe.filtering.describe(),
+                    behavior = probe.mapping.describe(),
+                    "NAT mapping probing 结果"
+                );
+                if probe.evidence == MappingEvidence::Rfc5780 {
+                    return Ok((Some(first.mapped_addr), probe.mapping));
+                }
+            }
+            Err(err) => warn!(%server, error = %err, "STUN mapping probing 失败，跳过"),
+        }
     }
 
-    let public_addr = observations[0].mapped_addr;
-    let mapping = classify_mapping(&observations);
-    for observation in &observations {
-        info!(
-            server = %observation.server,
-            mapped = %observation.mapped_addr,
-            "STUN 观测"
+    if let Some((public_addr, mapping)) = fallback {
+        warn!(
+            %public_addr,
+            behavior = mapping.describe(),
+            "没有完整 RFC 5780 证据，mapping 结果按证据不足处理"
         );
+        return Ok((Some(public_addr), MappingBehavior::Unknown));
     }
-    info!(%public_addr, behavior = mapping.describe(), "本机在公网上的样子");
 
-    Ok((Some(public_addr), mapping))
+    warn!("所有 STUN 服务器都没有响应，拿不到公网映射");
+    Ok((None, MappingBehavior::Unknown))
 }
 
 /// 组装要报给信令服务器的候选地址。
@@ -471,11 +496,14 @@ fn punch_diagnosis(mapping: MappingBehavior, public_addr: Option<SocketAddr>) ->
             "本机是地址端口相关（对称型）NAT：用同一端口访问不同目标会拿到不同的公网端口。\
              这种 NAT 下打洞基本没戏，需要在路由器上做 UDP 端口映射，再用 --advertise 指定对外地址。"
         }
-        MappingBehavior::EndpointIndependent | MappingBehavior::AddressDependent => {
-            "本机 NAT 类型是可以打洞的。多半是对端还没开始发包，或者对端也是对称型 NAT。"
+        MappingBehavior::EndpointIndependent => {
+            "mapping 对打洞较有利，但 filtering behavior 尚未测量，不能单独保证可以打洞。"
+        }
+        MappingBehavior::AddressDependent => {
+            "mapping 呈地址相关，只能说明结果具有条件性；filtering behavior 尚未测量，不能宣称可以打洞。"
         }
         MappingBehavior::Unknown => {
-            "没拿到足够的 STUN 观测，无法判断 NAT 类型。\
+            "没拿到完整 RFC 5780 证据，无法可靠判断 NAT mapping 类型。\
              建议在路由器上做一次 UDP 端口映射，然后用 --advertise 直接指定对外地址。"
         }
     };

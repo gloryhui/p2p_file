@@ -95,7 +95,7 @@ fn cmd_id(key_file: &Option<PathBuf>) -> Result<()> {
 }
 
 async fn cmd_stun(servers: &[String], timeout_secs: u64) -> Result<()> {
-    use p2p_file::nat::{classify_mapping, observe, resolve_server};
+    use p2p_file::nat::{MappingBehavior, MappingEvidence, probe_rfc5780, resolve_server};
 
     // 没指定就用默认的那几个。要判断 NAT 类型至少需要两个不同的观测点。
     let specs: Vec<String> = if servers.is_empty() {
@@ -129,34 +129,47 @@ async fn cmd_stun(servers: &[String], timeout_secs: u64) -> Result<()> {
     println!();
 
     let timeout = Duration::from_secs(timeout_secs);
-    let observations = observe(&socket, &addrs, timeout).await?;
-    if observations.is_empty() {
+    let mut reports = Vec::new();
+    for addr in addrs {
+        match probe_rfc5780(&socket, addr, timeout).await {
+            Ok(report) => {
+                for obs in &report.observations {
+                    println!("  {:<28} 看到的是 {}", obs.server, obs.mapped_addr);
+                }
+                reports.push(report);
+            }
+            Err(err) => println!("跳过 {addr}：{err}"),
+        }
+    }
+    if reports.is_empty() {
         return Err(Error::Discovery(
             "所有 STUN 服务器都没有响应（网络不通或者被防火墙挡了）".into(),
         ));
     }
 
-    for obs in &observations {
-        println!(
-            "  {:<28} 看到的是 {}",
-            obs.server.to_string(),
-            obs.mapped_addr
-        );
-    }
-
-    let behavior = classify_mapping(&observations);
+    let report = reports
+        .iter()
+        .find(|report| report.evidence == MappingEvidence::Rfc5780)
+        .unwrap_or(&reports[0]);
+    let behavior = report.mapping;
     println!();
     println!("NAT 映射行为: {}", behavior.describe());
+    println!("mapping 证据: {}", report.evidence.describe());
+    println!("Filtering behavior: 未测量（当前只测 mapping）");
 
-    if observations.len() < 2 {
-        println!("（只成功查到 1 个服务器，判断不准。多给几个 --server 会更可靠）");
-    } else if behavior.punchable() {
-        println!("这个类型可以打洞，直接按 README 的步骤部署即可。");
-    } else {
-        println!();
-        println!("这个类型打洞基本没戏。两条路：");
-        println!("  1. 在路由器上把 UDP 端口映射到本机，然后用 --advertise 指定对外地址");
-        println!("  2. 等中继（TURN / relay）支持——目前还没做");
+    match behavior {
+        MappingBehavior::EndpointIndependent => {
+            println!("mapping 对打洞较有利，但尚未测 filtering，不能保证最终可打洞。")
+        }
+        MappingBehavior::AddressDependent => {
+            println!("mapping 仅呈条件性地址相关；尚未测 filtering，不能宣称可以打洞。")
+        }
+        MappingBehavior::AddressAndPortDependent => {
+            println!("mapping 对直接打洞不利。可考虑端口映射或中继。")
+        }
+        MappingBehavior::Unknown => {
+            println!("证据不足，不能判断 NAT mapping，也不能宣称可以打洞。")
+        }
     }
 
     println!();
