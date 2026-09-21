@@ -24,7 +24,7 @@ use crate::nat::stun::{StunResult, query_binding_with};
 /// RFC 5780 mapping probing 的证据等级。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MappingEvidence {
-    /// primary 与 OTHER-ADDRESS 提供的两个备用目标都成功响应。
+    /// RFC 5780 行为发现已经取得足够证据；EIM 可以在 Test II 短路。
     Rfc5780,
     /// STUN 服务器没有提供可用的 OTHER-ADDRESS，或备用目标无法完成探测。
     InsufficientEvidence,
@@ -33,7 +33,7 @@ pub enum MappingEvidence {
 impl MappingEvidence {
     pub fn describe(self) -> &'static str {
         match self {
-            Self::Rfc5780 => "RFC 5780 三点探测证据完整",
+            Self::Rfc5780 => "RFC 5780 行为发现证据充分",
             Self::InsufficientEvidence => {
                 "证据不足（服务器不支持 RFC 5780 行为发现或备用探测失败）"
             }
@@ -55,7 +55,7 @@ impl FilteringBehavior {
     }
 }
 
-/// 一次 RFC 5780 mapping probing 的完整报告。
+/// 一次 RFC 5780 mapping probing 的报告。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MappingProbe {
     /// 实际发送过 Binding 的目标及其映射结果。
@@ -108,7 +108,7 @@ impl MappingBehavior {
     pub fn describe(self) -> &'static str {
         match self {
             Self::EndpointIndependent => "端点无关（mapping 有利，但 filtering 未测）",
-            Self::AddressDependent => "地址相关（仅在 RFC 5780 证据完整时成立，不能单独保证打洞）",
+            Self::AddressDependent => "地址相关（仅在 RFC 5780 证据充分时成立，不能单独保证打洞）",
             Self::AddressAndPortDependent => "地址端口相关/对称型（mapping 对打洞不利）",
             Self::Unknown => "未知（证据不足）",
         }
@@ -175,8 +175,11 @@ pub fn classify_mapping(observations: &[StunObservation]) -> MappingBehavior {
     MappingBehavior::Unknown
 }
 
-/// 按 RFC 5780 的 OTHER-ADDRESS 进行三点 mapping probing：
-/// primary IP+port、alternate IP+primary port、alternate IP+alternate port。
+/// 按 RFC 5780 §4.3 的顺序进行 mapping probing。
+///
+/// Test I 访问 primary；Test II 访问 alternate IP + primary port。若两次映射
+/// 相同，已经足以判定 EIM，不再发送 Test III。只有 Test II 改变映射时，才
+/// 访问 alternate IP + alternate port，并据此区分 ADM 与 APDM。
 pub async fn probe_rfc5780(
     socket: &UdpSocket,
     primary: SocketAddr,
@@ -185,6 +188,17 @@ pub async fn probe_rfc5780(
     let first = query_binding_with(socket, primary, timeout).await?;
     let other_address = first.other_address;
     let mut observations = vec![StunObservation::from_result(primary, &first)];
+
+    // RFC 5780 允许在 Test I 发现映射没有发生时，直接报告 effective EIM。
+    if first.mapped_addr == socket.local_addr()? {
+        return Ok(MappingProbe {
+            observations,
+            other_address,
+            mapping: MappingBehavior::EndpointIndependent,
+            evidence: MappingEvidence::Rfc5780,
+            filtering: FilteringBehavior::NotMeasured,
+        });
+    }
 
     let Some(other) = other_address else {
         return Ok(MappingProbe {
@@ -196,31 +210,82 @@ pub async fn probe_rfc5780(
         });
     };
 
-    let alternate_ip_primary_port = SocketAddr::new(other.ip(), primary.port());
-    let targets = [alternate_ip_primary_port, other];
-    for target in targets {
-        match query_binding_with(socket, target, timeout).await {
-            Ok(result) => observations.push(StunObservation::from_result(target, &result)),
-            Err(err) => {
-                tracing::warn!(%target, error = %err, "RFC 5780 备用目标探测失败");
-                return Ok(MappingProbe {
-                    mapping: MappingBehavior::Unknown,
-                    evidence: MappingEvidence::InsufficientEvidence,
-                    filtering: FilteringBehavior::NotMeasured,
-                    observations,
-                    other_address,
-                });
-            }
-        }
+    if !valid_other_address(primary, other) {
+        tracing::warn!(%primary, %other, "STUN OTHER-ADDRESS 不是有效的 RFC 5780 alternate topology");
+        return Ok(MappingProbe {
+            observations,
+            other_address,
+            mapping: MappingBehavior::Unknown,
+            evidence: MappingEvidence::InsufficientEvidence,
+            filtering: FilteringBehavior::NotMeasured,
+        });
     }
 
+    let alternate_ip_primary_port = SocketAddr::new(other.ip(), primary.port());
+    let second = match query_binding_with(socket, alternate_ip_primary_port, timeout).await {
+        Ok(result) => result,
+        Err(err) => {
+            tracing::warn!(target = %alternate_ip_primary_port, error = %err, "RFC 5780 Test II 探测失败");
+            return Ok(MappingProbe {
+                mapping: MappingBehavior::Unknown,
+                evidence: MappingEvidence::InsufficientEvidence,
+                filtering: FilteringBehavior::NotMeasured,
+                observations,
+                other_address,
+            });
+        }
+    };
+    observations.push(StunObservation::from_result(
+        alternate_ip_primary_port,
+        &second,
+    ));
+
+    // RFC 5780 §4.3: Test II 与 Test I 相同即结束，Test III 不需要成功甚至
+    // 不应该被发送；这也是 EIM 在备用端口不可达时仍可确认的关键。
+    if second.mapped_addr == first.mapped_addr {
+        return Ok(MappingProbe {
+            observations,
+            other_address,
+            mapping: MappingBehavior::EndpointIndependent,
+            evidence: MappingEvidence::Rfc5780,
+            filtering: FilteringBehavior::NotMeasured,
+        });
+    }
+
+    let third = match query_binding_with(socket, other, timeout).await {
+        Ok(result) => result,
+        Err(err) => {
+            tracing::warn!(target = %other, error = %err, "RFC 5780 Test III 探测失败");
+            return Ok(MappingProbe {
+                mapping: MappingBehavior::Unknown,
+                evidence: MappingEvidence::InsufficientEvidence,
+                filtering: FilteringBehavior::NotMeasured,
+                observations,
+                other_address,
+            });
+        }
+    };
+    observations.push(StunObservation::from_result(other, &third));
+
     Ok(MappingProbe {
-        mapping: classify_mapping(&observations),
+        mapping: if third.mapped_addr == second.mapped_addr {
+            MappingBehavior::AddressDependent
+        } else {
+            MappingBehavior::AddressAndPortDependent
+        },
         evidence: MappingEvidence::Rfc5780,
         filtering: FilteringBehavior::NotMeasured,
         observations,
         other_address,
     })
+}
+
+fn valid_other_address(primary: SocketAddr, other: SocketAddr) -> bool {
+    !other.ip().is_unspecified()
+        && other.port() != 0
+        && primary.is_ipv4() == other.is_ipv4()
+        && other.ip() != primary.ip()
+        && other.port() != primary.port()
 }
 
 /// 对一个或多个 STUN 服务器做观测。
@@ -332,8 +397,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn rfc5780探测实际访问三点并保留完整证据() {
+    async fn probe_with_mappings(mapped: [SocketAddr; 3], serve_test_iii: bool) -> MappingProbe {
         use crate::nat::stun::{Attribute, Message, MessageClass, Method};
 
         let primary = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -353,16 +417,12 @@ mod tests {
                 alternate_ip_primary_port,
                 alternate_ip_alternate_port,
             ];
-            for (index, socket) in sockets.into_iter().enumerate() {
+            let count = if serve_test_iii { 3 } else { 2 };
+            for (index, socket) in sockets.into_iter().take(count).enumerate() {
                 let mut buffer = [0u8; 1500];
                 let (len, from) = socket.recv_from(&mut buffer).await.unwrap();
                 let request = Message::decode(&buffer[..len]).unwrap();
-                let mapped = if index == 0 {
-                    "198.51.100.7:40000".parse().unwrap()
-                } else {
-                    "198.51.100.7:40001".parse().unwrap()
-                };
-                let mut attributes = vec![Attribute::XorMappedAddress(mapped)];
+                let mut attributes = vec![Attribute::XorMappedAddress(mapped[index])];
                 if index == 0 {
                     attributes.push(Attribute::OtherAddress(alternate_addr));
                 }
@@ -380,17 +440,125 @@ mod tests {
         let report = probe_rfc5780(&socket, primary_addr, Duration::from_secs(1))
             .await
             .unwrap();
+        task.await.unwrap();
+        report
+    }
+
+    #[tokio::test]
+    async fn rfc5780_test_ii与_test_i相同则两步判定_eim() {
+        let report = probe_with_mappings(
+            [
+                "198.51.100.7:40000".parse().unwrap(),
+                "198.51.100.7:40000".parse().unwrap(),
+                "198.51.100.7:49999".parse().unwrap(),
+            ],
+            false,
+        )
+        .await;
+
+        assert_eq!(report.evidence, MappingEvidence::Rfc5780);
+        assert_eq!(report.mapping, MappingBehavior::EndpointIndependent);
+        assert_eq!(report.filtering, FilteringBehavior::NotMeasured);
+        assert_eq!(report.observations.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rfc5780_test_iii与_test_ii相同则判定_adm() {
+        let report = probe_with_mappings(
+            [
+                "198.51.100.7:40000".parse().unwrap(),
+                "198.51.100.7:40001".parse().unwrap(),
+                "198.51.100.7:40001".parse().unwrap(),
+            ],
+            true,
+        )
+        .await;
 
         assert_eq!(report.evidence, MappingEvidence::Rfc5780);
         assert_eq!(report.mapping, MappingBehavior::AddressDependent);
-        assert_eq!(report.filtering, FilteringBehavior::NotMeasured);
         assert_eq!(report.observations.len(), 3);
-        assert_eq!(report.observations[0].server, primary_addr);
-        assert_eq!(
-            report.observations[1].server,
-            SocketAddr::new(alternate_addr.ip(), primary_addr.port())
-        );
-        assert_eq!(report.observations[2].server, alternate_addr);
+    }
+
+    #[tokio::test]
+    async fn rfc5780_test_iii与_test_ii不同则判定_apdm() {
+        let report = probe_with_mappings(
+            [
+                "198.51.100.7:40000".parse().unwrap(),
+                "198.51.100.7:40001".parse().unwrap(),
+                "198.51.100.7:40002".parse().unwrap(),
+            ],
+            true,
+        )
+        .await;
+
+        assert_eq!(report.evidence, MappingEvidence::Rfc5780);
+        assert_eq!(report.mapping, MappingBehavior::AddressAndPortDependent);
+        assert_eq!(report.observations.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_i映射等于本地地址时直接判定有效_eim() {
+        use crate::nat::stun::{Attribute, Message, MessageClass, Method};
+
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = socket.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut buffer = [0u8; 1500];
+            let (len, from) = server.recv_from(&mut buffer).await.unwrap();
+            let request = Message::decode(&buffer[..len]).unwrap();
+            let response = Message {
+                method: Method::Binding,
+                class: MessageClass::SuccessResponse,
+                transaction_id: request.transaction_id,
+                attributes: vec![Attribute::XorMappedAddress(from)],
+            };
+            server.send_to(&response.encode(), from).await.unwrap();
+        });
+
+        let report = probe_rfc5780(&socket, server_addr, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert_eq!(report.mapping, MappingBehavior::EndpointIndependent);
+        assert_eq!(report.evidence, MappingEvidence::Rfc5780);
+        assert_eq!(report.observations.len(), 1);
+        assert_eq!(report.observations[0].mapped_addr, local_addr);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn 非法_other_address报告证据不足() {
+        use crate::nat::stun::{Attribute, Message, MessageClass, Method};
+
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let invalid_other = server_addr;
+        let task = tokio::spawn(async move {
+            let mut buffer = [0u8; 1500];
+            let (len, from) = server.recv_from(&mut buffer).await.unwrap();
+            let request = Message::decode(&buffer[..len]).unwrap();
+            let response = Message {
+                method: Method::Binding,
+                class: MessageClass::SuccessResponse,
+                transaction_id: request.transaction_id,
+                attributes: vec![
+                    Attribute::XorMappedAddress("198.51.100.7:40000".parse().unwrap()),
+                    Attribute::OtherAddress(invalid_other),
+                ],
+            };
+            server.send_to(&response.encode(), from).await.unwrap();
+        });
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let report = probe_rfc5780(&socket, server_addr, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert_eq!(report.mapping, MappingBehavior::Unknown);
+        assert_eq!(report.evidence, MappingEvidence::InsufficientEvidence);
+        assert_eq!(report.observations.len(), 1);
         task.await.unwrap();
     }
 
@@ -406,7 +574,9 @@ mod tests {
                 method: crate::nat::stun::Method::Binding,
                 class: crate::nat::stun::MessageClass::SuccessResponse,
                 transaction_id: request.transaction_id,
-                attributes: vec![crate::nat::stun::Attribute::XorMappedAddress(from)],
+                attributes: vec![crate::nat::stun::Attribute::XorMappedAddress(
+                    "198.51.100.7:40000".parse().unwrap(),
+                )],
             };
             server.send_to(&response.encode(), from).await.unwrap();
         });

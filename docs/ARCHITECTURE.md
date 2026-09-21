@@ -107,7 +107,7 @@ src/
 - **安全**：打洞只解决连通性，不提供身份保证。必须靠密钥指纹 / 预共享码
   （类似短认证字符串 SAS）确认对面是不是目标节点，否则会把文件发给攻击者。
 
-### 地址相关映射（ADM）：只有 RFC 5780 证据完整时才可判定
+### 地址相关映射（ADM）：只有 RFC 5780 行为发现证据充分时才可判定
 
 ADM 需要同一目标 IP 的不同目标端口保持相同映射，同时换目标 IP 后映射发生变化。
 仅向多个不同 IP 各查询一次，即使映射端口不同，也不足以区分 ADM 与 APDM，必须报告
@@ -364,7 +364,7 @@ A、B 的签名和随机数各自自洽，验证全过，但业务流量实际�
 | `storage` | `.part` + 经磁盘哈希复核的提示位图、跨平台 checkpoint、长度不符则重来、同名不覆盖 |
 | `transfer` | 拉模型分片传输（窗口 16）、坏片拒收、收尾核对根哈希 |
 | `nat::stun` | 手写 RFC 5389 子集，含 XOR-MAPPED-ADDRESS、FINGERPRINT 与 RFC 5780 属性 |
-| `nat::classify` | RFC 5780 三点证据下推断 mapping；证据不足返回 Unknown |
+| `nat::classify` | RFC 5780 §4.3 状态机推断 mapping；证据不足返回 Unknown |
 | `nat::punch` | 同时开启探测循环 + keepalive + 令牌鉴权；令牌不保证 NAT 穿透 |
 | `discovery::signal` | 牵线服务器与客户端，长度前缀 postcard，含下线清理 |
 | `net` | 把 STUN / 候选收集 / 信令 / 打洞 / QUIC 端点串成 `establish()` |
@@ -378,14 +378,16 @@ A、B 的签名和随机数各自自洽，验证全过，但业务流量实际�
 - `scripts/e2e.sh` 起三个真实进程（信令服务器 / serve / tunnel）跑完整链路：
   打洞成功 → 隧道转发 1MB 随机数据无损 → 直推 2MB 文件 sha256 一致 →
   断开后 serve 重新打洞 → 再连一次仍然成功。全部通过。
-- 现在只在 RFC 5780 三点证据完整时报告 mapping 分类；未测 filtering，不把分类结果宣称为最终可打洞。
+- 现在只在 RFC 5780 行为发现证据充分时报告 mapping 分类；EIM 可在 Test II
+  短路；未测 filtering，不把分类结果宣称为最终可打洞。
 - 实测 `serve` 正在服务隧道时不再打洞，对端靠「候选顺序重试」兜底连上
   （日志确认走到了这条路径）。
 
 ### STUN 实现说明
 
 - 实现 Binding 请求/响应及 RFC 5780 CHANGE-REQUEST/OTHER-ADDRESS 属性解析；mapping probing
-  使用同一个 socket 访问 primary 与两个 alternate 目标，不把 filtering 结果混入 mapping。
+  按 §4.3 使用同一个 socket，先访问 primary 与 alternate IP+primary port，必要时再访问
+  alternate IP+alternate port，不把 filtering 结果混入 mapping。
 - **总是**附带 FINGERPRINT（`0x8028`），CRC-32/ISO-HDLC 后与 `0x5354554E` 异或，必须是最后一个属性。
 - 收到带 FINGERPRINT 的报文会强制校验；不带指纹的报文仍然接受（兼容老服务器）。
 - 地址属性同时支持 IPv4 与 IPv6 的 XOR 编码。

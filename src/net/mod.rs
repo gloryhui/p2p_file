@@ -422,7 +422,7 @@ async fn probe_public_addr(
         warn!(
             %public_addr,
             behavior = mapping.describe(),
-            "没有完整 RFC 5780 证据，mapping 结果按证据不足处理"
+            "没有充分 RFC 5780 行为发现证据，mapping 结果按证据不足处理"
         );
         return Ok((Some(public_addr), MappingBehavior::Unknown));
     }
@@ -503,7 +503,7 @@ fn punch_diagnosis(mapping: MappingBehavior, public_addr: Option<SocketAddr>) ->
             "mapping 呈地址相关，只能说明结果具有条件性；filtering behavior 尚未测量，不能宣称可以打洞。"
         }
         MappingBehavior::Unknown => {
-            "没拿到完整 RFC 5780 证据，无法可靠判断 NAT mapping 类型。\
+            "没拿到充分 RFC 5780 行为发现证据，无法可靠判断 NAT mapping 类型。\
              建议在路由器上做一次 UDP 端口映射，然后用 --advertise 直接指定对外地址。"
         }
     };

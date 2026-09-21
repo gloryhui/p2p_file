@@ -89,8 +89,9 @@ Filtering behavior: 未测量（当前只测 mapping）
 ```
 
 程序会优先使用支持 RFC 5780 `OTHER-ADDRESS` 的 STUN 服务器，对同一个 socket
-依次探测 primary IP+port、alternate IP+primary port、alternate IP+alternate port。
-只有这些证据完整时，才会区分 EIM / ADM / APDM；跨 IP 且每个 IP 只有一个样本时会保持未知。
+按 RFC 5780 §4.3 先探测 primary IP+port，再探测 alternate IP+primary port；只有
+Test II 映射与 Test I 不同，才继续探测 alternate IP+alternate port。只有 RFC 5780
+行为发现证据充分时，才会区分 EIM / ADM / APDM；跨 IP 且每个 IP 只有一个样本时会保持未知。
 当前只测 mapping，不测 filtering，因此任何 mapping 结果都不能单独等同于最终 punchability。
 
 如果输出是 `地址端口相关/对称型（mapping 对打洞不利）`，请直接跳到
@@ -217,7 +218,7 @@ journalctl --user -u p2p-serve -f
 
 按顺序排查：
 
-1. **先看 NAT mapping**：`$BIN stun`。只有报告明确显示 RFC 5780 证据完整时，
+1. **先看 NAT mapping**：`$BIN stun`。只有报告明确显示 RFC 5780 行为发现证据充分时，
    分类结果才有判别力；filtering 未测量，不能把 mapping 结果当成最终“可打洞”结论。
 
 2. **确认两边都在跑**。打洞是「同时开启」——只有一边发包是打不通的。
@@ -251,13 +252,14 @@ $BIN --log info tunnel --signal $SIGNAL --peer $HOME_ID --listen 127.0.0.1:2222 
 - 隧道搬运 1MB 随机数据无损，支持多条并发连接。
 - 文件直推 2MB，sha256 一致。
 - 断开后 `serve` 重新打洞，再连一次仍然成功。
-- 测试覆盖 RFC 5780 三点 mapping 分类、证据不足、地址相关映射（ADM）样本、令牌一致性、
+- 测试覆盖 RFC 5780 mapping 状态机、证据不足、地址相关映射（ADM）样本、令牌一致性、
   对端被强杀后的下线清理、信令注册认证与资源上限，以及畸形 `FileManifest` 的
   完整校验（`chunk_size=0` / 越界 / 分片数不符 / 根哈希错 / 极端长度都不 panic）。
 
 **只在真机上验证了一半**：
 
-- 本机网络的 mapping 结论只有在 RFC 5780 三点探测成功时才会报告；当前 CLI 不会
+- 本机网络的 mapping 结论只有在 RFC 5780 行为发现证据充分时才会报告（EIM 可在
+  Test II 短路）；当前 CLI 不会
   把 ADM 或 PunchToken 描述成必然可打洞。**两台真正处于不同 NAT 后面的机器之间的
   打洞，我没有条件实测**（需要两个独立网络）。
 
