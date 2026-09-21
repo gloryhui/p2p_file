@@ -19,6 +19,7 @@ mod tests {
     use crate::protocol::manifest::MIN_CHUNK_SIZE;
     use crate::transport::quic::{client_endpoint, connect, server_endpoint};
     use std::fs;
+    use std::io::Write;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -174,6 +175,67 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// bitmap 声称已有的分片如果磁盘内容已损坏，恢复时必须清位并再次请求。
+    #[tokio::test]
+    async fn 损坏的续传分片会被重新请求() {
+        let dir = temp_dir("resume_corrupt_chunk");
+        let send_dir = dir.join("send");
+        let recv_dir = dir.join("recv");
+        fs::create_dir_all(&send_dir).unwrap();
+        fs::create_dir_all(&recv_dir).unwrap();
+
+        let content: Vec<u8> = (0..(MIN_CHUNK_SIZE as usize * 2))
+            .map(|i| (i % 233) as u8)
+            .collect();
+        let source = send_dir.join("corrupt-resume.bin");
+        fs::write(&source, &content).unwrap();
+        let manifest = manifest_from_path(&source, MIN_CHUNK_SIZE).unwrap();
+
+        {
+            let mut download =
+                crate::storage::PartialDownload::create(&recv_dir, manifest.clone()).unwrap();
+            download
+                .write_chunk(0, &content[..MIN_CHUNK_SIZE as usize])
+                .unwrap();
+        }
+        let temp = crate::storage::PartialDownload::temp_path_for(&recv_dir, &manifest);
+        let mut file = fs::OpenOptions::new().write(true).open(&temp).unwrap();
+        file.write_all(&[0xff]).unwrap();
+        file.sync_all().unwrap();
+
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let server = server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let recv_dir_for_task = recv_dir.clone();
+        let receiver_task = tokio::spawn(async move {
+            let incoming = server.accept().await.unwrap();
+            let connection = incoming.await.unwrap();
+            let report = receive_file(&connection, &bob, &recv_dir_for_task).await;
+            connection.closed().await;
+            report
+        });
+
+        let client = client_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let connection = connect(&client, server_addr, "127.0.0.1").await.unwrap();
+        let send_report = send_file(&connection, &alice, &source, MIN_CHUNK_SIZE)
+            .await
+            .unwrap();
+        connection.close(0u32.into(), b"done");
+        client.wait_idle().await;
+
+        let receive_report = tokio::time::timeout(Duration::from_secs(10), receiver_task)
+            .await
+            .expect("接收端应在 10 秒内结束")
+            .unwrap()
+            .expect("接收应当成功");
+        assert_eq!(send_report.chunks_skipped, 0, "损坏分片不能被跳过");
+        assert_eq!(send_report.chunks_sent, 2, "两片都应重新发送");
+        assert_eq!(fs::read(receive_report.output_path).unwrap(), content);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// 对端声明自己有某片、实际却没有，收尾时必须报错而不是产出坏文件。
     #[tokio::test]
     async fn 收尾时发现缺片会报错() {
@@ -206,6 +268,69 @@ mod tests {
 
         // 磁盘上不应该出现正式文件名。
         assert!(!recv_dir.join("partial.bin").exists());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// finalize/rename 失败时，接收端只能发送 Abort；发送端绝不能收到成功报告。
+    ///
+    /// 让 unique_path 穷尽候选名后把 `.part` 改名到一个目录，稳定地产生 rename
+    /// 失败，不依赖运行用户是否有权限修改目录。
+    #[tokio::test]
+    async fn finalize失败时发送端能感知失败() {
+        let dir = temp_dir("finalize_failure");
+        let send_dir = dir.join("send");
+        let recv_dir = dir.join("recv");
+        fs::create_dir_all(&send_dir).unwrap();
+        fs::create_dir_all(&recv_dir).unwrap();
+
+        let content = vec![0x5au8; MIN_CHUNK_SIZE as usize];
+        let source = send_dir.join("finalize.bin");
+        fs::write(&source, &content).unwrap();
+
+        fs::create_dir(recv_dir.join("finalize.bin")).unwrap();
+        for counter in 1..10_000u32 {
+            fs::create_dir(recv_dir.join(format!("finalize ({counter}).bin"))).unwrap();
+        }
+
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let server = server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let recv_dir_for_task = recv_dir.clone();
+
+        let receiver_task = tokio::spawn(async move {
+            let incoming = server.accept().await.unwrap();
+            let connection = incoming.await.unwrap();
+            let result = receive_file(&connection, &bob, &recv_dir_for_task).await;
+            // 等发送端读完 Abort 后主动关闭连接。
+            connection.closed().await;
+            result
+        });
+
+        let client = client_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let connection = connect(&client, server_addr, "127.0.0.1").await.unwrap();
+        let send_result = send_file(&connection, &alice, &source, MIN_CHUNK_SIZE).await;
+        let send_error = send_result.expect_err("receiver finalize 失败时 sender 不能成功");
+        assert!(
+            send_error.to_string().contains("finalize")
+                || send_error.to_string().contains("保存")
+                || send_error.to_string().contains("rename"),
+            "sender 应看到 finalize 失败原因，实际: {send_error}"
+        );
+        connection.close(0u32.into(), b"finalize failed");
+        client.wait_idle().await;
+
+        let receive_error = tokio::time::timeout(Duration::from_secs(10), receiver_task)
+            .await
+            .expect("接收端应在 10 秒内结束")
+            .unwrap()
+            .expect_err("receiver finalize 失败必须返回错误");
+        assert!(
+            receive_error.to_string().contains("I/O")
+                || receive_error.to_string().contains("os error")
+        );
+        assert!(!recv_dir.join("finalize.bin").is_file());
 
         fs::remove_dir_all(&dir).unwrap();
     }

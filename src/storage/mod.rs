@@ -4,14 +4,15 @@
 //!
 //! - 数据先写进 `<名字>.<根哈希前 16 位>.part`，**全部校验通过后**才改名成正式文件，
 //!   中途放弃或崩溃都不会留下一个看起来正常、实际残缺的文件。
-//! - 位图单独存 `<同名>.bitmap`，每片写成功就更新一次，因此崩溃后能接着传。
+//! - 位图单独存 `<同名>.bitmap`。位图是可丢失的恢复提示，不是数据真相；每次
+//!   恢复都会重新校验其中标记为完成的分片。
 //! - 临时文件名带上根哈希，换一个文件（内容不同）不会误用上一次的残留进度。
 //!
 //! 目前用的是同步 `std::fs`。放到异步传输循环里会阻塞执行器，正式实现应当把
 //! 这些调用挪进 `tokio::task::spawn_blocking`（TODO）。
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
@@ -69,10 +70,10 @@ impl PartialDownload {
         let temp_path = Self::temp_path_for(dir, &manifest);
         let state_path = Self::state_path_for(dir, &manifest);
 
-        let mut bitmap = load_bitmap(&state_path, manifest.chunk_count())?;
+        let (mut bitmap, bitmap_needs_repair) = load_bitmap(&state_path, manifest.chunk_count())?;
 
         // 已有的临时文件长度对不上就整个作废，从头来。
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -83,8 +84,37 @@ impl PartialDownload {
         if existing_len != manifest.total_len {
             file.set_len(0)?;
             file.set_len(manifest.total_len)?;
+            // 不允许空位图在文件长度尚未安全落盘时成为恢复状态。
+            file.sync_all()?;
             bitmap = ChunkBitmap::new(manifest.chunk_count());
             save_bitmap(&state_path, &bitmap)?;
+        } else {
+            // bitmap 只说明“上次曾经认为这些片完成”，不能跳过磁盘数据校验。
+            // 每次只分配一个受 manifest 限制的 chunk 缓冲区，避免恢复路径被状态文件
+            // 放大成不受控的内存分配。
+            let mut bitmap_changed = bitmap_needs_repair;
+            for index in bitmap.present() {
+                let (offset, len) = manifest
+                    .chunk_range(index)
+                    .ok_or_else(|| Error::Protocol(format!("位图中的分片 {index} 越界")))?;
+                file.seek(SeekFrom::Start(offset))?;
+                let mut data = vec![0u8; len as usize];
+                match file.read_exact(&mut data) {
+                    Ok(()) if manifest.verify_chunk(index, &data) => {}
+                    Ok(()) => {
+                        bitmap.clear(index)?;
+                        bitmap_changed = true;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        bitmap.clear(index)?;
+                        bitmap_changed = true;
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+            if bitmap_changed {
+                save_bitmap(&state_path, &bitmap)?;
+            }
         }
 
         Ok(Self {
@@ -144,9 +174,14 @@ impl PartialDownload {
             .ok_or_else(|| Error::Protocol("下载已结束，无法继续写入".into()))?;
         file.seek(SeekFrom::Start(offset))?;
         file.write_all(data)?;
+        // 先把数据本身推到稳定存储，再发布新的完成位。即使 bitmap 的替换在
+        // Windows 上经历“删除旧文件 -> 改名”的短窗口，恢复也只会少传，不会假完成。
+        file.sync_data()?;
 
-        self.bitmap.set(index)?;
-        save_bitmap(&self.state_path, &self.bitmap)?;
+        let mut next_bitmap = self.bitmap.clone();
+        next_bitmap.set(index)?;
+        save_bitmap(&self.state_path, &next_bitmap)?;
+        self.bitmap = next_bitmap;
         Ok(())
     }
 
@@ -167,7 +202,9 @@ impl PartialDownload {
 
         let target = unique_path(&self.target_path);
         fs::rename(&self.temp_path, &target)?;
-        let _ = fs::remove_file(&self.state_path);
+        sync_parent_dir(&target)?;
+        remove_file_if_exists(&self.state_path)?;
+        sync_parent_dir(&self.state_path)?;
 
         Ok(target)
     }
@@ -190,25 +227,79 @@ impl std::fmt::Debug for PartialDownload {
     }
 }
 
-/// 读位图；文件不存在或不可用时返回空位图（当作从头开始）。
-fn load_bitmap(path: &Path, chunk_count: u32) -> Result<ChunkBitmap> {
+/// 读位图；文件不存在或不可用时返回空位图（当作从头开始）。第二个返回值
+/// 表示状态文件存在但需要被修复。
+fn load_bitmap(path: &Path, chunk_count: u32) -> Result<(ChunkBitmap, bool)> {
     match fs::read(path) {
         Ok(bytes) => match ChunkBitmap::from_bytes(chunk_count, &bytes) {
-            Ok(bitmap) => Ok(bitmap),
-            Err(_) => Ok(ChunkBitmap::new(chunk_count)),
+            Ok(bitmap) => Ok((bitmap, false)),
+            // 损坏/半截 bitmap 只能当作“没有可复用进度”，并在 create 中修复落盘。
+            Err(_) => Ok((ChunkBitmap::new(chunk_count), true)),
         },
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(ChunkBitmap::new(chunk_count)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Ok((ChunkBitmap::new(chunk_count), false))
+        }
         Err(err) => Err(err.into()),
     }
 }
 
-/// 原子写位图：先写临时文件再改名，避免崩溃时留下半截状态。
+/// 写位图：先把临时文件写完并同步，再做跨平台替换。
+///
+/// Unix 的 `rename` 可以直接替换旧目标。Windows 不允许用同样的调用覆盖已有
+/// 文件，因此采用“删除旧目标，再改名”的语义；这会留下一个很短的 bitmap 缺失
+/// 窗口，但 bitmap 本来就是提示信息，恢复时会重新校验 `.part`，所以崩溃最多导致
+/// 重传，绝不会把坏数据当成已完成。临时文件和目录同步仍保证正常完成时状态完整。
 fn save_bitmap(path: &Path, bitmap: &ChunkBitmap) -> Result<()> {
     let tmp = path.with_extension("bitmap.tmp");
     let mut file = File::create(&tmp)?;
     file.write_all(&bitmap.to_bytes())?;
     file.sync_all()?;
-    fs::rename(&tmp, path)?;
+    // Windows cannot rename an open temporary file reliably.
+    drop(file);
+    replace_bitmap_file(&tmp, path)?;
+    sync_parent_dir(path)?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_bitmap_file(tmp: &Path, path: &Path) -> Result<()> {
+    fs::rename(tmp, path)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_bitmap_file(tmp: &Path, path: &Path) -> Result<()> {
+    // std::fs::rename maps to MoveFileEx without replace-existing on Windows.
+    // Remove the old state explicitly, then rename the already-synced replacement.
+    // A missing bitmap is safe because create() treats it as empty and revalidates data.
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    fs::rename(tmp, path)?;
+    Ok(())
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> Result<()> {
+    // Windows has no portable std equivalent for syncing a directory handle. The
+    // file contents are synced before replacement, and recovery treats bitmap as
+    // advisory, so an uncommitted directory entry can only cause retransmission.
     Ok(())
 }
 
@@ -353,6 +444,120 @@ mod tests {
     }
 
     #[test]
+    fn 恢复时会清除指向损坏磁盘数据的完成位() {
+        let dir = temp_dir("resume_corrupt");
+        let content: Vec<u8> = (0..MIN_CHUNK_SIZE * 2).map(|i| (i % 197) as u8).collect();
+        let manifest = manifest_for(&content, "corrupt.bin");
+
+        {
+            let mut download = PartialDownload::create(&dir, manifest.clone()).unwrap();
+            download
+                .write_chunk(0, slice(&content, &manifest, 0))
+                .unwrap();
+        }
+
+        // bitmap 仍然声称第 0 片完成，但磁盘上的真实数据已被篡改。
+        let temp = PartialDownload::temp_path_for(&dir, &manifest);
+        let mut corrupted = slice(&content, &manifest, 0).to_vec();
+        corrupted[0] ^= 0xff;
+        let mut file = OpenOptions::new().write(true).open(&temp).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&corrupted).unwrap();
+        file.sync_all().unwrap();
+
+        let recovered = PartialDownload::create(&dir, manifest.clone()).unwrap();
+        assert!(!recovered.bitmap().is_set(0), "损坏分片不能继续被跳过");
+        assert_eq!(recovered.missing(), vec![0, 1]);
+        assert_eq!(
+            ChunkBitmap::from_bytes(
+                manifest.chunk_count(),
+                &fs::read(PartialDownload::state_path_for(&dir, &manifest)).unwrap()
+            )
+            .unwrap()
+            .count_set(),
+            0,
+            "修正后的 bitmap 必须持久化"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn bitmap损坏时安全恢复为空并修复状态文件() {
+        let dir = temp_dir("bitmap_corrupt");
+        let content = vec![8u8; MIN_CHUNK_SIZE as usize * 2];
+        let manifest = manifest_for(&content, "bitmap.bin");
+
+        {
+            let _download = PartialDownload::create(&dir, manifest.clone()).unwrap();
+        }
+        // 两片只需要一个字节；填充位为 1，故这是不可接受的 bitmap。
+        fs::write(
+            PartialDownload::state_path_for(&dir, &manifest),
+            [0b1111_1111u8],
+        )
+        .unwrap();
+
+        let recovered = PartialDownload::create(&dir, manifest.clone()).unwrap();
+        assert!(recovered.bitmap().present().is_empty());
+        assert_eq!(
+            fs::read(PartialDownload::state_path_for(&dir, &manifest)).unwrap(),
+            [0u8]
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn 临时文件长度变化时不保留旧完成位() {
+        let dir = temp_dir("resume_length");
+        let content = vec![9u8; MIN_CHUNK_SIZE as usize * 2];
+        let manifest = manifest_for(&content, "length.bin");
+
+        {
+            let mut download = PartialDownload::create(&dir, manifest.clone()).unwrap();
+            download
+                .write_chunk(0, slice(&content, &manifest, 0))
+                .unwrap();
+        }
+        let temp = PartialDownload::temp_path_for(&dir, &manifest);
+        OpenOptions::new()
+            .write(true)
+            .open(&temp)
+            .unwrap()
+            .set_len(manifest.total_len - 1)
+            .unwrap();
+
+        let recovered = PartialDownload::create(&dir, manifest.clone()).unwrap();
+        assert!(recovered.bitmap().present().is_empty());
+        assert_eq!(fs::metadata(temp).unwrap().len(), manifest.total_len);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn 连续更新bitmap可覆盖已有状态() {
+        let dir = temp_dir("bitmap_replace");
+        let content: Vec<u8> = (0..MIN_CHUNK_SIZE * 3).map(|i| (i % 223) as u8).collect();
+        let manifest = manifest_for(&content, "replace.bin");
+        let mut download = PartialDownload::create(&dir, manifest.clone()).unwrap();
+
+        for index in 0..manifest.chunk_count() {
+            download
+                .write_chunk(index, slice(&content, &manifest, index))
+                .unwrap();
+        }
+        let saved = ChunkBitmap::from_bytes(
+            manifest.chunk_count(),
+            &fs::read(PartialDownload::state_path_for(&dir, &manifest)).unwrap(),
+        )
+        .unwrap();
+        assert!(saved.is_complete());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn 临时文件长度不符则重来() {
         let dir = temp_dir("reset");
         let content = vec![1u8; MIN_CHUNK_SIZE as usize * 2];
@@ -382,6 +587,25 @@ mod tests {
             .write_chunk(0, slice(&content, &manifest, 0))
             .unwrap();
         assert!(download.finalize().is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn finalize改名失败时保留恢复状态() {
+        let dir = temp_dir("finalize_error");
+        let content = vec![10u8; MIN_CHUNK_SIZE as usize];
+        let manifest = manifest_for(&content, "finalize.bin");
+        let mut download = PartialDownload::create(&dir, manifest.clone()).unwrap();
+        download.write_chunk(0, &content).unwrap();
+        let temp = download.temp_path().to_path_buf();
+        let state = PartialDownload::state_path_for(&dir, &manifest);
+        // 让 rename 的目标父目录不存在；这模拟 rename/finalize 失败，且不依赖权限。
+        download.target_path = dir.join("missing-parent").join("finalize.bin");
+
+        assert!(download.finalize().is_err());
+        assert!(temp.exists(), "finalize 失败不能丢失 .part");
+        assert!(state.exists(), "finalize 失败不能丢失 bitmap");
+
         fs::remove_dir_all(&dir).unwrap();
     }
 

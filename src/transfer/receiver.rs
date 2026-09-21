@@ -177,7 +177,23 @@ pub async fn receive_file_on_stream(
         )));
     }
 
-    // 5. 回报根哈希，让发送端也能确认这次传的是同一份文件。
+    // 5. 先同步并 finalize。只有正式文件已经成功落盘、改名后，才允许发
+    // Complete；否则发送端会把一个尚未保存成功的文件当成成功。
+    let output_path = match download.finalize() {
+        Ok(path) => path,
+        Err(err) => {
+            let reason = format!("接收端 finalize 失败，文件未确认保存: {err}");
+            // 保留 .part/.bitmap 以便下次恢复；发送端必须看到明确失败，而不是
+            // 因为一个先发出的 Complete 错误地返回成功。
+            if let Err(send_err) = write_frame(&mut send, &ControlMessage::Abort { reason }).await {
+                tracing::warn!(error = %send_err, "无法把 finalize 失败通知发送端");
+            }
+            let _ = send.finish();
+            return Err(err);
+        }
+    };
+
+    // 6. 回报根哈希，让发送端也能确认这次传的是同一份文件。
     write_frame(
         &mut send,
         &ControlMessage::Complete {
@@ -187,7 +203,6 @@ pub async fn receive_file_on_stream(
     .await?;
     let _ = send.finish();
 
-    let output_path = download.finalize()?;
     tracing::info!(
         peer = %peer_node_id.short(),
         path = %output_path.display(),

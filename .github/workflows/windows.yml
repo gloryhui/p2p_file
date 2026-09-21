@@ -1,0 +1,14 @@
+name: Windows storage and resume
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows-tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run all Rust tests on Windows
+        run: cargo test --all-targets
