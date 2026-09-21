@@ -299,8 +299,9 @@ A、B 的签名和随机数各自自洽，验证全过，但业务流量实际�
 `ChannelBinding::from_connection`（生产代码里没有别的构造方式）。所有握手调用点都必须先
 从**当前连接**导出绑定值，不能传常量、空值或自己生成的随机数。
 
-**兼容性。** 载荷格式变了，`PROTOCOL_VERSION` 从 1 升到 2，`HANDSHAKE_DOMAIN` 同步升到
-`p2p_file/handshake/v2`。新旧节点在 `Hello`/`HelloAck` 里都会先校验版本并**明确拒绝**
+**兼容性。** 会话绑定载荷变更时 `PROTOCOL_VERSION` 从 1 升到 2；本次文件传输完成
+语义改为 finalize 成功后才发送 `Complete`，因此再从 2 升到 3，`HANDSHAKE_DOMAIN`
+同步为 `p2p_file/handshake/v3`。新旧节点在 `Hello`/`HelloAck` 里都会先校验版本并**明确拒绝**
 （`协议版本不兼容`），不会走到签名校验再报含糊错误；mDNS 公告也会按版本过滤。
 
 ## 5. 文件传输协议要点
@@ -325,9 +326,17 @@ A、B 的签名和随机数各自自洽，验证全过，但业务流量实际�
     CLI 也用 clap value parser 提前拒绝非法 `--chunk-size`。
   - 有效上限：分片数受 `MAX_FRAME_LEN`（16 MiB，每片 32 字节哈希）限制在约 52 万，
     因此单文件实际上限约 8 TiB；这是帧格式的既有约束，不是新加的静默限制。
-- **断点续传**：接收端持久化「已校验分片位图」，中断后只补缺失分片。
+- **断点续传**：接收端持久化「已校验分片位图」，但 bitmap 只是恢复提示，不是
+  数据真相。重启时会从 `.part` 重读每个置位分片并按 manifest 哈希复核；长度不符、
+  bitmap 损坏或哈希不符都会清除完成位并重新请求。
+- **崩溃一致性**：写片采用 `.part write -> sync_data -> bitmap checkpoint`；bitmap
+  checkpoint 先同步临时文件，再做平台相关替换。Unix 使用可覆盖的 `rename` 并同步
+  父目录；Windows 显式删除旧 bitmap 后再改名。bitmap 在替换窗口丢失只会导致重传，
+  不会导致假完成。
 - **并行度**：QUIC 多流并行拉取分片，配合流控避免打爆对端。
-- **落盘**：先写临时文件 + 位图，全部校验通过后再改名为目标文件，避免半成品被误用。
+- **落盘**：先写临时文件 + 位图，全部校验通过后 `sync_all`、改名并同步目录，
+  finalize 成功后接收端才发送 `Complete`；sync/rename/finalize 失败会发送 `Abort`，
+  让发送端看到失败并保留恢复状态。
 
 ## 6. 里程碑
 
@@ -348,7 +357,7 @@ A、B 的签名和随机数各自自洽，验证全过，但业务流量实际�
 | `protocol::message` / `frame` | 控制消息、握手签名载荷（与角色无关、含会话绑定值）、长度前缀帧 |
 | `transport::handshake` | 双向认证，挡住冒用节点 ID 与错误签名；签名绑定当前 TLS 会话，挡住透明 MITM 转发 |
 | `transport::quic` | 自签证书 + 跳过 TLS 校验 + 应用层身份 + TLS exporter 会话绑定；keepalive 10s / 空闲 30s |
-| `storage` | `.part` + 位图、原子写位图、长度不符则重来、同名不覆盖 |
+| `storage` | `.part` + 经磁盘哈希复核的提示位图、跨平台 checkpoint、长度不符则重来、同名不覆盖 |
 | `transfer` | 拉模型分片传输（窗口 16）、坏片拒收、收尾核对根哈希 |
 | `nat::stun` | 手写 RFC 5389 子集，含 XOR-MAPPED-ADDRESS 与 FINGERPRINT |
 | `nat::classify` | 由多次观测推断映射行为 |

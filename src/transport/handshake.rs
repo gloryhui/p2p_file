@@ -423,12 +423,12 @@ mod tests {
         assert!(responder.await.unwrap().is_err());
     }
 
-    /// v2 把会话绑定值纳入签名载荷，与 v1 不兼容。
+    /// v3 改变了文件传输的 Complete 语义，与仍会提前发送 Complete 的 v2 不兼容。
     ///
     /// 旧节点必须收到**明确的版本错误**，而不是一路走到签名校验再报一个
     /// 看不出原因的「签名校验失败」。
     #[tokio::test]
-    async fn 旧协议版本_v1_会被明确拒绝() {
+    async fn 旧协议版本_v2_会被明确拒绝() {
         let mallory = Identity::generate();
         let binding = test_binding();
         let ((_m_recv, mut m_send), (mut b_recv, mut b_send)) = split_pair();
@@ -441,7 +441,7 @@ mod tests {
         write_frame(
             &mut m_send,
             &ControlMessage::Hello {
-                protocol_version: 1,
+                protocol_version: 2,
                 node_id: mallory.node_id(),
                 public_key: mallory.public_key_bytes(),
                 nonce: [4u8; 32],
@@ -450,7 +450,7 @@ mod tests {
         .await
         .unwrap();
 
-        let error = responder.await.unwrap().expect_err("v1 必须被拒绝");
+        let error = responder.await.unwrap().expect_err("v2 必须被拒绝");
         let message = error.to_string();
         assert!(
             message.contains("协议版本不兼容"),

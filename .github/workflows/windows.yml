@@ -1,0 +1,18 @@
+name: Windows Issue 4 storage and resume
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows-issue4:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run storage recovery tests on Windows
+        run: cargo test --lib storage::tests --no-fail-fast
+      - name: Run resume and finalize tests on Windows
+        run: cargo test --lib transfer::tests --no-fail-fast
+      - name: Run protocol version tests on Windows
+        run: cargo test --lib transport::handshake::tests --no-fail-fast
