@@ -1,6 +1,6 @@
 //! 接收端。
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use quinn::{Connection, RecvStream, SendStream};
@@ -12,13 +12,43 @@ use crate::protocol::manifest::FileManifest;
 use crate::protocol::message::ControlMessage;
 use crate::storage::PartialDownload;
 use crate::transport::handshake::handshake_responder;
-use crate::transport::quic::ChannelBinding;
+use crate::transport::quic::{
+    ACCEPT_FIRST_BI_STREAM_TIMEOUT, ChannelBinding, STREAM_FIRST_FRAME_TIMEOUT,
+    TRANSFER_IDLE_TIMEOUT,
+};
 
 /// 同时在途的请求数。
 ///
 /// 太小会浪费带宽（等一个来回才发下一个），太大则会在内存里堆很多分片。
 /// 16 个 256 KiB 分片大约 4 MiB，是个保守的起点。
 pub const DEFAULT_WINDOW: usize = 16;
+
+#[derive(Default)]
+struct OutstandingChunks {
+    indexes: HashSet<u32>,
+}
+
+impl OutstandingChunks {
+    fn request(&mut self, index: u32) {
+        self.indexes.insert(index);
+    }
+
+    fn contains(&self, index: u32) -> bool {
+        self.indexes.contains(&index)
+    }
+
+    fn complete(&mut self, index: u32) -> bool {
+        self.indexes.remove(&index)
+    }
+
+    fn len(&self) -> usize {
+        self.indexes.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.indexes.is_empty()
+    }
+}
 
 /// 接收结果。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,22 +73,25 @@ pub async fn receive_file(
 ) -> Result<ReceiveReport> {
     // 1. 握手（对上发送端的第一条双向流）。会话绑定值取自这条连接本身。
     let binding = ChannelBinding::from_connection(connection)?;
-    let (mut handshake_send, mut handshake_recv) = connection
-        .accept_bi()
-        .await
-        .map_err(|err| Error::Transport(format!("接受握手流失败: {err}")))?;
+    let (mut handshake_send, mut handshake_recv) =
+        tokio::time::timeout(ACCEPT_FIRST_BI_STREAM_TIMEOUT, connection.accept_bi())
+            .await
+            .map_err(|_| Error::Transport("等待握手流超时".into()))?
+            .map_err(|err| Error::Transport(format!("接受握手流失败: {err}")))?;
     let outcome =
         handshake_responder(&mut handshake_send, &mut handshake_recv, identity, &binding).await?;
     let _ = handshake_send.finish();
 
     // 2. 收清单并开数据流。
-    let (send, mut recv) = connection
-        .accept_bi()
-        .await
-        .map_err(|err| Error::Transport(format!("接受数据流失败: {err}")))?;
+    let (send, mut recv) =
+        tokio::time::timeout(ACCEPT_FIRST_BI_STREAM_TIMEOUT, connection.accept_bi())
+            .await
+            .map_err(|_| Error::Transport("等待文件数据流超时".into()))?
+            .map_err(|err| Error::Transport(format!("接受数据流失败: {err}")))?;
 
-    let manifest = match read_frame(&mut recv)
-        .await?
+    let manifest = match tokio::time::timeout(STREAM_FIRST_FRAME_TIMEOUT, read_frame(&mut recv))
+        .await
+        .map_err(|_| Error::Protocol("等待文件流首帧超时".into()))??
         .ok_or_else(|| Error::Protocol("对端没有发清单就关闭了连接".into()))?
     {
         ControlMessage::Manifest(manifest) => *manifest,
@@ -102,13 +135,17 @@ pub async fn receive_file_on_stream(
 
     // 3. 打开（或恢复）临时下载。
     let mut download = PartialDownload::create(out_dir, manifest.clone())?;
-    write_frame(
-        &mut send,
-        &ControlMessage::Resume {
-            have: download.bitmap().to_bytes(),
-        },
+    tokio::time::timeout(
+        TRANSFER_IDLE_TIMEOUT,
+        write_frame(
+            &mut send,
+            &ControlMessage::Resume {
+                have: download.bitmap().to_bytes(),
+            },
+        ),
     )
-    .await?;
+    .await
+    .map_err(|_| Error::Protocol("发送 Resume 超时".into()))??;
 
     let already_have = download.bitmap().count_set();
     if already_have > 0 {
@@ -118,36 +155,46 @@ pub async fn receive_file_on_stream(
     // 4. 按窗口拉取缺失分片。
     let missing = download.missing();
     let mut pending: VecDeque<u32> = missing.into_iter().collect();
-    let mut in_flight: usize = 0;
+    let mut outstanding = OutstandingChunks::default();
     let mut chunks_received: u32 = 0;
 
     loop {
-        while in_flight < DEFAULT_WINDOW {
+        while outstanding.len() < DEFAULT_WINDOW {
             let Some(index) = pending.pop_front() else {
                 break;
             };
-            write_frame(&mut send, &ControlMessage::RequestChunk { index }).await?;
-            in_flight += 1;
+            tokio::time::timeout(
+                TRANSFER_IDLE_TIMEOUT,
+                write_frame(&mut send, &ControlMessage::RequestChunk { index }),
+            )
+            .await
+            .map_err(|_| Error::Protocol("发送 RequestChunk 超时".into()))??;
+            outstanding.request(index);
         }
 
-        if in_flight == 0 {
+        if outstanding.is_empty() {
             break;
         }
 
-        let message = read_frame(&mut recv)
-            .await?
+        let message = tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, read_frame(&mut recv))
+            .await
+            .map_err(|_| Error::Protocol("等待 Chunk 超时".into()))??
             .ok_or_else(|| Error::Protocol("分片还没收完，对端就关闭了连接".into()))?;
 
         match message {
             ControlMessage::Chunk { index, data } => {
+                if !outstanding.contains(index) {
+                    download.discard()?;
+                    return Err(Error::Protocol(format!("收到未请求或重复的分片 {index}")));
+                }
                 download.write_chunk(index, &data)?;
-                in_flight -= 1;
+                outstanding.complete(index);
                 chunks_received += 1;
 
                 if chunks_received.is_multiple_of(64) {
                     tracing::debug!(
                         received = chunks_received,
-                        remaining = pending.len() + in_flight,
+                        remaining = pending.len() + outstanding.len(),
                         "接收中"
                     );
                 }
@@ -194,13 +241,17 @@ pub async fn receive_file_on_stream(
     };
 
     // 6. 回报根哈希，让发送端也能确认这次传的是同一份文件。
-    write_frame(
-        &mut send,
-        &ControlMessage::Complete {
-            root_hash: manifest.root_hash,
-        },
+    tokio::time::timeout(
+        TRANSFER_IDLE_TIMEOUT,
+        write_frame(
+            &mut send,
+            &ControlMessage::Complete {
+                root_hash: manifest.root_hash,
+            },
+        ),
     )
-    .await?;
+    .await
+    .map_err(|_| Error::Protocol("发送 Complete 超时".into()))??;
     let _ = send.finish();
 
     tracing::info!(
@@ -217,4 +268,26 @@ pub async fn receive_file_on_stream(
         chunks_received,
         output_path,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OutstandingChunks;
+
+    #[test]
+    fn 重复和未请求分片不会污染在途集合() {
+        let mut outstanding = OutstandingChunks::default();
+        outstanding.request(3);
+        outstanding.request(7);
+        assert_eq!(outstanding.len(), 2);
+
+        assert!(!outstanding.complete(99));
+        assert_eq!(outstanding.len(), 2);
+        assert!(outstanding.contains(3));
+
+        assert!(outstanding.complete(3));
+        assert!(!outstanding.complete(3));
+        assert_eq!(outstanding.len(), 1);
+        assert!(!outstanding.is_empty());
+    }
 }

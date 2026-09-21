@@ -20,15 +20,18 @@
 //! - 服务端只转发到 `forwards` 白名单里的地址，客户端不能让它连任意目标；
 //! - 服务端只接受 `allowed_peers` 白名单里的节点。
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use quinn::{Connection, RecvStream, SendStream};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
@@ -39,7 +42,17 @@ use crate::protocol::message::ControlMessage;
 use crate::transfer::receiver::receive_file_on_stream;
 use crate::transfer::sender::{SendReport, send_file_after_handshake};
 use crate::transport::handshake::{handshake_initiator, handshake_responder};
-use crate::transport::quic::ChannelBinding;
+use crate::transport::quic::{
+    ACCEPT_FIRST_BI_STREAM_TIMEOUT, ChannelBinding, QUIC_HANDSHAKE_TIMEOUT,
+    STREAM_FIRST_FRAME_TIMEOUT, TRANSFER_IDLE_TIMEOUT,
+};
+
+/// 每轮 serve 最多同时等待这么多条尚未完成应用握手的 QUIC 连接。
+pub const DEFAULT_MAX_PENDING_HANDSHAKES: usize = 64;
+/// 单条认证连接最多同时处理的业务双向流。
+pub const DEFAULT_MAX_BUSINESS_STREAMS: usize = 16;
+/// 一个 serve 会话最多同时落盘的文件数。
+pub const DEFAULT_MAX_FILE_RECEIVES: usize = 4;
 
 /// 空闲多久后重新打洞（默认 2 分钟，比常见的 NAT 映射超时短一些）。
 pub const DEFAULT_RE_PUNCH_AFTER: Duration = Duration::from_secs(120);
@@ -59,6 +72,14 @@ pub struct ServeConfig {
     /// 几个小时后对端再来连就会被自己的 NAT 挡掉。所以空闲一段时间后主动
     /// 重新打一次洞，把映射重新立起来。
     pub re_punch_after: Duration,
+    /// 尚未完成应用层握手的连接上限。
+    pub max_pending_handshakes: usize,
+    /// 单条已认证 QUIC 连接的业务流上限。
+    pub max_business_streams: usize,
+    /// 当前 serve 会话的并发文件接收上限。
+    pub max_file_receives: usize,
+    /// 认证连接在没有任何业务流时允许保持多久。
+    pub connection_idle_timeout: Duration,
 }
 
 impl ServeConfig {
@@ -68,6 +89,10 @@ impl ServeConfig {
             forwards: Vec::new(),
             recv_dir: None,
             re_punch_after: DEFAULT_RE_PUNCH_AFTER,
+            max_pending_handshakes: DEFAULT_MAX_PENDING_HANDSHAKES,
+            max_business_streams: DEFAULT_MAX_BUSINESS_STREAMS,
+            max_file_receives: DEFAULT_MAX_FILE_RECEIVES,
+            connection_idle_timeout: TRANSFER_IDLE_TIMEOUT,
         }
     }
 
@@ -133,37 +158,61 @@ pub async fn serve_session(
 ) -> Result<()> {
     info!("直连已就绪，等待对端接入：{}", link.describe());
 
-    let endpoint = link.endpoint.clone();
-    let active = Arc::new(AtomicUsize::new(0));
+    let (endpoint, _signal) = link.into_parts();
+    let active = Arc::new(ActiveState::new());
+    let pending = Arc::new(Semaphore::new(config.max_pending_handshakes));
+    let file_receives = Arc::new(Semaphore::new(config.max_file_receives));
+    let connections = Arc::new(Mutex::new(ConnectionRegistry::default()));
     let grace = config.re_punch_after;
+    let mut idle_changes = active.idle_changes.subscribe();
+    let mut idle_deadline = active.idle_deadline(grace);
+    let mut connection_tasks = JoinSet::new();
 
     loop {
-        // 注意：**不能**给计时分支加 `if active == 0` 这样的守卫。
-        // `select!` 的守卫只在进入 select 的那一刻求值一次，之后不会重算：
-        //   - 若进入时已有连接，守卫为假，计时分支被永久禁用，而 accept 又
-        //     一直不来新连接 —— serve 就再也不会重新打洞；
-        //   - 若进入时还没有连接，计时到点又会不看当前状态直接拆掉会话。
-        // 所以守卫必须放在分支体里，等计时真的到点了再判断。
         let incoming = tokio::select! {
             incoming = endpoint.accept() => incoming,
-            _ = tokio::time::sleep(grace) => {
-                if active.load(Ordering::Relaxed) == 0 {
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                if active.count.load(Ordering::Relaxed) == 0 {
+                    // active 刚刚结束时，Drop 会记录真实的 idle 起点。即使
+                    // deadline 分支和 watch 通知同时就绪，也不能提前 re-punch。
+                    let refreshed = active.idle_deadline(grace);
+                    if refreshed > tokio::time::Instant::now() {
+                        idle_deadline = refreshed;
+                        continue;
+                    }
                     debug!("空闲超时，准备重新打洞");
-                    return Ok(());
+                    break;
                 }
-                // 还有连接在用，重新计时。
+                // 真正 active 的服务仍在运行时，只推进检查点；pending/失败
+                // 握手和普通 task completion 都不会触碰这个 deadline。
+                idle_deadline = tokio::time::Instant::now() + grace;
                 continue;
-            }
+            },
+            changed = idle_changes.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                // 最后一个 active session 结束的瞬间才进入新的 idle grace。
+                idle_deadline = active.idle_deadline(grace);
+                continue;
+            },
+            result = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+                if let Some(Err(err)) = result {
+                    debug!(error = %err, "连接处理 task 结束");
+                }
+                continue;
+            },
         };
 
         let Some(incoming) = incoming else {
-            return Ok(());
+            break;
         };
-        let connection = match incoming.await {
-            Ok(connection) => connection,
-            Err(err) => {
-                // 打洞后的第一个包可能来得比 accept 早，握手失败重试即可。
-                warn!(error = %err, "有连接进来但握手失败");
+
+        let permit = match pending.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                warn!("待握手连接达到上限，拒绝新的连接");
+                incoming.refuse();
                 continue;
             }
         };
@@ -171,15 +220,144 @@ pub async fn serve_session(
         let identity = identity.clone();
         let config = config.clone();
         let active = Arc::clone(&active);
-        active.fetch_add(1, Ordering::Relaxed);
-        tokio::spawn(async move {
-            if let Err(err) = serve_connection(connection.clone(), &identity, config).await {
+        let file_receives = Arc::clone(&file_receives);
+        let connections = Arc::clone(&connections);
+        connection_tasks.spawn(async move {
+            let connection = match tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, incoming).await {
+                Ok(Ok(connection)) => connection,
+                Ok(Err(err)) => {
+                    warn!(error = %err, "有连接进来但 QUIC 握手失败");
+                    return;
+                }
+                Err(_) => {
+                    warn!("QUIC 握手超时");
+                    return;
+                }
+            };
+            let connection_id = connections.lock().unwrap().insert(connection.clone());
+            if let Err(err) =
+                serve_connection(connection, &identity, config, active, file_receives, permit).await
+            {
                 warn!(error = %err, "处理连接时出错");
             }
-            // 连接真正关掉才算这条连接结束。
-            connection.closed().await;
-            active.fetch_sub(1, Ordering::Relaxed);
+            connections.lock().unwrap().remove(connection_id);
         });
+    }
+
+    // 先关闭 endpoint，再结束所有握手/业务 task。这样 QUIC 不会继续保留任何
+    // Connection 对 UDP socket 的引用，下一轮才能安全复用固定的本地端口。
+    endpoint.close(0u32.into(), b"serve session ended");
+    for connection in connections.lock().unwrap().values() {
+        connection.close(0u32.into(), b"serve session ended");
+    }
+    // 让已认证连接先观察到 endpoint close 并自行退出，确保它们持有的
+    // stream task/QUIC handle 都被结构化回收；不把 JoinSet 里的连接 task
+    // 直接 abort，避免嵌套业务流 task 脱离结构化清理而遗留 socket 引用。
+    while let Some(result) = connection_tasks.join_next().await {
+        if let Err(err) = result {
+            debug!(error = %err, "连接处理 task 已取消");
+        }
+    }
+    let connections: Vec<_> = connections.lock().unwrap().drain().collect();
+    for connection in connections {
+        let _ = tokio::time::timeout(Duration::from_secs(3), connection.closed()).await;
+    }
+    drop(_signal);
+    drop(endpoint);
+    // quinn 的 endpoint driver 在 drop 后还需要一个调度机会收掉底层
+    // socket 引用；显式让出执行权，保证下一轮固定端口 bind 不与清理竞态。
+    for _ in 0..3 {
+        tokio::task::yield_now().await;
+    }
+    Ok(())
+}
+
+/// 只保留当前仍在 pending/active 的连接，避免 serve 常驻时按历史连接无限增长。
+#[derive(Debug)]
+struct ConnectionRegistry<T> {
+    next_id: u64,
+    entries: HashMap<u64, T>,
+}
+
+impl<T> Default for ConnectionRegistry<T> {
+    fn default() -> Self {
+        Self {
+            next_id: 0,
+            entries: HashMap::new(),
+        }
+    }
+}
+
+impl<T> ConnectionRegistry<T> {
+    fn insert(&mut self, value: T) -> u64 {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.entries.insert(id, value);
+        id
+    }
+
+    fn remove(&mut self, id: u64) -> Option<T> {
+        self.entries.remove(&id)
+    }
+
+    fn values(&self) -> impl Iterator<Item = &T> {
+        self.entries.values()
+    }
+
+    fn drain(&mut self) -> impl Iterator<Item = T> {
+        std::mem::take(&mut self.entries).into_values()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+struct ActiveState {
+    count: AtomicUsize,
+    idle_since: Mutex<Option<tokio::time::Instant>>,
+    idle_generation: AtomicU64,
+    idle_changes: watch::Sender<u64>,
+}
+
+impl ActiveState {
+    fn new() -> Self {
+        let (idle_changes, _) = watch::channel(0);
+        Self {
+            count: AtomicUsize::new(0),
+            idle_since: Mutex::new(Some(tokio::time::Instant::now())),
+            idle_generation: AtomicU64::new(0),
+            idle_changes,
+        }
+    }
+
+    fn idle_deadline(&self, grace: Duration) -> tokio::time::Instant {
+        self.idle_since.lock().unwrap().map_or_else(
+            || tokio::time::Instant::now() + grace,
+            |since| since + grace,
+        )
+    }
+}
+
+struct ActiveSession(Arc<ActiveState>);
+
+impl ActiveSession {
+    fn new(active: Arc<ActiveState>) -> Self {
+        if active.count.fetch_add(1, Ordering::Relaxed) == 0 {
+            *active.idle_since.lock().unwrap() = None;
+        }
+        Self(active)
+    }
+}
+
+impl Drop for ActiveSession {
+    fn drop(&mut self) {
+        if self.0.count.fetch_sub(1, Ordering::Relaxed) == 1 {
+            *self.0.idle_since.lock().unwrap() = Some(tokio::time::Instant::now());
+            let generation = self.0.idle_generation.fetch_add(1, Ordering::Relaxed) + 1;
+            let _ = self.0.idle_changes.send(generation);
+        }
     }
 }
 
@@ -188,16 +366,20 @@ async fn serve_connection(
     connection: Connection,
     identity: &Identity,
     config: ServeConfig,
+    active: Arc<ActiveState>,
+    file_receives: Arc<Semaphore>,
+    pending_permit: OwnedSemaphorePermit,
 ) -> Result<()> {
     let remote = connection.remote_address();
 
     // 第一条流用于应用层握手，确认对端身份。会话绑定值取自这条连接：
     // 签名因此被钉死在这条 TLS 会话上，转发到别的会话必然验不过。
     let binding = ChannelBinding::from_connection(&connection)?;
-    let (mut handshake_send, mut handshake_recv) = connection
-        .accept_bi()
-        .await
-        .map_err(|err| Error::Transport(format!("接受握手流失败: {err}")))?;
+    let (mut handshake_send, mut handshake_recv) =
+        tokio::time::timeout(ACCEPT_FIRST_BI_STREAM_TIMEOUT, connection.accept_bi())
+            .await
+            .map_err(|_| Error::Transport("等待应用握手流超时".into()))?
+            .map_err(|err| Error::Transport(format!("接受握手流失败: {err}")))?;
     let outcome =
         handshake_responder(&mut handshake_send, &mut handshake_recv, identity, &binding).await?;
     let _ = handshake_send.finish();
@@ -208,62 +390,150 @@ async fn serve_connection(
         connection.close(1u32.into(), b"peer not allowed");
         return Ok(());
     }
+    // 到这里已经完成 QUIC handshake、应用握手和白名单检查；之后的业务
+    // 服务不再占用 pending-handshake 配额。
+    drop(pending_permit);
+    let _active = ActiveSession::new(active);
     info!(peer = %peer_id.short(), %remote, "对端已通过认证");
 
-    serve_streams(connection, peer_id, config).await
+    serve_streams(connection, peer_id, config, file_receives).await
 }
 
 /// 循环处理这条连接上开出来的每一条双向流。
 ///
 /// 流的类型由第一个消息决定：`Manifest` 是传文件，`TunnelOpen` 是开隧道。
 /// 这样一个 `serve` 进程就能同时提供两种服务，不用开两个端口。
-async fn serve_streams(connection: Connection, peer_id: NodeId, config: ServeConfig) -> Result<()> {
+async fn serve_streams(
+    connection: Connection,
+    peer_id: NodeId,
+    config: ServeConfig,
+    file_receives: Arc<Semaphore>,
+) -> Result<()> {
+    let streams = Arc::new(Semaphore::new(config.max_business_streams));
+    let mut stream_tasks = JoinSet::new();
+
     loop {
-        let (mut send, mut recv) = match connection.accept_bi().await {
+        let accepted = tokio::select! {
+            accepted = connection.accept_bi() => accepted,
+            result = stream_tasks.join_next(), if !stream_tasks.is_empty() => {
+                if let Some(Err(err)) = result {
+                    debug!(error = %err, "业务流 task 结束");
+                }
+                continue;
+            },
+            _ = tokio::time::sleep(config.connection_idle_timeout),
+                if stream_tasks.is_empty() => {
+                info!(peer = %peer_id.short(), "认证连接业务空闲超时");
+                return Ok(());
+            },
+        };
+        let (send, recv) = match accepted {
             Ok(pair) => pair,
             // 对端正常关闭（传完文件就关连接）不算错误。
             Err(quinn::ConnectionError::ApplicationClosed(_))
             | Err(quinn::ConnectionError::LocallyClosed) => {
                 info!(peer = %peer_id.short(), "对端关闭了连接");
+                drain_stream_tasks(&mut stream_tasks).await;
                 return Ok(());
             }
             Err(err) => {
+                drain_stream_tasks(&mut stream_tasks).await;
                 return Err(Error::Transport(format!("接受数据流失败: {err}")));
             }
         };
 
-        let first = read_frame(&mut recv).await?;
-        match first {
-            Some(ControlMessage::TunnelOpen { target }) => {
-                let forwards = config.forwards.clone();
-                tokio::spawn(async move {
+        let permit = match streams.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                warn!(peer = %peer_id.short(), "单连接业务流达到上限，拒绝新流");
+                let mut send = send;
+                let _ = tokio::time::timeout(
+                    STREAM_FIRST_FRAME_TIMEOUT,
+                    write_frame(
+                        &mut send,
+                        &ControlMessage::Abort {
+                            reason: "业务流并发达到上限".into(),
+                        },
+                    ),
+                )
+                .await;
+                let _ = send.finish();
+                continue;
+            }
+        };
+
+        let config = config.clone();
+        let file_receives = Arc::clone(&file_receives);
+        stream_tasks.spawn(async move {
+            let _permit = permit;
+            let mut send = send;
+            let mut recv = recv;
+            let first =
+                match tokio::time::timeout(STREAM_FIRST_FRAME_TIMEOUT, read_frame(&mut recv)).await
+                {
+                    Ok(Ok(Some(first))) => first,
+                    Ok(Ok(None)) => return,
+                    Ok(Err(err)) => {
+                        warn!(error = %err, "读取业务流首帧失败");
+                        return;
+                    }
+                    Err(_) => {
+                        warn!("业务流首帧超时");
+                        let _ = send.finish();
+                        return;
+                    }
+                };
+
+            match first {
+                ControlMessage::TunnelOpen { target } => {
+                    let forwards = config.forwards.clone();
                     if let Err(err) = handle_tunnel_request(send, recv, &target, &forwards).await {
                         warn!(target, error = %err, "隧道转发失败");
                     }
-                });
-            }
-
-            Some(ControlMessage::Manifest(manifest)) => {
-                // `read_frame` 已经在解码时校验过，这里是显式的 trust-boundary
-                // 复查：清单一旦进了接收流程就会决定临时文件长度和分片下标。
-                if let Err(err) = manifest.validate() {
-                    warn!(peer = %peer_id.short(), error = %err, "清单非法，拒绝接收");
-                    let _ = write_frame(
-                        &mut send,
-                        &ControlMessage::Abort {
-                            reason: format!("清单非法: {err}"),
-                        },
-                    )
-                    .await;
-                    let _ = send.finish();
-                    continue;
                 }
-                let Some(recv_dir) = config.recv_dir.clone() else {
-                    warn!(peer = %peer_id.short(), "收到文件但没配置接收目录，拒绝");
-                    let _ = send.finish();
-                    continue;
-                };
-                tokio::spawn(async move {
+
+                ControlMessage::Manifest(manifest) => {
+                    // `read_frame` 已经在解码时校验过，这里是显式的 trust-boundary
+                    // 复查：清单一旦进了接收流程就会决定临时文件长度和分片下标。
+                    if let Err(err) = manifest.validate() {
+                        warn!(peer = %peer_id.short(), error = %err, "清单非法，拒绝接收");
+                        let _ = tokio::time::timeout(
+                            TRANSFER_IDLE_TIMEOUT,
+                            write_frame(
+                                &mut send,
+                                &ControlMessage::Abort {
+                                    reason: format!("清单非法: {err}"),
+                                },
+                            ),
+                        )
+                        .await;
+                        let _ = send.finish();
+                        return;
+                    }
+                    let Some(recv_dir) = config.recv_dir.clone() else {
+                        warn!(peer = %peer_id.short(), "收到文件但没配置接收目录，拒绝");
+                        let _ = send.finish();
+                        return;
+                    };
+                    let file_permit = match file_receives.try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            warn!(peer = %peer_id.short(), "文件并发接收达到上限，拒绝新文件");
+                            let _ = tokio::time::timeout(
+                                TRANSFER_IDLE_TIMEOUT,
+                                write_frame(
+                                    &mut send,
+                                    &ControlMessage::Abort {
+                                        reason: "文件并发接收达到上限".into(),
+                                    },
+                                ),
+                            )
+                            .await;
+                            let _ = send.finish();
+                            return;
+                        }
+                    };
+                    let _file_permit = file_permit;
                     match receive_file_on_stream(send, recv, *manifest, &recv_dir, peer_id).await {
                         Ok(report) => info!(
                             path = %report.output_path.display(),
@@ -272,17 +542,25 @@ async fn serve_streams(connection: Connection, peer_id: NodeId, config: ServeCon
                         ),
                         Err(err) => warn!(error = %err, "文件接收失败"),
                     }
-                });
-            }
+                }
 
-            Some(ControlMessage::KeepAlive) => {}
-            Some(ControlMessage::Bye) | None => {
-                info!(peer = %peer_id.short(), "对端道别");
-                return Ok(());
+                ControlMessage::KeepAlive => {}
+                ControlMessage::Bye => {
+                    info!(peer = %peer_id.short(), "对端道别");
+                }
+                other => {
+                    warn!(kind = other.kind(), "服务端收到意料之外的消息，忽略");
+                }
             }
-            Some(other) => {
-                warn!(kind = other.kind(), "服务端收到意料之外的消息，忽略");
-            }
+        });
+    }
+}
+
+async fn drain_stream_tasks(stream_tasks: &mut JoinSet<()>) {
+    stream_tasks.abort_all();
+    while let Some(result) = stream_tasks.join_next().await {
+        if let Err(err) = result {
+            debug!(error = %err, "业务流 task 已取消");
         }
     }
 }
@@ -461,10 +739,11 @@ async fn open_session(link: &DirectLink, identity: &Identity) -> Result<Connecti
 
     // 绑定值必须来自刚建立的这条连接，不能复用别的会话。
     let binding = ChannelBinding::from_connection(&connection)?;
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .map_err(|err| Error::Transport(format!("打开握手流失败: {err}")))?;
+    let (mut send, mut recv) =
+        tokio::time::timeout(ACCEPT_FIRST_BI_STREAM_TIMEOUT, connection.open_bi())
+            .await
+            .map_err(|_| Error::Transport("打开握手流超时".into()))?
+            .map_err(|err| Error::Transport(format!("打开握手流失败: {err}")))?;
     let outcome = handshake_initiator(&mut send, &mut recv, identity, &binding).await?;
     let _ = send.finish();
 
@@ -491,10 +770,11 @@ fn connection_remote(connection: Connection) -> String {
 
 /// 为一条本地 TCP 连接开一条隧道。
 async fn open_tunnel(tcp: TcpStream, connection: &Connection, target: &str) -> Result<()> {
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .map_err(|err| Error::Transport(format!("打开隧道流失败: {err}")))?;
+    let (mut send, mut recv) =
+        tokio::time::timeout(ACCEPT_FIRST_BI_STREAM_TIMEOUT, connection.open_bi())
+            .await
+            .map_err(|_| Error::Transport("打开隧道流超时".into()))?
+            .map_err(|err| Error::Transport(format!("打开隧道流失败: {err}")))?;
 
     write_frame(
         &mut send,
@@ -504,7 +784,10 @@ async fn open_tunnel(tcp: TcpStream, connection: &Connection, target: &str) -> R
     )
     .await?;
 
-    match read_frame(&mut recv).await? {
+    match tokio::time::timeout(STREAM_FIRST_FRAME_TIMEOUT, read_frame(&mut recv))
+        .await
+        .map_err(|_| Error::Protocol("等待 TunnelReady 超时".into()))??
+    {
         Some(ControlMessage::TunnelReady) => splice(tcp, send, recv).await,
         Some(ControlMessage::TunnelError { reason }) => {
             let _ = send.finish();
@@ -659,6 +942,153 @@ mod tests {
         assert!(config.forwards.is_empty());
         assert!(config.recv_dir.is_none());
         assert!(config.allowed_peers.is_empty());
+    }
+
+    #[test]
+    fn connection_registry_churn只保留当前连接() {
+        let mut registry = ConnectionRegistry::default();
+        for connection in 0..1_000 {
+            let id = registry.insert(connection);
+            assert_eq!(registry.len(), 1);
+            assert_eq!(registry.remove(id), Some(connection));
+            assert_eq!(registry.len(), 0);
+        }
+    }
+
+    /// pending permit 只覆盖握手和白名单检查；第一条认证连接存活时，第二条
+    /// 连接仍应能进入应用握手。
+    #[tokio::test]
+    async fn 认证成功后释放_pending_permit() {
+        let signal_addr = spawn_signal_server().await;
+        let server_identity = Identity::generate();
+        let client_identity = Identity::generate();
+        let (server_link, client_link) =
+            establish_pair(signal_addr, &server_identity, &client_identity).await;
+
+        let serve_task = tokio::spawn(serve_session(
+            server_link,
+            server_identity,
+            ServeConfig {
+                allowed_peers: vec![client_identity.node_id()],
+                max_pending_handshakes: 1,
+                connection_idle_timeout: Duration::from_secs(5),
+                re_punch_after: Duration::from_secs(30),
+                ..ServeConfig::new()
+            },
+        ));
+
+        let first = open_session(&client_link, &client_identity)
+            .await
+            .expect("第一条连接应认证成功");
+        let second = tokio::time::timeout(
+            Duration::from_secs(5),
+            open_session(&client_link, &client_identity),
+        )
+        .await
+        .expect("第二条连接不应被第一条连接占满 pending permit")
+        .expect("第二条连接应认证成功");
+
+        first.close(0u32.into(), b"test done");
+        second.close(0u32.into(), b"test done");
+        serve_task.abort();
+    }
+
+    /// 每轮都制造一个未完成应用握手的连接，不能把固定的 service-idle
+    /// deadline 往后推；否则服务端会永远不 re-punch。
+    #[tokio::test]
+    async fn pending_churn不阻止_re_punch() {
+        let signal_addr = spawn_signal_server().await;
+        let server_identity = Identity::generate();
+        let client_identity = Identity::generate();
+        let (server_link, client_link) =
+            establish_pair(signal_addr, &server_identity, &client_identity).await;
+
+        let serve_task = tokio::spawn(serve_session(
+            server_link,
+            server_identity,
+            ServeConfig {
+                allowed_peers: vec![client_identity.node_id()],
+                re_punch_after: Duration::from_millis(300),
+                connection_idle_timeout: Duration::from_secs(5),
+                ..ServeConfig::new()
+            },
+        ));
+
+        let churn_until = tokio::time::Instant::now() + Duration::from_millis(900);
+        let mut re_punched = false;
+        while tokio::time::Instant::now() < churn_until {
+            if serve_task.is_finished() {
+                re_punched = true;
+                break;
+            }
+            if let Ok(Ok(connection)) =
+                tokio::time::timeout(Duration::from_millis(100), client_link.connect()).await
+            {
+                // 不发送应用首帧，模拟 pending/失败握手；服务端必须在固定
+                // deadline 到期时结束，而不是因这个连接的 task completion 重置计时。
+                connection.close(0u32.into(), b"pending churn");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(re_punched, "pending/失败连接持续 churn 不应阻止 re-punch");
+        serve_task
+            .await
+            .expect("serve task 不应 panic")
+            .expect("serve session 应正常结束");
+    }
+
+    /// 认证成功但没有业务流的连接不能永久占住 active，进而阻止 re-punch。
+    #[tokio::test]
+    async fn 认证后业务静默会释放_active() {
+        let signal_addr = spawn_signal_server().await;
+        let server_identity = Identity::generate();
+        let client_identity = Identity::generate();
+        let (server_link, client_link) =
+            establish_pair(signal_addr, &server_identity, &client_identity).await;
+
+        let serve_task = tokio::spawn(serve_session(
+            server_link,
+            server_identity,
+            ServeConfig {
+                allowed_peers: vec![client_identity.node_id()],
+                re_punch_after: Duration::from_millis(150),
+                connection_idle_timeout: Duration::from_millis(50),
+                ..ServeConfig::new()
+            },
+        ));
+        let connection = open_session(&client_link, &client_identity)
+            .await
+            .expect("认证应成功");
+
+        tokio::time::timeout(Duration::from_secs(2), serve_task)
+            .await
+            .expect("认证后无业务流不能永久阻止 re-punch")
+            .expect("serve task 不应 panic")
+            .expect("serve session 应正常结束");
+        connection.close(0u32.into(), b"test done");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active结束后完整_grace重新计算() {
+        let state = Arc::new(ActiveState::new());
+        let grace = Duration::from_secs(10);
+        let initial_deadline = state.idle_deadline(grace);
+        let active = ActiveSession::new(Arc::clone(&state));
+
+        // active 跨过原始 deadline；它仍然不应被当作 idle。
+        tokio::time::advance(grace + Duration::from_secs(1)).await;
+        assert_eq!(state.count.load(Ordering::Relaxed), 1);
+
+        let ended_at = tokio::time::Instant::now();
+        drop(active);
+        let new_deadline = state.idle_deadline(grace);
+        assert!(new_deadline > initial_deadline);
+        assert_eq!(new_deadline, ended_at + grace);
+
+        tokio::time::advance(grace - Duration::from_secs(1)).await;
+        assert!(tokio::time::Instant::now() < new_deadline);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(tokio::time::Instant::now() >= new_deadline);
     }
 
     /// 全链路：信令牵线 → 双方打洞 → QUIC 直连 → TCP 隧道转发。
