@@ -9,6 +9,10 @@ keywords = ["p2p", "nat-traversal", "quic", "file-transfer", "tunnel"]
 categories = ["network-programming"]
 license = "MIT"
 
+[features]
+default = []
+gui = ["dep:gpui", "dep:unicode-segmentation"]
+
 [dependencies]
 blake3 = "1.8.7"
 clap = { version = "4.6.7", features = ["derive"] }
@@ -25,3 +29,10 @@ thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["full", "test-util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+gpui = { version = "=0.2.2", optional = true }
+unicode-segmentation = { version = "1.13.3", optional = true }
+
+[[bin]]
+name = "p2p-desktop"
+path = "src/bin/p2p-desktop.rs"
+required-features = ["gui"]

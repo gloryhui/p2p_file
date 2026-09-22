@@ -1,0 +1,48 @@
+name: GPUI desktop build matrix
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gpui-check:
+    name: GPUI check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            packages: >-
+              pkg-config libfontconfig1-dev libfreetype6-dev libwayland-dev
+              libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev
+              libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev
+              libxkbcommon-dev libxkbcommon-x11-dev
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            packages: ""
+          - os: macos-14
+            target: aarch64-apple-darwin
+            packages: ""
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux GPUI development packages
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.packages }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Check native desktop shell
+        run: cargo check --locked --features gui --bin p2p-desktop --target ${{ matrix.target }}
+      - name: Build native desktop shell
+        run: cargo build --locked --features gui --bin p2p-desktop --target ${{ matrix.target }}
+      - name: Run explicit GUI unit tests
+        if: runner.os == 'Linux'
+        run: cargo test --locked --features gui --lib desktop::tests
+      - name: Run GUI Clippy
+        if: runner.os == 'Linux'
+        run: cargo clippy --locked --features gui --all-targets -- -D warnings
