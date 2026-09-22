@@ -289,12 +289,7 @@ where
             .await?;
             finish_stream(&mut control_send, "关闭测速控制流")?;
             let peer = read_speedtest_result(&mut control_recv).await?;
-            if peer.0 != result.0 {
-                return Err(Error::Protocol(format!(
-                    "测速 upload 字节数不一致：本机 {}，对端 {}",
-                    result.0, peer.0
-                )));
-            }
+            let result = upload_result_from_peer(result, peer)?;
             wait_control_eof(&mut control_recv).await?;
             result
         }
@@ -534,6 +529,26 @@ fn elapsed_millis(elapsed: Duration) -> u64 {
     elapsed.as_millis().max(1) as u64
 }
 
+/// upload 的吞吐必须以接收端实际观测到的数据阶段耗时为准。
+///
+/// 发送端的 `write_all` / `finish` 只表示本端完成写入或提交发送，不能证明对端
+/// 已经完整收到 payload；因此这里只用发送端 bytes 做一致性校验，最终 elapsed
+/// 来自 peer 返回的 receiver observation。
+fn upload_result_from_peer(sender: (u64, Duration), peer: (u64, u64)) -> Result<(u64, Duration)> {
+    if peer.0 != sender.0 {
+        return Err(Error::Protocol(format!(
+            "测速 upload 字节数不一致：本机 {}，对端 {}",
+            sender.0, peer.0
+        )));
+    }
+    if peer.1 == 0 {
+        return Err(Error::Protocol(
+            "测速 upload 对端返回了无效的 elapsed_ms".into(),
+        ));
+    }
+    Ok((peer.0, Duration::from_millis(peer.1)))
+}
+
 fn rate_mib(bytes: u64, elapsed: Duration) -> f64 {
     bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64().max(f64::MIN_POSITIVE)
 }
@@ -606,6 +621,16 @@ mod tests {
         assert!(validate_options(Duration::from_millis(999), MIN_BLOCK_SIZE as usize).is_err());
         assert!(validate_options(Duration::from_secs(1), (MIN_BLOCK_SIZE - 1) as usize).is_err());
         assert!(validate_options(Duration::from_secs(1), (MAX_BLOCK_SIZE + 1) as usize).is_err());
+    }
+
+    #[test]
+    fn upload最终结果使用接收端elapsed而不是发送端elapsed() {
+        let sender = (1024, Duration::from_secs(99));
+        let peer = (1024, 37);
+        let result = upload_result_from_peer(sender, peer).unwrap();
+        assert_eq!(result.0, 1024);
+        assert_eq!(result.1, Duration::from_millis(37));
+        assert_ne!(result.1, sender.1);
     }
 
     #[tokio::test]

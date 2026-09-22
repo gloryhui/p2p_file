@@ -568,7 +568,7 @@ async fn cmd_speedtest(
     println!("peer:           {}", peer);
     println!("remote:         {}", connection.remote_address());
     println!("direction:      {}", direction.as_str());
-    println!("duration:       {:.2} s", duration_secs as f64);
+    println!("configured duration: {:.2} s", duration_secs as f64);
 
     for report in &reports {
         print_speedtest_report(report);
@@ -580,7 +580,8 @@ async fn cmd_speedtest(
             .map(|report| report.elapsed)
             .fold(Duration::ZERO, |total, value| total + value);
         println!(
-            "both total:      {} bytes, {:.2} MiB/s, {:.2} Mbps",
+            "both total:      elapsed {:.3} s, {} bytes, {:.2} MiB/s, {:.2} Mbps",
+            elapsed.as_secs_f64(),
             bytes,
             bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64().max(f64::MIN_POSITIVE),
             bytes as f64 * 8.0 / 1_000_000.0 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE),
@@ -591,6 +592,7 @@ async fn cmd_speedtest(
 
 fn print_speedtest_report(report: &SpeedTestReport) {
     println!("phase:           {}", report.direction.as_str());
+    println!("elapsed:         {:.3} s", report.elapsed.as_secs_f64());
     println!(
         "bytes:          {} ({:.2} MiB)",
         report.bytes,
