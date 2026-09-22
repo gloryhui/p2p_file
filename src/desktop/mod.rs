@@ -814,6 +814,8 @@ impl Render for DesktopShell {
 
         div()
             .size_full()
+            .id("desktop-shell")
+            .overflow_y_scroll()
             .bg(rgb(0xf4f7fb))
             .flex()
             .flex_col()
