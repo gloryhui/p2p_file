@@ -68,6 +68,16 @@ The first capture was intentionally retained as a diagnostic, not as a PASS:
    without resizing. `gpui-t001-wm-first-frame.png` is the visually inspected
    960x680 first frame. No production polling or repaint workaround was added.
 
+4. To separate the earlier manual-focus evidence from a WM startup race, a fresh
+   `:101` display started Openbox first. `xprop -root _NET_SUPPORTING_WM_CHECK`
+   returned `0x20011f`; only then was the GUI started with `dbus-run-session`.
+   After three seconds, window `4194305` was captured directly, with no resize
+   and no `xdotool windowfocus`. The visually inspected
+   [`gpui-t001-wm-ready-auto-first-frame.png`](screenshots/gpui-t001-wm-ready-auto-first-frame.png)
+   is the automatic first-frame result. This confirms the no-WM black frame is
+   an Xvfb/WM expose/focus environment difference, not a reason to add a
+   production repaint loop.
+
 The minimum-size run used `xdotool windowsize --sync WINDOW 760 560`. The top
 view is [`gpui-t001-minimum-v2-top.png`](screenshots/gpui-t001-minimum-v2-top.png);
 wheel-scrolling the root container to the bottom produced
