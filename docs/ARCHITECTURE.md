@@ -11,7 +11,7 @@ NAT 打洞失败时回退到中继（TURN / circuit relay），保证「能连�
 
 ```
 src/
-  main.rs         CLI 入口，四个新命令（signal-server / serve / tunnel / push）的编排
+  main.rs         CLI 入口，命令（signal-server / serve / tunnel / push / speedtest）的编排
   cli.rs          参数解析（clap）
   identity.rs     长期密钥对 → 节点 ID（ed25519）
   discovery/      节点发现
@@ -23,7 +23,8 @@ src/
     punch.rs       打洞状态机（同时开启 + 令牌鉴权）
     portmap.rs     UPnP IGD / NAT-PMP 主动端口映射（空壳）
   net/            把上面这些串起来：STUN → 候选收集 → 信令 → 打洞 → QUIC 端点
-  tunnel/         通用 TCP 端口转发 + 文件直推 + 空闲重打洞
+  tunnel/         通用 TCP 端口转发 + 文件直推 + 测速分发 + 空闲重打洞
+  speedtest.rs    P2P / QUIC 内存到内存测速
   transport/      数据通道（QUIC）
   protocol/       应用层协议：握手、文件清单、分片请求、控制消息
   transfer/       发送端 / 接收端、断点续传、进度
@@ -263,12 +264,43 @@ RST（`Err`），提前返回，节点就永远留在「在线」表里——服
 | --- | --- |
 | `Manifest` | 走文件接收流程 |
 | `TunnelOpen { target }` | 连到 `target` 并把字节双向搬运 |
+| `SpeedTestOpen` | 校验参数后走测速控制流 + 原始单向数据流 |
 
 `target` 必须在 `--forward` 白名单里，且只接受 `IP:port`（不接受域名，
 免得用 DNS 绕过白名单）。
 
 搬运用 `tokio::io::copy_bidirectional` 的等价手写实现（`splice`），
 两个方向各自独立，任一方向结束就关掉这条流。
+
+## 4.6.1 P2P / QUIC 纯网络测速
+
+`speedtest` 复用 `establish()`、同一个打洞 socket、QUIC、应用层 Ed25519 握手和
+`serve --allow` 白名单。它不新增服务端进程，也不建立绕过认证的连接。
+
+一轮测速的协议拓扑是：
+
+```text
+客户端                              serve
+  SpeedTestOpen  ───────────────────►  控制双向流
+  ◄────────────────── SpeedTestReady
+  原始 payload ─────────────────────►  upload 单向流
+  ◄────────────── SpeedTestResult
+```
+
+download 将原始 payload 的方向反过来；`both` 在客户端等待第一轮完全结束后再
+打开第二条控制流，因此不会制造同时双向的额外变量。每个 block 不经过 postcard
+或 `ControlMessage`，数据源只复用一个固定 pattern buffer 连续写入/读取。
+
+控制面的 `SpeedTestOpen`、`SpeedTestReady` 和 `SpeedTestResult` 追加在现有
+`ControlMessage` 的末尾，保持既有 v3 消息的 postcard discriminant 不变，因此
+`PROTOCOL_VERSION` 不升级。线上每次只接受 `upload` 或 `download`，CLI 的 `both`
+只是顺序组合。
+
+吞吐计时从收到 `SpeedTestReady` 后、真正打开并开始处理数据流开始，到数据流
+完成为止；信令、STUN、打洞、QUIC/TLS、Ed25519 握手和测速控制协商不计入
+throughput。Quinn 统计使用数据阶段前后的 `Connection::stats()` 做 delta，输出
+实际公开的 `remote_address()`、`rtt()`、`path.cwnd`、`path.current_mtu`、丢包、
+丢字节、拥塞事件及 UDP datagram/byte 计数，不伪造字段。
 
 ## 4.7 应用层握手与会话绑定
 
@@ -368,7 +400,8 @@ A、B 的签名和随机数各自自洽，验证全过，但业务流量实际�
 | `nat::punch` | 同时开启探测循环 + keepalive + 令牌鉴权；令牌不保证 NAT 穿透 |
 | `discovery::signal` | 牵线服务器与客户端，长度前缀 postcard，含下线清理 |
 | `net` | 把 STUN / 候选收集 / 信令 / 打洞 / QUIC 端点串成 `establish()` |
-| `tunnel` | 通用 TCP 端口转发 + 文件直推 + 空闲重打洞 |
+| `tunnel` | 通用 TCP 端口转发 + 文件直推 + 测速业务分发 + 空闲重打洞 |
+| `speedtest` | 固定内存 pattern 的 upload/download/both 及 Quinn 诊断指标 |
 
 真实验证过的行为（不只是单测）：
 
@@ -380,7 +413,9 @@ A、B 的签名和随机数各自自洽，验证全过，但业务流量实际�
   断开后 serve 重新打洞 → 再连一次仍然成功。全部通过。
 - 现在只在 RFC 5780 行为发现证据充分时报告 mapping 分类；EIM 可在 Test II
   短路；未测 filtering，不把分类结果宣称为最终可打洞。
-- 实测 `serve` 正在服务隧道时不再打洞，对端靠「候选顺序重试」兜底连上
+- 实测 `serve` 正在服务隧道时不再打洞，对端靠「候选顺序重试」兜底连上。
+- 本地真实 QUIC 两端及 `scripts/e2e.sh` 验证 `speedtest` 的 upload/download/both，
+  bytes > 0，测速期间接收目录没有文件、`.part` 或 `.bitmap`。
   （日志确认走到了这条路径）。
 
 ### STUN 实现说明
@@ -403,7 +438,8 @@ A、B 的签名和随机数各自自洽，验证全过，但业务流量实际�
    能直连就省掉大半麻烦，值得优先做。
 4. 打洞没有端口预测（birthday paradox 式扫描），对称 NAT 下救不回来。
 5. 文件读写用的是同步 IO，跑在大文件时会阻塞异步执行器，应挪进 `spawn_blocking`。
-6. 分片数据和控制消息共用一条流，应拆成独立单向流。
+6. 文件传输的分片数据和控制消息共用一条流，应拆成独立单向流；`speedtest` 已经
+   使用控制双向流 + 原始单向数据流，不能把它的设计结论套回文件协议。
 7. `serve` 空闲后会回到「等对端」状态，此时它在自家 NAT 上没有映射。
    这没问题（重新打洞时映射会重建），但意味着对端必须能通过信令唤醒它——
    如果信令服务器挂了，已经建立的隧道会继续工作，但断线后无法重连。

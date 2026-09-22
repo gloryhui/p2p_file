@@ -31,7 +31,10 @@ use crate::identity::{Identity, NodeId};
 use crate::nat::classify::{MappingBehavior, MappingEvidence, probe_rfc5780};
 use crate::nat::punch::{PunchConfig, simultaneous_open_any};
 use crate::nat::stun::resolve_server;
-use crate::transport::quic::endpoint_from_socket;
+use crate::transport::handshake::handshake_initiator;
+use crate::transport::quic::{
+    ACCEPT_FIRST_BI_STREAM_TIMEOUT, ChannelBinding, endpoint_from_socket,
+};
 
 /// 默认 STUN 服务器。
 ///
@@ -222,6 +225,32 @@ impl DirectLink {
                 "未确认"
             }
         )
+    }
+
+    /// 在已经建立的直连上完成一次应用层身份认证。
+    ///
+    /// `push`、`tunnel` 和 `speedtest` 都走这里，确保测速不会另起一套
+    /// 连接流程，也不会绕过 channel binding 或目标节点 ID 校验。
+    pub async fn connect_authenticated(&self, identity: &Identity) -> Result<quinn::Connection> {
+        let connection = self.connect().await?;
+        let binding = ChannelBinding::from_connection(&connection)?;
+        let (mut send, mut recv) =
+            tokio::time::timeout(ACCEPT_FIRST_BI_STREAM_TIMEOUT, connection.open_bi())
+                .await
+                .map_err(|_| Error::Transport("打开握手流超时".into()))?
+                .map_err(|err| Error::Transport(format!("打开握手流失败: {err}")))?;
+        let outcome = handshake_initiator(&mut send, &mut recv, identity, &binding).await?;
+        let _ = send.finish();
+
+        if outcome.peer_node_id != self.peer_node_id {
+            connection.close(2u32.into(), b"unexpected peer");
+            return Err(Error::Identity(format!(
+                "对端身份不符：期待 {}，实际 {}",
+                self.peer_node_id.short(),
+                outcome.peer_node_id.short()
+            )));
+        }
+        Ok(connection)
     }
 }
 
