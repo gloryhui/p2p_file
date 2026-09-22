@@ -143,6 +143,7 @@ mod tests {
                 let data = read_chunk(&mut file, offset, len).unwrap();
                 download.write_chunk(index, &data).unwrap();
             }
+            download.checkpoint().unwrap();
         }
 
         // 现在重新走一次完整传输：对端应当跳过已有的两片。
@@ -204,6 +205,7 @@ mod tests {
             download
                 .write_chunk(0, &content[..MIN_CHUNK_SIZE as usize])
                 .unwrap();
+            download.checkpoint().unwrap();
         }
         let temp = crate::storage::PartialDownload::temp_path_for(&recv_dir, &manifest);
         let mut file = fs::OpenOptions::new().write(true).open(&temp).unwrap();
@@ -264,6 +266,7 @@ mod tests {
             download
                 .write_chunk(0, &content[..MIN_CHUNK_SIZE as usize])
                 .unwrap();
+            download.checkpoint().unwrap();
         }
 
         // 单侧验证：没传完的下载不允许收尾。
