@@ -39,9 +39,10 @@ use crate::identity::{Identity, NodeId};
 use crate::net::{DirectConfig, DirectLink, establish};
 use crate::protocol::frame::{read_frame, write_frame};
 use crate::protocol::message::ControlMessage;
+use crate::speedtest::serve_speedtest;
 use crate::transfer::receiver::receive_file_on_stream;
 use crate::transfer::sender::{SendReport, send_file_after_handshake};
-use crate::transport::handshake::{handshake_initiator, handshake_responder};
+use crate::transport::handshake::handshake_responder;
 use crate::transport::quic::{
     ACCEPT_FIRST_BI_STREAM_TIMEOUT, ChannelBinding, QUIC_HANDSHAKE_TIMEOUT,
     STREAM_FIRST_FRAME_TIMEOUT, TRANSFER_IDLE_TIMEOUT,
@@ -464,6 +465,7 @@ async fn serve_streams(
 
         let config = config.clone();
         let file_receives = Arc::clone(&file_receives);
+        let connection_for_stream = connection.clone();
         stream_tasks.spawn(async move {
             let _permit = permit;
             let mut send = send;
@@ -541,6 +543,25 @@ async fn serve_streams(
                             "文件接收完成"
                         ),
                         Err(err) => warn!(error = %err, "文件接收失败"),
+                    }
+                }
+
+                ControlMessage::SpeedTestOpen {
+                    direction,
+                    duration_ms,
+                    block_size,
+                } => {
+                    if let Err(err) = serve_speedtest(
+                        &connection_for_stream,
+                        send,
+                        recv,
+                        direction,
+                        duration_ms,
+                        block_size,
+                    )
+                    .await
+                    {
+                        warn!(peer = %peer_id.short(), error = %err, "测速失败");
                     }
                 }
 
@@ -734,30 +755,10 @@ pub async fn forward_on(
 
 /// 建一条到对端的 QUIC 连接并完成应用层认证。
 async fn open_session(link: &DirectLink, identity: &Identity) -> Result<Connection> {
-    // 按候选顺序尝试连接，而不是只试打洞确认过的那个。
-    let connection = link.connect().await?;
-
-    // 绑定值必须来自刚建立的这条连接，不能复用别的会话。
-    let binding = ChannelBinding::from_connection(&connection)?;
-    let (mut send, mut recv) =
-        tokio::time::timeout(ACCEPT_FIRST_BI_STREAM_TIMEOUT, connection.open_bi())
-            .await
-            .map_err(|_| Error::Transport("打开握手流超时".into()))?
-            .map_err(|err| Error::Transport(format!("打开握手流失败: {err}")))?;
-    let outcome = handshake_initiator(&mut send, &mut recv, identity, &binding).await?;
-    let _ = send.finish();
-
-    if outcome.peer_node_id != link.peer_node_id {
-        connection.close(2u32.into(), b"unexpected peer");
-        return Err(Error::Identity(format!(
-            "对端身份不符：期待 {}，实际 {}",
-            link.peer_node_id.short(),
-            outcome.peer_node_id.short()
-        )));
-    }
+    let connection = link.connect_authenticated(identity).await?;
 
     info!(
-        peer = %outcome.peer_node_id.short(),
+        peer = %link.peer_node_id.short(),
         remote = %connection_remote(connection.clone()),
         "直连已加密并认证"
     );
@@ -1246,18 +1247,19 @@ mod tests {
         match open_session(&client_link, &client_identity).await {
             Err(_) => {}
             Ok(connection) => {
-                let result =
-                    tokio::time::timeout(Duration::from_secs(10), connection.open_bi()).await;
-                match result {
-                    // 服务端关闭了连接。
-                    Ok(Err(_)) => {}
-                    // 流开出来了但立刻被关，写不进去。
-                    Ok(Ok((mut send, _))) => {
-                        let write = write_frame(&mut send, &ControlMessage::KeepAlive).await;
-                        assert!(write.is_err(), "未授权节点不该能正常收发");
-                    }
-                    Err(_) => panic!("不该等到超时"),
-                }
+                let result = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    crate::speedtest::run_speedtest(
+                        &connection,
+                        crate::speedtest::SpeedTestDirection::Upload,
+                        Duration::from_secs(1),
+                        crate::speedtest::MIN_BLOCK_SIZE as usize,
+                        |_| {},
+                    ),
+                )
+                .await
+                .expect("未授权测速不该挂死");
+                assert!(result.is_err(), "未授权节点不该能通过 speedtest");
             }
         }
 
@@ -1289,6 +1291,36 @@ mod tests {
                 ..ServeConfig::new()
             },
         ));
+
+        // 先跑纯网络测速：同一条已认证的 serve 分发路径应支持 upload、download，
+        // 且 both 必须按顺序完成；测速期间接收目录不能出现任何文件或临时状态。
+        let speed_connection = open_session(&client_link, &client_identity)
+            .await
+            .expect("测速连接应当认证成功");
+        let speed_reports = crate::speedtest::run_speedtest(
+            &speed_connection,
+            crate::speedtest::SpeedTestDirection::Both,
+            Duration::from_secs(1),
+            crate::speedtest::MIN_BLOCK_SIZE as usize,
+            |_| {},
+        )
+        .await
+        .expect("测速应当成功");
+        assert_eq!(speed_reports.len(), 2);
+        assert_eq!(
+            speed_reports[0].direction,
+            crate::speedtest::SpeedTestDirection::Upload
+        );
+        assert_eq!(
+            speed_reports[1].direction,
+            crate::speedtest::SpeedTestDirection::Download
+        );
+        assert!(speed_reports.iter().all(|report| report.bytes > 0));
+        assert!(
+            std::fs::read_dir(&recv_dir).unwrap().next().is_none(),
+            "测速不得创建文件、.part 或 .bitmap"
+        );
+        speed_connection.close(0u32.into(), b"speedtest done");
 
         // 造一个跨多个分片的文件。
         let payload: Vec<u8> = (0..(crate::protocol::manifest::MIN_CHUNK_SIZE * 2 + 777))

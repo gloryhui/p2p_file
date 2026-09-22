@@ -72,6 +72,27 @@ pub enum ControlMessage {
     Abort { reason: String },
     /// 礼貌结束。
     Bye,
+
+    /// 请求一次内存到内存的 QUIC 测速。
+    ///
+    /// 测速方向只在控制面协商；实际 payload 走同一连接上的独立单向流，
+    /// 不把每个 block 包成控制消息。
+    SpeedTestOpen {
+        direction: SpeedTestWireDirection,
+        duration_ms: u64,
+        block_size: u32,
+    },
+    /// 对端已经接受测速参数，可以打开数据流。
+    SpeedTestReady,
+    /// 测速数据源在数据流结束后报告本阶段统计。
+    SpeedTestResult { bytes: u64, elapsed_ms: u64 },
+}
+
+/// 测速协议线上只允许单向的一轮；CLI 的 `both` 会顺序发起 upload 和 download。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SpeedTestWireDirection {
+    Upload,
+    Download,
 }
 
 impl ControlMessage {
@@ -112,6 +133,9 @@ impl ControlMessage {
             Self::KeepAlive => "KeepAlive",
             Self::Abort { .. } => "Abort",
             Self::Bye => "Bye",
+            Self::SpeedTestOpen { .. } => "SpeedTestOpen",
+            Self::SpeedTestReady => "SpeedTestReady",
+            Self::SpeedTestResult { .. } => "SpeedTestResult",
         }
     }
 }
@@ -191,6 +215,16 @@ mod tests {
                 reason: "对端掉线".into(),
             },
             ControlMessage::Bye,
+            ControlMessage::SpeedTestOpen {
+                direction: SpeedTestWireDirection::Upload,
+                duration_ms: 10_000,
+                block_size: 1024 * 1024,
+            },
+            ControlMessage::SpeedTestReady,
+            ControlMessage::SpeedTestResult {
+                bytes: 123,
+                elapsed_ms: 456,
+            },
         ];
 
         for message in messages {
@@ -198,6 +232,24 @@ mod tests {
             let decoded = ControlMessage::decode(&bytes).unwrap();
             assert_eq!(message, decoded, "{} 往返失败", message.kind());
         }
+    }
+
+    #[test]
+    fn 追加测速消息不改变已有消息编号() {
+        // postcard 对 enum 使用声明顺序编码。测速消息追加在末尾，保留 v3
+        // 已有控制消息的 discriminant，因此不需要升级协议版本。
+        assert_eq!(ControlMessage::Ready.encode().unwrap()[0], 3);
+        assert_eq!(ControlMessage::Bye.encode().unwrap()[0], 15);
+        assert_eq!(
+            ControlMessage::SpeedTestOpen {
+                direction: SpeedTestWireDirection::Upload,
+                duration_ms: 1_000,
+                block_size: 16 * 1024,
+            }
+            .encode()
+            .unwrap()[0],
+            16
+        );
     }
 
     #[test]

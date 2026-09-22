@@ -143,6 +143,22 @@ assert roundtrip(blob) == blob, "1MB 随机数据不对"
 PY
 pass "隧道转发正确（含 1MB 随机数据、多条并发连接）"
 
+step "2.25 纯网络测速（不读写文件、不经过文件协议）"
+RUST_LOG=info "$BIN" --key-file "$WORK/laptop.key" --log info speedtest \
+    --signal 127.0.0.1:7000 \
+    --peer "$HOME_ID" \
+    --duration 1 \
+    --direction both \
+    --block-size 65536 \
+    --port 9103 > "$WORK/speedtest.log" 2>&1 \
+    || fail "speedtest 没有完成"
+grep -Eq '^bytes:[[:space:]]+[1-9][0-9]*' "$WORK/speedtest.log" \
+    || fail "speedtest 没有报告正数 bytes"
+if find "$WORK/recv" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+    fail "speedtest 不应在接收目录创建任何文件"
+fi
+pass "speedtest 成功，bytes > 0，接收目录保持为空"
+
 step "2.5 让隧道跨过重新打洞的宽限期（${RE_PUNCH}s），确认不会被误拆"
 sleep $((RE_PUNCH + 8))
 python3 - <<'PY' || fail "隧道在宽限期后被误拆了"

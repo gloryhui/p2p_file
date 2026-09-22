@@ -8,6 +8,10 @@ use clap::{Args, Parser, Subcommand};
 use crate::discovery::signal::DEFAULT_SIGNAL_PORT;
 use crate::identity::NodeId;
 use crate::protocol::manifest::{DEFAULT_CHUNK_SIZE, validate_chunk_size};
+use crate::speedtest::{
+    DEFAULT_BLOCK_SIZE, DEFAULT_DURATION_SECS, MAX_BLOCK_SIZE, MAX_DURATION_SECS, MIN_BLOCK_SIZE,
+    MIN_DURATION_SECS, SpeedTestDirection,
+};
 
 /// clap 的 `--chunk-size` 解析器。
 ///
@@ -19,6 +23,30 @@ fn parse_chunk_size(raw: &str) -> std::result::Result<u32, String> {
         .parse()
         .map_err(|_| format!("分片大小必须是 0..={} 的整数，收到 {raw}", u32::MAX))?;
     validate_chunk_size(value).map_err(|err| err.to_string())?;
+    Ok(value)
+}
+
+fn parse_speedtest_duration(raw: &str) -> std::result::Result<u64, String> {
+    let value: u64 = raw
+        .parse()
+        .map_err(|_| format!("测速 duration 必须是整数，收到 {raw}"))?;
+    if !(MIN_DURATION_SECS..=MAX_DURATION_SECS).contains(&value) {
+        return Err(format!(
+            "测速 duration 必须在 {MIN_DURATION_SECS}..={MAX_DURATION_SECS} 秒范围内，收到 {value}"
+        ));
+    }
+    Ok(value)
+}
+
+fn parse_speedtest_block_size(raw: &str) -> std::result::Result<u32, String> {
+    let value: u32 = raw
+        .parse()
+        .map_err(|_| format!("测速 block-size 必须是整数，收到 {raw}"))?;
+    if !(MIN_BLOCK_SIZE..=MAX_BLOCK_SIZE).contains(&value) {
+        return Err(format!(
+            "测速 block-size 必须在 {MIN_BLOCK_SIZE}..={MAX_BLOCK_SIZE} 字节范围内，收到 {value}"
+        ));
+    }
     Ok(value)
 }
 
@@ -209,6 +237,38 @@ pub enum Command {
             value_parser = parse_chunk_size
         )]
         chunk_size: u32,
+    },
+
+    /// 测量已经认证的 P2P / QUIC 内存到内存吞吐，不访问文件系统。
+    Speedtest {
+        #[command(flatten)]
+        direct: DirectOpts,
+
+        /// 对端节点 ID
+        #[arg(long, value_name = "NODE_ID")]
+        peer: NodeId,
+
+        /// 测速时长（秒）
+        #[arg(
+            long,
+            default_value_t = DEFAULT_DURATION_SECS,
+            value_name = "SECONDS",
+            value_parser = parse_speedtest_duration
+        )]
+        duration: u64,
+
+        /// 方向：upload / download / both（both 按顺序执行）
+        #[arg(long, value_enum, default_value = "both", value_name = "MODE")]
+        direction: SpeedTestDirection,
+
+        /// 每次写入/读取的固定内存 block 大小（字节）
+        #[arg(
+            long,
+            default_value_t = DEFAULT_BLOCK_SIZE,
+            value_name = "BYTES",
+            value_parser = parse_speedtest_block_size
+        )]
+        block_size: u32,
     },
 }
 
@@ -429,6 +489,110 @@ mod tests {
             }
             other => panic!("解析结果不对: {other:?}"),
         }
+    }
+
+    #[test]
+    fn 解析_speedtest_子命令及默认值() {
+        let peer = "00112233445566778899aabbccddeeff";
+        let cli = Cli::parse_from([
+            "p2p_file",
+            "speedtest",
+            "--signal",
+            "1.2.3.4:7000",
+            "--peer",
+            peer,
+        ]);
+        match cli.command {
+            Command::Speedtest {
+                direct,
+                peer: parsed_peer,
+                duration,
+                direction,
+                block_size,
+            } => {
+                assert_eq!(direct.signal, "1.2.3.4:7000");
+                assert_eq!(parsed_peer.to_hex(), peer);
+                assert_eq!(duration, DEFAULT_DURATION_SECS);
+                assert_eq!(direction, SpeedTestDirection::Both);
+                assert_eq!(block_size, DEFAULT_BLOCK_SIZE);
+            }
+            other => panic!("解析结果不对: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 解析_speedtest_方向和参数边界() {
+        let peer = "00112233445566778899aabbccddeeff";
+        for (direction, expected) in [
+            ("upload", SpeedTestDirection::Upload),
+            ("download", SpeedTestDirection::Download),
+            ("both", SpeedTestDirection::Both),
+        ] {
+            let cli = Cli::parse_from([
+                "p2p_file",
+                "speedtest",
+                "--signal",
+                "1.2.3.4:7000",
+                "--peer",
+                peer,
+                "--direction",
+                direction,
+                "--duration",
+                "300",
+                "--block-size",
+                "16777216",
+            ]);
+            match cli.command {
+                Command::Speedtest { direction, .. } => assert_eq!(direction, expected),
+                other => panic!("解析结果不对: {other:?}"),
+            }
+        }
+
+        for bad in ["", "0", "301", "99999999999999999999"] {
+            assert!(
+                Cli::try_parse_from([
+                    "p2p_file",
+                    "speedtest",
+                    "--signal",
+                    "1.2.3.4:7000",
+                    "--peer",
+                    peer,
+                    "--duration",
+                    bad,
+                ])
+                .is_err(),
+                "非法 duration {bad} 应当被拒绝"
+            );
+        }
+        for bad in ["0", "16383", "16777217", "abc", "4294967295"] {
+            assert!(
+                Cli::try_parse_from([
+                    "p2p_file",
+                    "speedtest",
+                    "--signal",
+                    "1.2.3.4:7000",
+                    "--peer",
+                    peer,
+                    "--block-size",
+                    bad,
+                ])
+                .is_err(),
+                "非法 block-size {bad} 应当被拒绝"
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "p2p_file",
+                "speedtest",
+                "--signal",
+                "1.2.3.4:7000",
+                "--peer",
+                peer,
+                "--direction",
+                "sideways",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

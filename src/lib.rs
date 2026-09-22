@@ -19,6 +19,7 @@ pub mod identity;
 pub mod nat;
 pub mod net;
 pub mod protocol;
+pub mod speedtest;
 pub mod storage;
 pub mod transfer;
 pub mod transport;

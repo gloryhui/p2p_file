@@ -15,6 +15,7 @@ use p2p_file::error::{Error, Result};
 use p2p_file::identity::Identity;
 use p2p_file::nat::punch::PunchConfig;
 use p2p_file::net::{DirectConfig, establish};
+use p2p_file::speedtest::{SpeedTestDirection, SpeedTestReport, SpeedTestStats, run_speedtest};
 use p2p_file::transfer::{receive_file, send_file};
 use p2p_file::transport::quic::{client_endpoint, connect, server_endpoint};
 use p2p_file::tunnel::{ServeConfig, forward_tunnel, push_file, serve_loop};
@@ -79,6 +80,13 @@ async fn run(cli: Cli) -> Result<()> {
             file,
             chunk_size,
         } => cmd_push(&key_file, direct, peer, file, chunk_size).await,
+        Command::Speedtest {
+            direct,
+            peer,
+            duration,
+            direction,
+            block_size,
+        } => cmd_speedtest(&key_file, direct, peer, duration, direction, block_size).await,
     }
 }
 
@@ -512,6 +520,104 @@ async fn cmd_push(
             Ok(())
         }
     }
+}
+
+async fn cmd_speedtest(
+    key_file: &Option<PathBuf>,
+    direct: DirectOpts,
+    peer: p2p_file::identity::NodeId,
+    duration_secs: u64,
+    direction: SpeedTestDirection,
+    block_size: u32,
+) -> Result<()> {
+    let identity = load_identity(key_file)?;
+    println!("本机节点: {}", identity.node_id());
+    println!("目标对端:   {} ({})", peer.short(), peer);
+
+    let config = direct_config(&direct, peer);
+    let link = establish(&identity, &config).await?;
+    println!("直连已建立：{}", link.describe());
+
+    let connection = link.connect_authenticated(&identity).await?;
+    println!("已完成 QUIC / Ed25519 认证，开始内存到内存测速。\n");
+
+    let result = run_speedtest(
+        &connection,
+        direction,
+        Duration::from_secs(duration_secs),
+        block_size as usize,
+        |progress| {
+            println!(
+                "[{:>2}s] {:>8.2} MiB/s {:>8.2} Mbps RTT {:.0} ms ({})",
+                progress.elapsed.as_secs(),
+                progress.mib_per_sec,
+                progress.mbps,
+                progress.rtt.as_secs_f64() * 1000.0,
+                progress.direction.as_str(),
+            );
+        },
+    )
+    .await;
+
+    connection.close(0u32.into(), b"speedtest done");
+    close_endpoint(&link.endpoint).await;
+
+    let reports = result?;
+    println!();
+    println!("P2P speedtest");
+    println!("peer:           {}", peer);
+    println!("remote:         {}", connection.remote_address());
+    println!("direction:      {}", direction.as_str());
+    println!("configured duration: {:.2} s", duration_secs as f64);
+
+    for report in &reports {
+        print_speedtest_report(report);
+    }
+    if reports.len() > 1 {
+        let bytes: u64 = reports.iter().map(|report| report.bytes).sum();
+        let elapsed: Duration = reports
+            .iter()
+            .map(|report| report.elapsed)
+            .fold(Duration::ZERO, |total, value| total + value);
+        println!(
+            "both total:      elapsed {:.3} s, {} bytes, {:.2} MiB/s, {:.2} Mbps",
+            elapsed.as_secs_f64(),
+            bytes,
+            bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64().max(f64::MIN_POSITIVE),
+            bytes as f64 * 8.0 / 1_000_000.0 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE),
+        );
+    }
+    Ok(())
+}
+
+fn print_speedtest_report(report: &SpeedTestReport) {
+    println!("phase:           {}", report.direction.as_str());
+    println!("elapsed:         {:.3} s", report.elapsed.as_secs_f64());
+    println!(
+        "bytes:          {} ({:.2} MiB)",
+        report.bytes,
+        report.bytes as f64 / (1024.0 * 1024.0)
+    );
+    println!("throughput:     {:.2} MiB/s", report.mib_per_sec());
+    println!("throughput:     {:.2} Mbps", report.mbps());
+    print_speedtest_stats(&report.stats);
+}
+
+fn print_speedtest_stats(stats: &SpeedTestStats) {
+    println!("RTT:            {:.0} ms", stats.rtt.as_secs_f64() * 1000.0);
+    println!("cwnd:           {} bytes", stats.cwnd);
+    println!("lost packets:   {}", stats.lost_packets);
+    println!("lost bytes:     {}", stats.lost_bytes);
+    println!("congestion events: {}", stats.congestion_events);
+    println!("MTU:            {} bytes", stats.current_mtu);
+    println!(
+        "UDP sent:       {} datagrams / {} bytes",
+        stats.sent_datagrams, stats.sent_bytes
+    );
+    println!(
+        "UDP received:   {} datagrams / {} bytes",
+        stats.received_datagrams, stats.received_bytes
+    );
 }
 
 fn load_identity(key_file: &Option<PathBuf>) -> Result<Identity> {

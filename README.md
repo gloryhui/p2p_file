@@ -152,6 +152,36 @@ ssh -p 2222 127.0.0.1
 $BIN push --signal $SIGNAL --peer $HOME_ID ./大文件.mkv
 ```
 
+### P2P / QUIC 纯网络测速
+
+想把网络链路和文件传输本身区分开时，在外面那台机器上运行：
+
+```bash
+$BIN speedtest \
+  --signal $SIGNAL \
+  --peer $HOME_ID
+```
+
+也可以指定时长、方向和固定内存 block：
+
+```bash
+$BIN speedtest \
+  --signal $SIGNAL \
+  --peer $HOME_ID \
+  --duration 15 \
+  --direction upload \
+  --block-size 1048576
+```
+
+`speedtest` 是经过现有信令、STUN/候选、UDP 打洞、QUIC 和 Ed25519 身份认证后的
+内存到内存测速。它不读写磁盘，不计算文件 hash，不使用 manifest、bitmap、fsync
+或文件分片协议；因此它不是 ISP 官方测速，而是用来和 `push` 速度做对照。
+`--direction both` 会先 upload、再 download，不做同时双向测速。
+
+- `speedtest` 快、`push` 慢：优先检查文件协议、磁盘和 fsync。
+- `speedtest` 慢、`push` 慢：优先检查 QUIC、UDP、RTT、丢包、流控或 ISP。
+- `speedtest` 快、`push` 快：当前链路和文件路径都正常。
+
 ## 部署为 systemd 服务
 
 两个服务都用**用户级 unit**，这样路径里不用写死用户名。
