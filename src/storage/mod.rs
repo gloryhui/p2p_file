@@ -5,7 +5,7 @@
 //! - 数据先写进 `<名字>.<根哈希前 16 位>.part`，**全部校验通过后**才改名成正式文件，
 //!   中途放弃或崩溃都不会留下一个看起来正常、实际残缺的文件。
 //! - 位图单独存 `<同名>.bitmap`。位图是可丢失的恢复提示，不是数据真相；每次
-//!   恢复都会重新校验其中标记为完成的分片。
+//!   恢复都会重新校验其中标记为完成的分片。位图只保存 durable checkpoint 的快照。
 //! - 临时文件名带上根哈希，换一个文件（内容不同）不会误用上一次的残留进度。
 //!
 //! 目前用的是同步 `std::fs`。放到异步传输循环里会阻塞执行器，正式实现应当把
@@ -14,6 +14,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 use crate::protocol::manifest::{FileManifest, safe_file_name};
@@ -25,6 +26,25 @@ const PART_SUFFIX: &str = "part";
 const BITMAP_SUFFIX: &str = "bitmap";
 /// 正式文件最多尝试的带编号候选数；耗尽后明确失败，绝不回退到原名覆盖。
 const MAX_FINALIZE_SUFFIX: u32 = 10_000;
+/// 脏数据达到这个大小后做一次 durable checkpoint。
+const CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
+/// 距离上次 durable checkpoint 超过这个时间后做一次 checkpoint。
+const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy, Debug)]
+struct CheckpointPolicy {
+    bytes: u64,
+    interval: Duration,
+}
+
+impl Default for CheckpointPolicy {
+    fn default() -> Self {
+        Self {
+            bytes: CHECKPOINT_BYTES,
+            interval: CHECKPOINT_INTERVAL,
+        }
+    }
+}
 
 /// 一个进行中的下载。
 pub struct PartialDownload {
@@ -34,7 +54,15 @@ pub struct PartialDownload {
     state_path: PathBuf,
     /// `None` 表示句柄已关闭（收尾或放弃之后）。
     file: Option<File>,
-    bitmap: ChunkBitmap,
+    /// 当前进程已经校验并写入 `.part` 的分片，可能尚未 sync 到稳定存储。
+    written_bitmap: ChunkBitmap,
+    /// 最近一次成功 checkpoint 后，已安全落盘并写入 `.bitmap` 的快照。
+    durable_bitmap: ChunkBitmap,
+    /// written_bitmap 中还没有进入 durable_bitmap 的写入量。
+    dirty_bytes: u64,
+    /// 最近一次成功 durable checkpoint 的时间。
+    last_checkpoint: Instant,
+    checkpoint_policy: CheckpointPolicy,
 }
 
 impl PartialDownload {
@@ -65,6 +93,14 @@ impl PartialDownload {
     /// `manifest.total_len` 直接 `set_len` 出文件、按 `chunk_count` 分配位图，
     /// 是「不可信清单」最危险的下游。校验不通过就什么都不碰。
     pub fn create(dir: &Path, manifest: FileManifest) -> Result<Self> {
+        Self::create_with_policy(dir, manifest, CheckpointPolicy::default())
+    }
+
+    fn create_with_policy(
+        dir: &Path,
+        manifest: FileManifest,
+        checkpoint_policy: CheckpointPolicy,
+    ) -> Result<Self> {
         manifest.validate()?;
         fs::create_dir_all(dir)?;
 
@@ -119,13 +155,18 @@ impl PartialDownload {
             }
         }
 
+        let durable_bitmap = bitmap.clone();
         Ok(Self {
             manifest,
             target_path,
             temp_path,
             state_path,
             file: Some(file),
-            bitmap,
+            written_bitmap: bitmap,
+            durable_bitmap,
+            dirty_bytes: 0,
+            last_checkpoint: Instant::now(),
+            checkpoint_policy,
         })
     }
 
@@ -133,8 +174,15 @@ impl PartialDownload {
         &self.manifest
     }
 
+    /// 当前进程已经写入并校验通过的分片。未进入 checkpoint 的分片也会出现在这里。
     pub fn bitmap(&self) -> &ChunkBitmap {
-        &self.bitmap
+        &self.written_bitmap
+    }
+
+    /// 最近一次成功 checkpoint 的持久化进度。
+    #[cfg(test)]
+    pub(crate) fn durable_bitmap(&self) -> &ChunkBitmap {
+        &self.durable_bitmap
     }
 
     pub fn temp_path(&self) -> &Path {
@@ -147,11 +195,11 @@ impl PartialDownload {
 
     /// 还缺哪些片。
     pub fn missing(&self) -> Vec<u32> {
-        self.bitmap.missing()
+        self.written_bitmap.missing()
     }
 
     pub fn is_complete(&self) -> bool {
-        self.bitmap.is_complete()
+        self.written_bitmap.is_complete()
     }
 
     /// 写入一片数据。
@@ -170,32 +218,66 @@ impl PartialDownload {
             .chunk_offset(index)
             .ok_or_else(|| Error::Protocol(format!("第 {index} 片越界")))?;
 
+        {
+            let file = self
+                .file
+                .as_mut()
+                .ok_or_else(|| Error::Protocol("下载已结束，无法继续写入".into()))?;
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(data)?;
+        }
+
+        self.written_bitmap.set(index)?;
+        self.dirty_bytes = self.dirty_bytes.saturating_add(data.len() as u64);
+        self.checkpoint_if_due()
+    }
+
+    fn checkpoint_if_due(&mut self) -> Result<()> {
+        if self.dirty_bytes >= self.checkpoint_policy.bytes
+            || self.last_checkpoint.elapsed() >= self.checkpoint_policy.interval
+        {
+            self.checkpoint()?;
+        }
+        Ok(())
+    }
+
+    /// 将当前 written bitmap 与 `.part` 一起推进到 durable 状态。
+    pub(crate) fn checkpoint(&mut self) -> Result<()> {
+        let checkpoint_bytes = self.dirty_bytes;
+        let checkpoint_started = Instant::now();
+
+        // 顺序不可改变：先让文件数据 durable，再发布 bitmap 快照。
         let file = self
             .file
             .as_mut()
-            .ok_or_else(|| Error::Protocol("下载已结束，无法继续写入".into()))?;
-        file.seek(SeekFrom::Start(offset))?;
-        file.write_all(data)?;
-        // 先把数据本身推到稳定存储，再发布新的完成位。即使 bitmap 的替换在
-        // Windows 上经历“删除旧文件 -> 改名”的短窗口，恢复也只会少传，不会假完成。
+            .ok_or_else(|| Error::Protocol("下载已结束，无法 checkpoint".into()))?;
         file.sync_data()?;
 
-        let mut next_bitmap = self.bitmap.clone();
-        next_bitmap.set(index)?;
-        save_bitmap(&self.state_path, &next_bitmap)?;
-        self.bitmap = next_bitmap;
+        let snapshot = self.written_bitmap.clone();
+        save_bitmap(&self.state_path, &snapshot)?;
+        self.durable_bitmap = snapshot;
+        self.dirty_bytes = 0;
+        self.last_checkpoint = Instant::now();
+
+        tracing::debug!(
+            checkpoint_bytes,
+            checkpoint_elapsed_ms = checkpoint_started.elapsed().as_millis(),
+            "完成 durable checkpoint"
+        );
         Ok(())
     }
 
     /// 收尾：落盘并改名成正式文件，清理位图。返回正式文件路径。
     pub fn finalize(mut self) -> Result<PathBuf> {
-        if !self.bitmap.is_complete() {
+        if !self.written_bitmap.is_complete() {
             return Err(Error::Protocol(format!(
                 "还有 {} 片没收到，不能收尾",
-                self.manifest.chunk_count() - self.bitmap.count_set()
+                self.manifest.chunk_count() - self.written_bitmap.count_set()
             )));
         }
 
+        // 即使尚未达到自动 checkpoint 条件，收尾也必须先发布完整的 durable bitmap。
+        self.checkpoint()?;
         if let Some(file) = self.file.as_mut() {
             file.sync_all()?;
         }
@@ -227,7 +309,9 @@ impl std::fmt::Debug for PartialDownload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PartialDownload")
             .field("target", &self.target_path)
-            .field("bitmap", &self.bitmap)
+            .field("written_bitmap", &self.written_bitmap)
+            .field("durable_bitmap", &self.durable_bitmap)
+            .field("dirty_bytes", &self.dirty_bytes)
             .finish()
     }
 }
@@ -411,6 +495,13 @@ mod tests {
         &content[offset as usize..(offset + u64::from(len)) as usize]
     }
 
+    fn no_auto_checkpoint_policy() -> CheckpointPolicy {
+        CheckpointPolicy {
+            bytes: u64::MAX,
+            interval: Duration::MAX,
+        }
+    }
+
     #[test]
     fn 完整写入并收尾() {
         let dir = temp_dir("complete");
@@ -478,6 +569,7 @@ mod tests {
             let mut first = PartialDownload::create(&dir, manifest.clone()).unwrap();
             first.write_chunk(0, slice(&content, &manifest, 0)).unwrap();
             first.write_chunk(1, slice(&content, &manifest, 1)).unwrap();
+            first.checkpoint().unwrap();
             // 直接丢弃结构体（不调用 discard/finalize），模拟进程退出或断线。
         }
 
@@ -496,6 +588,175 @@ mod tests {
     }
 
     #[test]
+    fn 未checkpoint的分片不进入持久化恢复进度() {
+        let dir = temp_dir("not_durable");
+        let content = vec![0x31u8; MIN_CHUNK_SIZE as usize * 2];
+        let manifest = manifest_for(&content, "not-durable.bin");
+
+        {
+            let mut download = PartialDownload::create_with_policy(
+                &dir,
+                manifest.clone(),
+                no_auto_checkpoint_policy(),
+            )
+            .unwrap();
+            download
+                .write_chunk(0, slice(&content, &manifest, 0))
+                .unwrap();
+            assert!(download.bitmap().is_set(0));
+            assert!(!download.durable_bitmap().is_set(0));
+            let persisted = ChunkBitmap::from_bytes(
+                manifest.chunk_count(),
+                &fs::read(PartialDownload::state_path_for(&dir, &manifest)).unwrap(),
+            )
+            .unwrap();
+            assert!(!persisted.is_set(0));
+        }
+
+        let recovered = PartialDownload::create(&dir, manifest.clone()).unwrap();
+        assert!(!recovered.bitmap().is_set(0));
+        assert_eq!(recovered.missing(), vec![0, 1]);
+        drop(recovered);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn checkpoint后可以恢复() {
+        let dir = temp_dir("checkpoint_resume");
+        let content = vec![0x32u8; MIN_CHUNK_SIZE as usize * 3];
+        let manifest = manifest_for(&content, "checkpoint.bin");
+
+        {
+            let mut download = PartialDownload::create_with_policy(
+                &dir,
+                manifest.clone(),
+                no_auto_checkpoint_policy(),
+            )
+            .unwrap();
+            download
+                .write_chunk(0, slice(&content, &manifest, 0))
+                .unwrap();
+            download
+                .write_chunk(1, slice(&content, &manifest, 1))
+                .unwrap();
+            assert_eq!(download.durable_bitmap().present(), Vec::<u32>::new());
+            download.checkpoint().unwrap();
+            assert_eq!(download.durable_bitmap().present(), vec![0, 1]);
+        }
+
+        let recovered = PartialDownload::create(&dir, manifest.clone()).unwrap();
+        assert_eq!(recovered.bitmap().present(), vec![0, 1]);
+        assert_eq!(recovered.missing(), vec![2]);
+        drop(recovered);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn checkpoint后篡改的分片会清位且保留其它分片() {
+        let dir = temp_dir("checkpoint_corrupt");
+        let content: Vec<u8> = (0..MIN_CHUNK_SIZE * 3)
+            .map(|index| (index % 193) as u8)
+            .collect();
+        let manifest = manifest_for(&content, "checkpoint-corrupt.bin");
+
+        {
+            let mut download = PartialDownload::create_with_policy(
+                &dir,
+                manifest.clone(),
+                no_auto_checkpoint_policy(),
+            )
+            .unwrap();
+            for index in 0..manifest.chunk_count() {
+                download
+                    .write_chunk(index, slice(&content, &manifest, index))
+                    .unwrap();
+            }
+            download.checkpoint().unwrap();
+        }
+
+        let temp = PartialDownload::temp_path_for(&dir, &manifest);
+        let (offset, _) = manifest.chunk_range(1).unwrap();
+        let mut corrupted = slice(&content, &manifest, 1).to_vec();
+        corrupted[0] ^= 0xff;
+        let mut file = OpenOptions::new().write(true).open(&temp).unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&corrupted).unwrap();
+        file.sync_all().unwrap();
+
+        let recovered = PartialDownload::create(&dir, manifest.clone()).unwrap();
+        assert_eq!(recovered.bitmap().present(), vec![0, 2]);
+        assert_eq!(recovered.durable_bitmap().present(), vec![0, 2]);
+        let persisted = ChunkBitmap::from_bytes(
+            manifest.chunk_count(),
+            &fs::read(PartialDownload::state_path_for(&dir, &manifest)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted.present(), vec![0, 2]);
+        drop(recovered);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn finalize会强制checkpoint() {
+        let dir = temp_dir("finalize_checkpoint");
+        let content = vec![0x33u8; MIN_CHUNK_SIZE as usize * 2];
+        let manifest = manifest_for(&content, "finalize-checkpoint.bin");
+
+        let mut download = PartialDownload::create_with_policy(
+            &dir,
+            manifest.clone(),
+            no_auto_checkpoint_policy(),
+        )
+        .unwrap();
+        for index in 0..manifest.chunk_count() {
+            download
+                .write_chunk(index, slice(&content, &manifest, index))
+                .unwrap();
+        }
+        let persisted_before_finalize =
+            fs::read(PartialDownload::state_path_for(&dir, &manifest)).unwrap();
+        assert_eq!(persisted_before_finalize, vec![0u8]);
+
+        let output = download.finalize().unwrap();
+        assert_eq!(fs::read(&output).unwrap(), content);
+        assert!(!PartialDownload::temp_path_for(&dir, &manifest).exists());
+        assert!(!PartialDownload::state_path_for(&dir, &manifest).exists());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn 可以连续执行多次checkpoint() {
+        let dir = temp_dir("checkpoint_multiple");
+        let content = vec![0x34u8; MIN_CHUNK_SIZE as usize * 2];
+        let manifest = manifest_for(&content, "checkpoint-multiple.bin");
+
+        {
+            let mut download = PartialDownload::create_with_policy(
+                &dir,
+                manifest.clone(),
+                no_auto_checkpoint_policy(),
+            )
+            .unwrap();
+            download
+                .write_chunk(0, slice(&content, &manifest, 0))
+                .unwrap();
+            download.checkpoint().unwrap();
+            assert_eq!(download.durable_bitmap().present(), vec![0]);
+            download
+                .write_chunk(1, slice(&content, &manifest, 1))
+                .unwrap();
+            download.checkpoint().unwrap();
+            assert_eq!(download.durable_bitmap().present(), vec![0, 1]);
+        }
+
+        let recovered = PartialDownload::create(&dir, manifest.clone()).unwrap();
+        assert!(recovered.is_complete());
+        drop(recovered);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn 恢复时会清除指向损坏磁盘数据的完成位() {
         let dir = temp_dir("resume_corrupt");
         let content: Vec<u8> = (0..MIN_CHUNK_SIZE * 2).map(|i| (i % 197) as u8).collect();
@@ -506,6 +767,7 @@ mod tests {
             download
                 .write_chunk(0, slice(&content, &manifest, 0))
                 .unwrap();
+            download.checkpoint().unwrap();
         }
 
         // bitmap 仍然声称第 0 片完成，但磁盘上的真实数据已被篡改。
@@ -599,6 +861,7 @@ mod tests {
                 .write_chunk(index, slice(&content, &manifest, index))
                 .unwrap();
         }
+        download.checkpoint().unwrap();
         let saved = ChunkBitmap::from_bytes(
             manifest.chunk_count(),
             &fs::read(PartialDownload::state_path_for(&dir, &manifest)).unwrap(),
