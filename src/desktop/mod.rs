@@ -86,6 +86,26 @@ fn marked_selection_to_utf8(
         ..insertion_offset + utf8_offset_from_utf16(new_text, selection_utf16.end)
 }
 
+fn mouse_index_for_layout(content: &str, layout_text: &str, index: usize) -> Option<usize> {
+    if content != layout_text {
+        return None;
+    }
+
+    let index = index.min(content.len());
+    if content.is_char_boundary(index) {
+        return Some(index);
+    }
+
+    Some(
+        content
+            .char_indices()
+            .take_while(|(boundary, _)| *boundary < index)
+            .map(|(boundary, _)| boundary)
+            .last()
+            .unwrap_or(0),
+    )
+}
+
 struct TextField {
     focus_handle: FocusHandle,
     content: SharedString,
@@ -171,10 +191,12 @@ impl TextField {
         cx: &mut Context<Self>,
     ) {
         self.is_selecting = true;
-        if event.modifiers.shift {
-            self.select_to(self.index_for_mouse_position(event.position), cx);
-        } else {
-            self.move_to(self.index_for_mouse_position(event.position), cx);
+        if let Some(index) = self.index_for_mouse_position(event.position) {
+            if event.modifiers.shift {
+                self.select_to(index, cx);
+            } else {
+                self.move_to(index, cx);
+            }
         }
     }
 
@@ -183,8 +205,10 @@ impl TextField {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.is_selecting {
-            self.select_to(self.index_for_mouse_position(event.position), cx);
+        if self.is_selecting
+            && let Some(index) = self.index_for_mouse_position(event.position)
+        {
+            self.select_to(index, cx);
         }
     }
 
@@ -233,22 +257,29 @@ impl TextField {
         }
     }
 
-    fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
+    fn index_for_mouse_position(&self, position: Point<Pixels>) -> Option<usize> {
         if self.content.is_empty() {
-            return 0;
+            return Some(0);
         }
 
         let (Some(bounds), Some(line)) = (self.last_bounds.as_ref(), self.last_layout.as_ref())
         else {
-            return 0;
+            return None;
+        };
+        if line.text != self.content {
+            return None;
         };
         if position.y < bounds.top() {
-            return 0;
+            return Some(0);
         }
         if position.y > bounds.bottom() {
-            return self.content.len();
+            return Some(self.content.len());
         }
-        line.closest_index_for_x(position.x - bounds.left())
+        mouse_index_for_layout(
+            &self.content,
+            &line.text,
+            line.closest_index_for_x(position.x - bounds.left()),
+        )
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -1115,7 +1146,10 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{marked_selection_to_utf8, utf8_offset_from_utf16, utf16_offset_from_utf8};
+    use super::{
+        marked_selection_to_utf8, mouse_index_for_layout, utf8_offset_from_utf16,
+        utf16_offset_from_utf8,
+    };
 
     #[test]
     fn utf16_offsets_preserve_cjk_and_surrogate_pairs() {
@@ -1135,5 +1169,31 @@ mod tests {
         let combined = format!("{content}{new_text}");
 
         assert_eq!(&combined[selected], "🙂");
+    }
+
+    #[test]
+    fn stale_ascii_layout_is_rejected_after_content_becomes_short_emoji() {
+        assert_eq!(mouse_index_for_layout("🙂", "old ASCII content", 3), None);
+    }
+
+    #[test]
+    fn stale_long_layout_is_rejected_after_content_becomes_short_text() {
+        assert_eq!(
+            mouse_index_for_layout("短", "a much longer old value", 3),
+            None
+        );
+    }
+
+    #[test]
+    fn placeholder_layout_is_rejected_when_content_is_empty() {
+        assert_eq!(
+            mouse_index_for_layout("", "输入或粘贴对端 ID（仅壳层输入）", 3),
+            None
+        );
+    }
+
+    #[test]
+    fn current_layout_maps_internal_utf8_offset_to_a_boundary() {
+        assert_eq!(mouse_index_for_layout("🙂", "🙂", 3), Some(0));
     }
 }
