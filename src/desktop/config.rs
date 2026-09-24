@@ -249,6 +249,29 @@ impl DesktopConfig {
     }
 }
 
+pub(super) fn restore_saved_settings(config: DesktopConfig) -> (SettingsDraft, String, bool) {
+    restore_saved_settings_with_validator(config, validate_receive_directory)
+}
+
+fn restore_saved_settings_with_validator(
+    config: DesktopConfig,
+    validate: impl FnOnce(&Path) -> Result<(), ConfigError>,
+) -> (SettingsDraft, String, bool) {
+    let settings = SettingsDraft::from_config(config);
+    let note = match settings.receive_directory.as_deref() {
+        Some(path) => match validate(path) {
+            Ok(()) => "已加载已保存设置；网络功能待接入".to_owned(),
+            Err(error) => format!("已加载设置；{error}。可选择新的接收目录并保存；网络功能待接入"),
+        },
+        None => "已加载设置；请重新选择接收目录；网络功能待接入".to_owned(),
+    };
+    // The parsed JSON and settings fields are valid even if the saved directory
+    // has since become unavailable. Keep remediation enabled so the user can
+    // select a replacement instead of treating this runtime condition as JSON
+    // corruption.
+    (settings, note, true)
+}
+
 pub fn validate_signal_host(host: &str) -> Result<(), ConfigError> {
     if host.is_empty()
         || host.trim() != host
@@ -330,35 +353,117 @@ pub fn validate_speedtest_seconds(value: u16) -> Result<(), ConfigError> {
     }
 }
 
-fn validate_receive_directory(path: &Path) -> Result<(), ConfigError> {
-    let metadata = fs::metadata(path).map_err(|error| match error.kind() {
-        io::ErrorKind::PermissionDenied => {
-            ConfigError::ReceiveDirectoryPermission(path.display().to_string())
-        }
-        _ => ConfigError::ReceiveDirectoryUnavailable(format!("{}：{error}", path.display())),
-    })?;
+pub(super) fn validate_receive_directory(path: &Path) -> Result<(), ConfigError> {
+    validate_receive_directory_with(path, probe_receive_directory_write)
+}
+
+fn validate_receive_directory_with(
+    path: &Path,
+    probe_write: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<(), ConfigError> {
+    let metadata = fs::metadata(path).map_err(|error| receive_directory_io_error(path, error))?;
     if !metadata.is_dir() {
         return Err(ConfigError::ReceiveDirectoryUnavailable(format!(
             "{} 不是目录",
             path.display()
         )));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o222 == 0 {
-            return Err(ConfigError::ReceiveDirectoryPermission(
-                path.display().to_string(),
-            ));
+    probe_write(path).map_err(|error| receive_directory_io_error(path, error))?;
+    Ok(())
+}
+
+fn receive_directory_io_error(path: &Path, error: io::Error) -> ConfigError {
+    match error.kind() {
+        io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem => {
+            ConfigError::ReceiveDirectoryPermission(format!("{}：{error}", path.display()))
+        }
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory => {
+            ConfigError::ReceiveDirectoryUnavailable(format!("{}：{error}", path.display()))
+        }
+        _ => ConfigError::Io(error),
+    }
+}
+
+fn probe_receive_directory_write(directory: &Path) -> io::Result<()> {
+    for _ in 0..32 {
+        let probe_path = directory.join(format!(
+            ".p2p-file-write-probe-{:032x}.tmp",
+            rand::random::<u128>()
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+
+        // Construct the cleanup guard before opening the file so unwinding
+        // drops the file handle first (important on Windows), then removes it.
+        let mut cleanup = ProbeFileCleanup::new(probe_path.clone());
+        let mut file = match options.open(&probe_path) {
+            Ok(file) => {
+                cleanup.arm();
+                file
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+
+        let write_result = file.write_all(b"p2p-file receive-directory probe\n");
+        drop(file);
+        let cleanup_result = cleanup.remove();
+        return match (write_result, cleanup_result) {
+            (Err(error), _) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        };
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "无法创建唯一的接收目录写能力探针",
+    ))
+}
+
+struct ProbeFileCleanup {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl ProbeFileCleanup {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: false }
+    }
+
+    fn arm(&mut self) {
+        self.armed = true;
+    }
+
+    fn remove(&mut self) -> io::Result<()> {
+        if !self.armed {
+            return Ok(());
+        }
+        match fs::remove_file(&self.path) {
+            Ok(()) => {
+                self.armed = false;
+                Ok(())
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.armed = false;
+                Ok(())
+            }
+            Err(error) => Err(error),
         }
     }
-    #[cfg(windows)]
-    if metadata.permissions().readonly() {
-        return Err(ConfigError::ReceiveDirectoryPermission(
-            path.display().to_string(),
-        ));
+}
+
+impl Drop for ProbeFileCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
     }
-    Ok(())
 }
 
 pub fn ensure_private_app_dir(path: &Path) -> io::Result<()> {
@@ -613,6 +718,97 @@ mod tests {
             fs::read_dir(config_file.parent().unwrap()).unwrap().count(),
             1
         );
+        assert_eq!(fs::read_dir(&receive).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_reports_disappeared_receive_directory_without_corrupting_or_overwriting_config() {
+        let root = temp_dir("missing_receive");
+        let receive = root.join("Downloads");
+        fs::create_dir_all(&receive).unwrap();
+        let config_file = root.join("settings").join("settings.json");
+        valid_draft(receive.clone())
+            .save_atomic(&config_file)
+            .unwrap();
+        let original_config = fs::read(&config_file).unwrap();
+
+        fs::remove_dir_all(&receive).unwrap();
+        let config = DesktopConfig::load(&config_file)
+            .expect("a stale receive path must not make valid JSON corrupt")
+            .expect("the saved configuration should still load");
+        let (mut settings, note, can_save) = restore_saved_settings(config);
+
+        assert!(note.contains("接收目录不可用"), "{note}");
+        assert!(note.contains("网络功能待接入"), "{note}");
+        assert!(can_save, "a stale receive directory must remain repairable");
+        assert_eq!(
+            settings.receive_directory.as_deref(),
+            Some(receive.as_path())
+        );
+        assert_eq!(fs::read(&config_file).unwrap(), original_config);
+
+        let replacement = root.join("replacement");
+        fs::create_dir(&replacement).unwrap();
+        settings.receive_directory = Some(replacement.clone());
+        settings.save_atomic(&config_file).unwrap();
+        assert_eq!(
+            DesktopConfig::load(&config_file)
+                .unwrap()
+                .unwrap()
+                .receive_directory,
+            replacement
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn write_capability_failure_is_a_directory_diagnostic_and_preserves_config() {
+        let root = temp_dir("write_failure");
+        let receive = root.join("Downloads");
+        fs::create_dir_all(&receive).unwrap();
+        let config_file = root.join("settings").join("settings.json");
+        valid_draft(receive.clone())
+            .save_atomic(&config_file)
+            .unwrap();
+        let original_config = fs::read(&config_file).unwrap();
+
+        let config = DesktopConfig::load(&config_file)
+            .expect("a runtime write failure must not make valid JSON corrupt")
+            .unwrap();
+        let (settings, note, can_save) = restore_saved_settings_with_validator(config, |path| {
+            validate_receive_directory_with(path, |_| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected write probe failure",
+                ))
+            })
+        });
+
+        assert!(note.contains("接收目录没有写权限"), "{note}");
+        assert!(note.contains("网络功能待接入"), "{note}");
+        assert!(can_save, "a write failure must leave settings repairable");
+        assert_eq!(
+            settings.receive_directory.as_deref(),
+            Some(receive.as_path())
+        );
+        assert_eq!(fs::read(&config_file).unwrap(), original_config);
+        assert!(DesktopConfig::load(&config_file).unwrap().is_some());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn receive_directory_file_path_is_unavailable_not_a_permission_failure() {
+        let root = temp_dir("not_directory");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("file");
+        fs::write(&file, b"existing data").unwrap();
+
+        assert!(matches!(
+            validate_receive_directory(&file),
+            Err(ConfigError::ReceiveDirectoryUnavailable(_))
+        ));
+        assert_eq!(fs::read(&file).unwrap(), b"existing data");
         fs::remove_dir_all(root).unwrap();
     }
 

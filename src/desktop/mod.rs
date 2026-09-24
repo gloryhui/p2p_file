@@ -84,11 +84,7 @@ impl DesktopStartup {
         let config_file = paths.config_file();
         let defaults = || SettingsDraft::defaults(paths.downloads_dir.clone());
         let (settings, config_note, can_save_settings) = match DesktopConfig::load(&config_file) {
-            Ok(Some(config)) => (
-                SettingsDraft::from_config(config),
-                "已加载已保存设置；网络功能待接入".to_owned(),
-                true,
-            ),
+            Ok(Some(config)) => config::restore_saved_settings(config),
             Ok(None) => {
                 let note = if paths.downloads_dir.is_some() {
                     "尚未保存信令设置；请填写主机和端口".to_owned()
@@ -837,7 +833,8 @@ impl DesktopShell {
                     shell.is_saving_settings = false;
                     match result {
                         Ok(()) => {
-                            shell.config_note = "设置已保存；上线意图已记录，网络功能待接入".into();
+                            shell.config_note =
+                                "设置已保存；接收目录写能力检查通过；网络功能待接入".into();
                             shell.set_status("设置已保存；当前仍未连接，网络功能待接入", cx);
                         }
                         Err(error) => {
@@ -935,6 +932,9 @@ impl DesktopShell {
                         if let Some(path) = paths.pop() {
                             if let Some(path_text) = path.to_str() {
                                 shell.settings.receive_directory = Some(path.to_path_buf());
+                                shell.config_note =
+                                    "已选择新接收目录；保存时会重新验证写能力；网络功能待接入"
+                                        .into();
                                 shell.set_status(
                                     format!("接收目录已选择 {path_text}；保存后用于新任务"),
                                     cx,
