@@ -39,8 +39,10 @@ cargo clippy --locked --offline --features gui --all-targets -- -D warnings
 cargo build --locked --offline --features gui --bin p2p-desktop
 ```
 
-All five commands passed. The two explicit desktop tests cover UTF-16/UTF-8
-offsets, CJK, emoji, and an IME marked selection after a multibyte prefix.
+All five commands passed. The six explicit desktop tests cover UTF-16/UTF-8
+offsets with CJK and emoji; IME selection after a multibyte prefix; stale
+ASCII-to-emoji and long-to-short layouts; placeholder transitions; and valid
+UTF-8 boundaries for the current layout.
 
 ## First-frame and minimum-size evidence
 
@@ -85,6 +87,47 @@ wheel-scrolling the root container to the bottom produced
 where the complete status bar is visible. The two-line source correction is
 the `id("desktop-shell").overflow_y_scroll()` root container in
 `src/desktop/mod.rs`.
+
+## T001 attempt 2 disabled-control evidence
+
+The attempt 2 build was run in a fresh D-Bus session on Xvfb display `:111`
+with Openbox ready before the GUI started. The first-frame capture is
+[`gpui-t001-a2-disabled-first-frame.png`](screenshots/gpui-t001-a2-disabled-first-frame.png)
+at 960x680. Both `复制（无身份）` and `连接（网络未接入）` are visibly disabled;
+the peer ID field remains editable.
+
+For the no-op interaction capture,
+[`gpui-t001-a2-disabled-noop.png`](screenshots/gpui-t001-a2-disabled-noop.png),
+`peer-test` was entered and the disabled connection control was clicked. The
+status stayed `未配置身份；网络功能待接入`; it did not report a connection.
+The disabled copy control was also clicked while the X11 clipboard contained
+`clipboard-sentinel`; reading the clipboard afterward returned the same value.
+Neither disabled control has a mouse-up handler in the T001 shell.
+
+At the required minimum size, the top capture
+[`gpui-t001-a2-minimum-top.png`](screenshots/gpui-t001-a2-minimum-top.png)
+shows both disabled controls. After scrolling to the bottom,
+[`gpui-t001-a2-minimum-bottom.png`](screenshots/gpui-t001-a2-minimum-bottom.png)
+shows the unchanged disconnected status bar while retaining the controls in
+view. The runtime window geometry was 760x560 logical pixels.
+
+Reproduction commands, after building the binary:
+
+```sh
+Xvfb :111 -screen 0 1280x800x24 -nolisten tcp
+env DISPLAY=:111 XDG_CURRENT_DESKTOP=GNOME openbox --sm-disable
+env DISPLAY=:111 xprop -root _NET_SUPPORTING_WM_CHECK
+env DISPLAY=:111 XDG_CURRENT_DESKTOP=GNOME dbus-run-session -- \
+  target/debug/p2p-desktop
+env DISPLAY=:111 xdotool windowsize --sync WINDOW 760 560
+env DISPLAY=:111 xdotool mousemove --window WINDOW 700 500 \
+  click --repeat 8 --delay 100 5
+```
+
+To check the disabled copy control, keep the clipboard owner alive in a
+separate terminal with `printf '%s' 'clipboard-sentinel' | xclip -quiet
+-selection clipboard -i -loops 10`, click `复制（无身份）`, then run
+`xclip -selection clipboard -o`; the output remains `clipboard-sentinel`.
 
 ## Input, clipboard, and native picker evidence
 

@@ -41,8 +41,6 @@ actions!(
         ChooseFiles,
         ChooseFolder,
         ChooseReceiveDirectory,
-        CopyLocalId,
-        Connect,
         Quit,
     ]
 );
@@ -780,17 +778,17 @@ impl DesktopShell {
         .detach();
     }
 
-    fn copy_local_id(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.set_status("当前没有真实 Node ID 可复制；身份由 T002 接入", cx);
-    }
-
-    fn connect(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let peer_id = self.peer_id.read(cx).content.clone();
-        if peer_id.trim().is_empty() {
-            self.set_status("请先输入对端 ID；连接逻辑由 T004/T005 接入", cx);
-        } else {
-            self.set_status("已收到连接请求；当前仅验证桌面壳，未发起网络连接", cx);
-        }
+    fn unavailable_control(label: &'static str) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_2()
+            .bg(rgb(0xf0f2f5))
+            .border_1()
+            .border_color(rgb(0xd9dee7))
+            .rounded_md()
+            .text_color(rgb(0x737e8d))
+            .cursor(CursorStyle::Arrow)
+            .child(label)
     }
 
     fn choose_files_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -922,20 +920,7 @@ impl Render for DesktopShell {
                                             .truncate()
                                             .child("T002 将填充真实 32 位 Node ID（当前未接入）"),
                                     )
-                                    .child(
-                                        div()
-                                            .px_2()
-                                            .py_2()
-                                            .border_1()
-                                            .border_color(rgb(0xdde3ee))
-                                            .rounded_md()
-                                            .child("复制")
-                                            .hover(|style| style.bg(rgb(0xf0f3f8)).cursor_pointer())
-                                            .on_mouse_up(
-                                                MouseButton::Left,
-                                                cx.listener(Self::copy_local_id),
-                                            ),
-                                    ),
+                                    .child(Self::unavailable_control("复制（无身份）")),
                             ),
                     )
                     .child(
@@ -955,20 +940,7 @@ impl Render for DesktopShell {
                                     .gap_2()
                                     .items_center()
                                     .child(self.peer_id.clone())
-                                    .child(
-                                        div()
-                                            .px_3()
-                                            .py_2()
-                                            .rounded_md()
-                                            .bg(rgb(0x3468d4))
-                                            .text_color(white())
-                                            .child("连接")
-                                            .hover(|style| style.bg(rgb(0x2856b5)).cursor_pointer())
-                                            .on_mouse_up(
-                                                MouseButton::Left,
-                                                cx.listener(Self::connect),
-                                            ),
-                                    ),
+                                    .child(Self::unavailable_control("连接（网络未接入）")),
                             ),
                     ),
             )
