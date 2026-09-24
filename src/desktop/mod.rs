@@ -10,7 +10,14 @@
 //! T001 shell state/path-picker boundaries; it is not presented as original
 //! MIT-licensed application code. See docs/gpui-mvp/THIRD_PARTY_NOTICES.md.
 
+mod config;
+mod instance_lock;
+
 use std::{ops::Range, path::PathBuf};
+
+use crate::identity::Identity;
+use config::{AppPaths, ConfigError, DesktopConfig, SettingsDraft, SpeedtestDirection};
+use instance_lock::InstanceLock;
 
 use gpui::{
     App, Application, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler,
@@ -44,6 +51,75 @@ actions!(
         Quit,
     ]
 );
+
+struct DesktopStartup {
+    instance_lock: InstanceLock,
+    identity_id: Option<String>,
+    identity_status: String,
+    config_file: PathBuf,
+    settings: SettingsDraft,
+    config_note: String,
+    can_save_settings: bool,
+}
+
+impl DesktopStartup {
+    fn load() -> Result<Self, String> {
+        let paths = AppPaths::discover().map_err(|error| error.to_string())?;
+        config::ensure_private_app_dir(&paths.config_dir)
+            .map_err(|error| format!("无法准备配置目录：{error}"))?;
+        config::ensure_private_app_dir(&paths.data_dir)
+            .map_err(|error| format!("无法准备应用数据目录：{error}"))?;
+        let instance_lock = InstanceLock::acquire(&paths.instance_lock_file())
+            .map_err(|error| error.to_string())?;
+
+        let (identity_id, identity_status) = match Identity::load_or_create(&paths.identity_file())
+        {
+            Ok(identity) => (
+                Some(identity.node_id().to_hex()),
+                "本机身份已就绪".to_owned(),
+            ),
+            Err(error) => (None, format!("本机身份不可用：{error}")),
+        };
+
+        let config_file = paths.config_file();
+        let defaults = || SettingsDraft::defaults(paths.downloads_dir.clone());
+        let (settings, config_note, can_save_settings) = match DesktopConfig::load(&config_file) {
+            Ok(Some(config)) => (
+                SettingsDraft::from_config(config),
+                "已加载已保存设置；网络功能待接入".to_owned(),
+                true,
+            ),
+            Ok(None) => {
+                let note = if paths.downloads_dir.is_some() {
+                    "尚未保存信令设置；请填写主机和端口".to_owned()
+                } else {
+                    "未找到系统 Downloads，请选择接收目录".to_owned()
+                };
+                (defaults(), note, true)
+            }
+            Err(ConfigError::Corrupt(error)) => (
+                defaults(),
+                format!("配置损坏，原文件已保留；保存已禁用：{error}"),
+                false,
+            ),
+            Err(error) => (
+                defaults(),
+                format!("配置读取失败，保存已禁用：{error}"),
+                false,
+            ),
+        };
+
+        Ok(Self {
+            instance_lock,
+            identity_id,
+            identity_status,
+            config_file,
+            settings,
+            config_note,
+            can_save_settings,
+        })
+    }
+}
 
 fn utf8_offset_from_utf16(content: &str, offset: usize) -> usize {
     let mut utf8_offset = 0;
@@ -675,9 +751,18 @@ impl Focusable for TextField {
 
 struct DesktopShell {
     peer_id: Entity<TextField>,
+    signal_host: Entity<TextField>,
+    signal_port: Entity<TextField>,
     selected_files: Vec<PathBuf>,
     selected_folder: Option<PathBuf>,
-    receive_directory: Option<PathBuf>,
+    settings: SettingsDraft,
+    identity_id: Option<String>,
+    identity_status: SharedString,
+    config_file: PathBuf,
+    config_note: SharedString,
+    can_save_settings: bool,
+    is_saving_settings: bool,
+    _instance_lock: InstanceLock,
     status: SharedString,
     focus_handle: FocusHandle,
 }
@@ -686,6 +771,83 @@ impl DesktopShell {
     fn set_status(&mut self, status: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.status = status.into();
         cx.notify();
+    }
+
+    fn copy_node_id(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(identity_id) = self.identity_id.as_ref() {
+            cx.write_to_clipboard(ClipboardItem::new_string(identity_id.clone()));
+            self.set_status("已复制完整本机 Node ID", cx);
+        }
+    }
+
+    fn cycle_concurrency(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.settings.send_concurrency = self.settings.send_concurrency % 3 + 1;
+        cx.notify();
+    }
+
+    fn cycle_speedtest_duration(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.speedtest_seconds = if self.settings.speedtest_seconds == 30 {
+            60
+        } else if self.settings.speedtest_seconds >= 600 {
+            30
+        } else {
+            self.settings.speedtest_seconds + 60
+        };
+        cx.notify();
+    }
+
+    fn toggle_speedtest_direction(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.speedtest_direction = match self.settings.speedtest_direction {
+            SpeedtestDirection::Upload => SpeedtestDirection::Download,
+            SpeedtestDirection::Download => SpeedtestDirection::Upload,
+        };
+        cx.notify();
+    }
+
+    fn save_settings(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_save_settings || self.is_saving_settings {
+            self.set_status("当前配置不可保存；请检查配置诊断信息", cx);
+            return;
+        }
+
+        let mut draft = self.settings.clone();
+        draft.signal_host = self.signal_host.read(cx).content.to_string();
+        draft.signal_port = self.signal_port.read(cx).content.to_string();
+        let config_file = self.config_file.clone();
+        let background = cx.background_executor().clone();
+        self.is_saving_settings = true;
+        self.set_status("正在验证并保存设置…", cx);
+
+        cx.spawn(async move |shell, cx| {
+            let result = background
+                .spawn(async move { draft.save_atomic(&config_file) })
+                .await;
+            shell
+                .update(cx, |shell, cx| {
+                    shell.is_saving_settings = false;
+                    match result {
+                        Ok(()) => {
+                            shell.config_note = "设置已保存；上线意图已记录，网络功能待接入".into();
+                            shell.set_status("设置已保存；当前仍未连接，网络功能待接入", cx);
+                        }
+                        Err(error) => {
+                            shell.set_status(format!("设置未保存：{error}"), cx);
+                        }
+                    }
+                })
+                .ok();
+        })
+        .detach();
     }
 
     fn choose_files(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -699,6 +861,9 @@ impl DesktopShell {
             let result = task.await;
             shell
                 .update(cx, |shell, cx| match result {
+                    Ok(Ok(Some(paths))) if paths.iter().any(|path| path.to_str().is_none()) => {
+                        shell.set_status("所选文件路径编码不受支持；未保存或转换该路径", cx);
+                    }
                     Ok(Ok(Some(paths))) if !paths.is_empty() => {
                         let count = paths.len();
                         shell.selected_files = paths;
@@ -727,11 +892,16 @@ impl DesktopShell {
                 .update(cx, |shell, cx| match result {
                     Ok(Ok(Some(mut paths))) => {
                         if let Some(path) = paths.pop() {
-                            shell.selected_folder = Some(path.clone());
-                            shell.set_status(
-                                format!("已选择目录 {}；网络传输仍待接入", path.display()),
-                                cx,
-                            );
+                            if let Some(path_text) = path.to_str() {
+                                shell.selected_folder = Some(path.to_path_buf());
+                                shell.set_status(
+                                    format!("已选择目录 {path_text}；网络传输仍待接入"),
+                                    cx,
+                                );
+                            } else {
+                                shell
+                                    .set_status("所选目录路径编码不受支持；未保存或转换该路径", cx);
+                            }
                         } else {
                             shell.set_status("未选择目录", cx);
                         }
@@ -763,8 +933,16 @@ impl DesktopShell {
                 .update(cx, |shell, cx| match result {
                     Ok(Ok(Some(mut paths))) => {
                         if let Some(path) = paths.pop() {
-                            shell.receive_directory = Some(path.clone());
-                            shell.set_status(format!("接收目录已设置为 {}", path.display()), cx);
+                            if let Some(path_text) = path.to_str() {
+                                shell.settings.receive_directory = Some(path.to_path_buf());
+                                shell.set_status(
+                                    format!("接收目录已选择 {path_text}；保存后用于新任务"),
+                                    cx,
+                                );
+                            } else {
+                                shell
+                                    .set_status("所选接收目录路径编码不受支持；请改选其它目录", cx);
+                            }
                         } else {
                             shell.set_status("未选择接收目录", cx);
                         }
@@ -807,7 +985,11 @@ impl DesktopShell {
 
     fn path_line(label: &str, path: Option<&PathBuf>) -> impl IntoElement {
         let value = path
-            .map(|path| path.display().to_string())
+            .map(|path| {
+                path.to_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| "路径编码不受支持".to_owned())
+            })
             .unwrap_or_else(|| "尚未选择".to_owned());
         div()
             .flex()
@@ -821,6 +1003,55 @@ impl DesktopShell {
                     .text_color(rgb(0x5f6b7a))
                     .child(value),
             )
+    }
+
+    fn copy_identity_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let button = div().px_2().py_2().border_1().rounded_md();
+        if self.identity_id.is_some() {
+            button
+                .bg(rgb(0xeaf1ff))
+                .border_color(rgb(0xb8cdfa))
+                .text_color(rgb(0x2456a6))
+                .child("复制完整 ID")
+                .hover(|style| style.bg(rgb(0xdce8ff)).cursor_pointer())
+                .on_mouse_up(MouseButton::Left, cx.listener(Self::copy_node_id))
+        } else {
+            button
+                .bg(rgb(0xf0f2f5))
+                .border_color(rgb(0xd9dee7))
+                .text_color(rgb(0x737e8d))
+                .cursor(CursorStyle::Arrow)
+                .child("复制（身份不可用）")
+        }
+    }
+
+    fn save_settings_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let label = if self.is_saving_settings {
+            "正在保存…"
+        } else {
+            "保存设置"
+        };
+        let button = div().px_3().py_2().border_1().rounded_md();
+        if self.can_save_settings && !self.is_saving_settings {
+            button
+                .bg(rgb(0x2456a6))
+                .border_color(rgb(0x2456a6))
+                .text_color(white())
+                .child(label)
+                .hover(|style| style.bg(rgb(0x1d478c)).cursor_pointer())
+                .on_mouse_up(MouseButton::Left, cx.listener(Self::save_settings))
+        } else {
+            button
+                .bg(rgb(0xf0f2f5))
+                .border_color(rgb(0xd9dee7))
+                .text_color(rgb(0x737e8d))
+                .cursor(CursorStyle::Arrow)
+                .child(if self.can_save_settings {
+                    label
+                } else {
+                    "保存已禁用"
+                })
+        }
     }
 }
 
@@ -837,9 +1068,17 @@ impl Render for DesktopShell {
         } else {
             self.selected_files
                 .iter()
-                .map(|path| path.display().to_string())
+                .map(|path| {
+                    path.to_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| "路径编码不受支持".to_owned())
+                })
                 .collect()
         };
+        let identity_text = self
+            .identity_id
+            .clone()
+            .unwrap_or_else(|| "身份不可用".to_owned());
 
         div()
             .size_full()
@@ -866,7 +1105,7 @@ impl Render for DesktopShell {
                                 div()
                                     .text_sm()
                                     .text_color(rgb(0x5f6b7a))
-                                    .child("原生 GPUI 桌面壳 · T001 平台验证"),
+                                    .child("原生 GPUI 桌面壳 · T002 配置与身份"),
                             ),
                     )
                     .child(
@@ -876,7 +1115,141 @@ impl Render for DesktopShell {
                             .rounded_md()
                             .bg(rgb(0xfff3d6))
                             .text_color(rgb(0x8b5a00))
-                            .child("未连接"),
+                            .child("未连接 · 网络功能待接入"),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p(px(20.))
+                    .bg(white())
+                    .border_1()
+                    .border_color(rgb(0xdde3ee))
+                    .rounded_md()
+                    .shadow_sm()
+                    .child(div().text_size(px(18.)).child("启动设置"))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(div().text_sm().child("信令主机或 IP"))
+                                    .child(self.signal_host.clone()),
+                            )
+                            .child(
+                                div()
+                                    .w(px(150.))
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(div().text_sm().child("端口"))
+                                    .child(self.signal_port.clone()),
+                            ),
+                    )
+                    .child(Self::path_line(
+                        "接收目录（仅本机可见）",
+                        self.settings.receive_directory.as_ref(),
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_2()
+                                    .bg(rgb(0xf3f5f8))
+                                    .border_1()
+                                    .border_color(rgb(0xdde3ee))
+                                    .rounded_md()
+                                    .child("选择接收目录")
+                                    .hover(|style| style.bg(rgb(0xe9edf3)).cursor_pointer())
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(Self::choose_receive_directory),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_2()
+                                    .bg(rgb(0xf3f5f8))
+                                    .border_1()
+                                    .border_color(rgb(0xdde3ee))
+                                    .rounded_md()
+                                    .child(format!(
+                                        "发送并发：{}（点击切换）",
+                                        self.settings.send_concurrency
+                                    ))
+                                    .hover(|style| style.bg(rgb(0xe9edf3)).cursor_pointer())
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(Self::cycle_concurrency),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_2()
+                                    .bg(rgb(0xf3f5f8))
+                                    .border_1()
+                                    .border_color(rgb(0xdde3ee))
+                                    .rounded_md()
+                                    .child(format!(
+                                        "测速时长：{} 秒（点击切换）",
+                                        self.settings.speedtest_seconds
+                                    ))
+                                    .hover(|style| style.bg(rgb(0xe9edf3)).cursor_pointer())
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(Self::cycle_speedtest_duration),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_2()
+                                    .bg(rgb(0xf3f5f8))
+                                    .border_1()
+                                    .border_color(rgb(0xdde3ee))
+                                    .rounded_md()
+                                    .child(format!(
+                                        "测速方向：{}（点击切换）",
+                                        self.settings.speedtest_direction.label()
+                                    ))
+                                    .hover(|style| style.bg(rgb(0xe9edf3)).cursor_pointer())
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(Self::toggle_speedtest_direction),
+                                    ),
+                            )
+                            .child(self.save_settings_button(cx)),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0x5f6b7a))
+                            .child(self.config_note.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0x8b5a00))
+                            .child("保存设置仅记录上线意图；网络功能待接入，不会显示在线。"),
                     ),
             )
             .child(
@@ -918,10 +1291,16 @@ impl Render for DesktopShell {
                                             .rounded_md()
                                             .text_color(rgb(0x7b8797))
                                             .truncate()
-                                            .child("T002 将填充真实 32 位 Node ID（当前未接入）"),
+                                            .child(identity_text),
                                     )
-                                    .child(Self::unavailable_control("复制（无身份）")),
+                                    .child(self.copy_identity_button(cx)),
                             ),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0x5f6b7a))
+                            .child(self.identity_status.clone()),
                     )
                     .child(
                         div()
@@ -1015,22 +1394,10 @@ impl Render for DesktopShell {
                             .border_color(rgb(0xdde3ee))
                             .rounded_md()
                             .child(div().text_size(px(18.)).child("接收"))
-                            .child(Self::path_line("接收目录", self.receive_directory.as_ref()))
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_2()
-                                    .bg(rgb(0xf3f5f8))
-                                    .border_1()
-                                    .border_color(rgb(0xdde3ee))
-                                    .rounded_md()
-                                    .child("设置接收目录")
-                                    .hover(|style| style.bg(rgb(0xe9edf3)).cursor_pointer())
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(Self::choose_receive_directory),
-                                    ),
-                            )
+                            .child(Self::path_line(
+                                "接收目录",
+                                self.settings.receive_directory.as_ref(),
+                            ))
                             .child(
                                 div().text_sm().text_color(rgb(0x5f6b7a)).child(
                                     "收到的文件将在后续任务中落盘；当前不会写入任何传输数据。",
@@ -1056,7 +1423,15 @@ impl Render for DesktopShell {
 
 /// Start the native GPUI application.
 pub fn run() {
-    Application::new().run(|cx: &mut App| {
+    let startup = match DesktopStartup::load() {
+        Ok(startup) => startup,
+        Err(error) => {
+            eprintln!("桌面启动失败：{error}");
+            return;
+        }
+    };
+
+    Application::new().run(move |cx: &mut App| {
         cx.bind_keys([
             KeyBinding::new("backspace", Backspace, None),
             KeyBinding::new("delete", Delete, None),
@@ -1075,6 +1450,27 @@ pub fn run() {
         ]);
 
         let bounds = Bounds::centered(None, size(px(960.), px(680.)), cx);
+        let DesktopStartup {
+            instance_lock,
+            identity_id,
+            identity_status,
+            config_file,
+            settings,
+            config_note,
+            can_save_settings,
+        } = startup;
+        let initial_status = if identity_id.is_some() {
+            if settings.signal_host.is_empty() {
+                "未配置信令；网络功能待接入"
+            } else {
+                "未连接；网络功能待接入"
+            }
+        } else {
+            &identity_status
+        }
+        .to_owned();
+        let initial_host = settings.signal_host.clone();
+        let initial_port = settings.signal_port.clone();
         let window = cx.open_window(
             WindowOptions {
                 titlebar: Some(gpui::TitlebarOptions {
@@ -1085,14 +1481,33 @@ pub fn run() {
                 window_min_size: Some(size(px(760.), px(560.))),
                 ..Default::default()
             },
-            |_, cx| {
+            move |_, cx| {
                 let peer_id = cx.new(|cx| TextField::new(cx, "输入或粘贴对端 ID（仅壳层输入）"));
+                let signal_host = cx.new(|cx| {
+                    let mut field = TextField::new(cx, "输入 IPv4、IPv6 或主机名");
+                    field.content = initial_host.into();
+                    field
+                });
+                let signal_port = cx.new(|cx| {
+                    let mut field = TextField::new(cx, "1–65535");
+                    field.content = initial_port.into();
+                    field
+                });
                 cx.new(|cx| DesktopShell {
                     peer_id,
+                    signal_host,
+                    signal_port,
                     selected_files: Vec::new(),
                     selected_folder: None,
-                    receive_directory: None,
-                    status: "未配置身份；网络功能待接入".into(),
+                    settings,
+                    identity_id,
+                    identity_status: identity_status.into(),
+                    config_file,
+                    config_note: config_note.into(),
+                    can_save_settings,
+                    is_saving_settings: false,
+                    _instance_lock: instance_lock,
+                    status: initial_status.into(),
                     focus_handle: cx.focus_handle(),
                 })
             },
@@ -1102,7 +1517,7 @@ pub fn run() {
             Ok(window) => {
                 window
                     .update(cx, |shell, window, cx| {
-                        window.focus(&shell.peer_id.focus_handle(cx));
+                        window.focus(&shell.signal_host.focus_handle(cx));
                         cx.activate(true);
                     })
                     .expect("新建 GPUI 窗口后初始化焦点失败");
