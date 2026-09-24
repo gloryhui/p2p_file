@@ -25,4 +25,7 @@ pub mod transfer;
 pub mod transport;
 pub mod tunnel;
 
+#[cfg(feature = "gui")]
+pub mod desktop;
+
 pub use error::{Error, Result};
