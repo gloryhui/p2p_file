@@ -143,11 +143,9 @@ pub(crate) fn receiver_recovery(
 }
 
 fn ensure_explicitly_recoverable(task: &TaskRecord) -> Result<(), TaskStoreError> {
-    let state_is_recoverable = matches!(
-        task.state(),
-        TaskState::Queued | TaskState::Paused | TaskState::Interrupted
-    ) || (task.state() == TaskState::Failed
-        && task.diagnostic().is_some_and(TaskDiagnostic::is_retryable));
+    let state_is_recoverable = matches!(task.state(), TaskState::Paused | TaskState::Interrupted)
+        || (task.state() == TaskState::Failed
+            && task.diagnostic().is_some_and(TaskDiagnostic::is_retryable));
 
     if state_is_recoverable {
         Ok(())

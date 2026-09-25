@@ -496,6 +496,7 @@ fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::task_model::{ManifestIdentity, PeerId, TaskDirection, TaskErrorCode};
     use super::*;
     use crate::identity::{Identity, NodeId};
     #[cfg(unix)]
@@ -537,6 +538,66 @@ mod tests {
             super::super::task_model::ManifestIdentity::blake3([9; 32], 12, 4).unwrap(),
         )
         .unwrap()
+    }
+
+    fn receiver_task() -> TaskRecord {
+        let peer = NodeId::from_public_key(&Identity::generate().public_key());
+        #[cfg(windows)]
+        let receive_root = PathBuf::from(r"C:\Users\user\Downloads");
+        #[cfg(not(windows))]
+        let receive_root = PathBuf::from("/Users/user/Downloads");
+        TaskRecord::new_receiver(
+            PeerId::from_node_id(peer),
+            receive_root,
+            ManifestIdentity::blake3([7; 32], 12, 4).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn task_for_direction(direction: TaskDirection) -> TaskRecord {
+        match direction {
+            TaskDirection::Send => task(),
+            TaskDirection::Receive => receiver_task(),
+        }
+    }
+
+    fn transition_to_state(
+        store: &mut TaskStore,
+        task_id: &TaskId,
+        target: TaskState,
+        retryable_failure: bool,
+    ) {
+        use TaskState::*;
+
+        let path: &[TaskState] = match target {
+            Scanning => &[],
+            Queued => &[Queued],
+            Connecting => &[Queued, Connecting],
+            Negotiating => &[Queued, Connecting, Negotiating],
+            Transferring => &[Queued, Connecting, Negotiating, Transferring],
+            Pausing => &[Queued, Pausing],
+            Paused => &[Queued, Pausing, Paused],
+            Finalizing => &[Queued, Connecting, Negotiating, Transferring, Finalizing],
+            Completed => &[
+                Queued,
+                Connecting,
+                Negotiating,
+                Transferring,
+                Finalizing,
+                Completed,
+            ],
+            Interrupted => &[Interrupted],
+            Failed => &[Failed],
+        };
+
+        for (index, next) in path.iter().copied().enumerate() {
+            let diagnostic = (next == Failed)
+                .then(|| TaskDiagnostic::new(TaskErrorCode::NetworkInterrupted, retryable_failure));
+            store
+                .transition(task_id, next, diagnostic, 100 + index as i64)
+                .unwrap();
+        }
+        assert_eq!(store.task(task_id).unwrap().state(), target);
     }
 
     fn cleanup(dir: &Path) {
@@ -755,13 +816,133 @@ mod tests {
             recovery,
             TaskStoreError::Model(TaskModelError::NotRecoverable)
         ));
-        store
-            .transition(&task_id, TaskState::Queued, None, 10)
-            .unwrap();
+        transition_to_state(&mut store, &task_id, TaskState::Paused, false);
+        let stored = store.task(&task_id).unwrap();
         let recovery = task_recovery::sender_recovery(&store, &task_id).unwrap();
         assert_eq!(recovery.task_id(), &task_id);
-        assert!(recovery.source_path().is_absolute());
-        assert_eq!(recovery.state(), TaskState::Queued);
+        assert_eq!(recovery.peer_id(), stored.peer_id());
+        assert_eq!(recovery.source_path(), stored.local_path());
+        assert_eq!(recovery.manifest_identity(), stored.manifest_identity());
+        assert_eq!(recovery.state(), TaskState::Paused);
+        assert_eq!(store.task(&task_id).unwrap(), stored);
+        assert!(matches!(
+            task_recovery::receiver_recovery(&store, &task_id),
+            Err(TaskStoreError::Model(TaskModelError::WrongDirection))
+        ));
+        drop(store);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn sender_recovery_rejects_queued_without_mutating_the_task() {
+        let dir = temp_dir();
+        let path = dir.join("tasks.json");
+        let (mut store, _) = TaskStore::open(&path).unwrap();
+        let task_id = store.create(task()).unwrap();
+        transition_to_state(&mut store, &task_id, TaskState::Queued, false);
+        let before = store.task(&task_id).unwrap();
+
+        assert!(matches!(
+            task_recovery::sender_recovery(&store, &task_id),
+            Err(TaskStoreError::Model(TaskModelError::NotRecoverable))
+        ));
+        assert_eq!(store.task(&task_id).unwrap(), before);
+        drop(store);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn receiver_recovery_rejects_queued_without_mutating_the_task() {
+        let dir = temp_dir();
+        let path = dir.join("tasks.json");
+        let (mut store, _) = TaskStore::open(&path).unwrap();
+        let task_id = store.create(receiver_task()).unwrap();
+        transition_to_state(&mut store, &task_id, TaskState::Queued, false);
+        let before = store.task(&task_id).unwrap();
+
+        assert!(matches!(
+            task_recovery::receiver_recovery(&store, &task_id),
+            Err(TaskStoreError::Model(TaskModelError::NotRecoverable))
+        ));
+        assert_eq!(store.task(&task_id).unwrap(), before);
+        drop(store);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn recovery_state_matrix_allows_only_explicit_recovery_sources_read_only() {
+        let dir = temp_dir();
+        let path = dir.join("tasks.json");
+        let (mut store, _) = TaskStore::open(&path).unwrap();
+        let cases = [
+            (TaskState::Scanning, false, false),
+            (TaskState::Queued, false, false),
+            (TaskState::Connecting, false, false),
+            (TaskState::Negotiating, false, false),
+            (TaskState::Transferring, false, false),
+            (TaskState::Pausing, false, false),
+            (TaskState::Paused, false, true),
+            (TaskState::Finalizing, false, false),
+            (TaskState::Completed, false, false),
+            (TaskState::Interrupted, false, true),
+            (TaskState::Failed, false, false),
+            (TaskState::Failed, true, true),
+        ];
+
+        for (state, retryable_failure, should_recover) in cases {
+            for direction in [TaskDirection::Send, TaskDirection::Receive] {
+                let task_id = store.create(task_for_direction(direction)).unwrap();
+                transition_to_state(&mut store, &task_id, state, retryable_failure);
+                let before = store.task(&task_id).unwrap();
+                let result = match direction {
+                    TaskDirection::Send => {
+                        task_recovery::sender_recovery(&store, &task_id).map(|recovery| {
+                            assert_eq!(recovery.task_id(), &task_id);
+                            assert_eq!(recovery.peer_id(), before.peer_id());
+                            assert_eq!(recovery.source_path(), before.local_path());
+                            assert_eq!(recovery.manifest_identity(), before.manifest_identity());
+                            assert_eq!(recovery.state(), before.state());
+                        })
+                    }
+                    TaskDirection::Receive => task_recovery::receiver_recovery(&store, &task_id)
+                        .map(|recovery| {
+                            assert_eq!(recovery.task_id(), &task_id);
+                            assert_eq!(recovery.peer_id(), before.peer_id());
+                            assert_eq!(recovery.receive_root(), before.local_path());
+                            assert_eq!(recovery.manifest_identity(), before.manifest_identity());
+                            assert_eq!(recovery.state(), before.state());
+                        }),
+                };
+
+                if should_recover {
+                    assert!(result.is_ok(), "{direction:?} recovery for {state:?}");
+                } else {
+                    assert!(
+                        matches!(
+                            result,
+                            Err(TaskStoreError::Model(TaskModelError::NotRecoverable))
+                        ),
+                        "{direction:?} recovery for {state:?}"
+                    );
+                }
+                assert_eq!(store.task(&task_id).unwrap(), before);
+
+                let wrong_direction = match direction {
+                    TaskDirection::Send => {
+                        task_recovery::receiver_recovery(&store, &task_id).map(|_| ())
+                    }
+                    TaskDirection::Receive => {
+                        task_recovery::sender_recovery(&store, &task_id).map(|_| ())
+                    }
+                };
+                assert!(matches!(
+                    wrong_direction,
+                    Err(TaskStoreError::Model(TaskModelError::WrongDirection))
+                ));
+                assert_eq!(store.task(&task_id).unwrap(), before);
+            }
+        }
+
         drop(store);
         cleanup(&dir);
     }
@@ -868,14 +1049,19 @@ mod tests {
         )
         .unwrap();
         let task_id = store.create(record).unwrap();
-        store
-            .transition(&task_id, TaskState::Queued, None, 30)
-            .unwrap();
+        transition_to_state(&mut store, &task_id, TaskState::Paused, false);
+        let stored = store.task(&task_id).unwrap();
         let recovery = task_recovery::receiver_recovery(&store, &task_id).unwrap();
         assert_eq!(recovery.task_id(), &task_id);
         assert_eq!(recovery.peer_id(), &peer_id);
         assert_eq!(recovery.receive_root(), receive_root);
-        assert_eq!(recovery.state(), TaskState::Queued);
+        assert_eq!(recovery.receive_root(), stored.local_path());
+        assert_eq!(recovery.state(), TaskState::Paused);
+        assert_eq!(store.task(&task_id).unwrap(), stored);
+        assert!(matches!(
+            task_recovery::sender_recovery(&store, &task_id),
+            Err(TaskStoreError::Model(TaskModelError::WrongDirection))
+        ));
         drop(store);
         cleanup(&dir);
     }
