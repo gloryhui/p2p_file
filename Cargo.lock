@@ -4113,6 +4113,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "clap",
+ "dirs 5.0.1",
  "ed25519-dalek",
  "gpui",
  "hex",
@@ -4123,6 +4124,7 @@ dependencies = [
  "rand 0.10.3",
  "rcgen",
  "serde",
+ "serde_json",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
