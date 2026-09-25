@@ -180,3 +180,10 @@ the OS version, SDK/toolchain, native first frame, 760x560 minimum window,
 Ctrl/Command-A/C/V plus CJK/emoji input, native file/folder cancellation, and
 high-DPI behavior. The green Windows-2022 and macOS-14 CI jobs prove compilation
 for their runner targets only; they do not replace those native smoke tests.
+
+## T003 validation
+
+T003 model/store implementation commands and persistence/recovery regression
+results are indexed in [t003-validation.md](t003-validation.md). Exact-head CI
+and platform status are recorded in the T003 REPORT on the control issue. The
+storage and durability decision is in [ADR-002](../ADR-002.md).

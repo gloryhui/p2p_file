@@ -10,14 +10,23 @@
 //! T001 shell state/path-picker boundaries; it is not presented as original
 //! MIT-licensed application code. See docs/gpui-mvp/THIRD_PARTY_NOTICES.md.
 
-mod config;
-mod instance_lock;
+pub(in crate::desktop) mod config;
+pub(in crate::desktop) mod instance_lock;
+#[allow(dead_code)] // Task list consumers arrive in later GPUI task integrations.
+mod task_events;
+#[allow(dead_code)] // T003 establishes the domain model before transfer consumers exist.
+mod task_model;
+#[allow(dead_code)] // Explicit recovery APIs are consumed by later task execution work.
+mod task_recovery;
+#[allow(dead_code)] // Durable mutation API is intentionally staged ahead of its UI consumer.
+mod task_store;
 
 use std::{ops::Range, path::PathBuf};
 
 use crate::identity::Identity;
 use config::{AppPaths, ConfigError, DesktopConfig, SettingsDraft, SpeedtestDirection};
 use instance_lock::InstanceLock;
+use task_store::TaskStore;
 
 use gpui::{
     App, Application, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler,
@@ -54,6 +63,8 @@ actions!(
 
 struct DesktopStartup {
     instance_lock: InstanceLock,
+    task_store: Option<TaskStore>,
+    task_store_status: String,
     identity_id: Option<String>,
     identity_status: String,
     config_file: PathBuf,
@@ -71,6 +82,20 @@ impl DesktopStartup {
             .map_err(|error| format!("无法准备应用数据目录：{error}"))?;
         let instance_lock = InstanceLock::acquire(&paths.instance_lock_file())
             .map_err(|error| error.to_string())?;
+
+        let (task_store, task_store_status) =
+            match TaskStore::open(&paths.data_dir.join("tasks.json")) {
+                Ok((store, recovery)) => {
+                    let interrupted = recovery.interrupted_task_ids().len();
+                    let status = if interrupted == 0 {
+                        "本机任务记录已就绪".to_owned()
+                    } else {
+                        format!("上次退出时有 {interrupted} 个任务中断；等待用户选择后续操作")
+                    };
+                    (Some(store), status)
+                }
+                Err(error) => (None, format!("任务记录不可用，原文件已保留：{error}")),
+            };
 
         let (identity_id, identity_status) = match Identity::load_or_create(&paths.identity_file())
         {
@@ -107,6 +132,8 @@ impl DesktopStartup {
 
         Ok(Self {
             instance_lock,
+            task_store,
+            task_store_status,
             identity_id,
             identity_status,
             config_file,
@@ -759,6 +786,7 @@ struct DesktopShell {
     can_save_settings: bool,
     is_saving_settings: bool,
     _instance_lock: InstanceLock,
+    _task_store: Option<TaskStore>,
     status: SharedString,
     focus_handle: FocusHandle,
 }
@@ -1452,6 +1480,8 @@ pub fn run() {
         let bounds = Bounds::centered(None, size(px(960.), px(680.)), cx);
         let DesktopStartup {
             instance_lock,
+            task_store,
+            task_store_status,
             identity_id,
             identity_status,
             config_file,
@@ -1459,16 +1489,17 @@ pub fn run() {
             config_note,
             can_save_settings,
         } = startup;
-        let initial_status = if identity_id.is_some() {
+        let initial_status = if task_store.is_none() || !task_store_status.contains("已就绪") {
+            task_store_status.clone()
+        } else if identity_id.is_some() {
             if settings.signal_host.is_empty() {
-                "未配置信令；网络功能待接入"
+                "未配置信令；网络功能待接入".to_owned()
             } else {
-                "未连接；网络功能待接入"
+                "未连接；网络功能待接入".to_owned()
             }
         } else {
-            &identity_status
-        }
-        .to_owned();
+            identity_status.clone()
+        };
         let initial_host = settings.signal_host.clone();
         let initial_port = settings.signal_port.clone();
         let window = cx.open_window(
@@ -1507,6 +1538,7 @@ pub fn run() {
                     can_save_settings,
                     is_saving_settings: false,
                     _instance_lock: instance_lock,
+                    _task_store: task_store,
                     status: initial_status.into(),
                     focus_handle: cx.focus_handle(),
                 })
