@@ -10,6 +10,7 @@
 //! T001 shell state/path-picker boundaries; it is not presented as original
 //! MIT-licensed application code. See docs/gpui-mvp/THIRD_PARTY_NOTICES.md.
 
+mod activity;
 pub(in crate::desktop) mod config;
 mod files;
 mod frame_budget;
@@ -21,6 +22,7 @@ mod publish;
 mod queue;
 pub(crate) mod secure_fs;
 mod session;
+mod speed;
 #[allow(dead_code)] // Task list consumers arrive in later GPUI task integrations.
 mod task_events;
 #[allow(dead_code)] // T003 establishes the domain model before transfer consumers exist.

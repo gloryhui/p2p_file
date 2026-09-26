@@ -548,7 +548,22 @@ mod tests {
             }
         }
 
-        for bad in ["", "0", "301", "99999999999999999999"] {
+        for seconds in ["301", "599", "600"] {
+            assert!(
+                Cli::try_parse_from([
+                    "p2p_file",
+                    "speedtest",
+                    "--signal",
+                    "1.2.3.4:7000",
+                    "--peer",
+                    peer,
+                    "--duration",
+                    seconds
+                ])
+                .is_ok()
+            );
+        }
+        for bad in ["", "0", "601", "99999999999999999999"] {
             assert!(
                 Cli::try_parse_from([
                     "p2p_file",

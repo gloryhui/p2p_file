@@ -154,6 +154,8 @@ $BIN push --signal $SIGNAL --peer $HOME_ID ./大文件.mkv
 
 ### P2P / QUIC 纯网络测速
 
+测速 CLI 默认仍为 10 秒，`--duration` 支持 1–600 秒。桌面测速业务支持 30 秒或 1–10 分钟，产品按钮在 T010 接入。长时边界由可控时钟回归验证；真实 600 秒与双 NAT 证据以 [GPUI 总控 Issue #24](https://github.com/gloryhui/p2p_file/issues/24) 为准。
+
 想把网络链路和文件传输本身区分开时，在外面那台机器上运行：
 
 ```bash
