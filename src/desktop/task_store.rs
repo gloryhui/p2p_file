@@ -178,6 +178,37 @@ impl TaskStore {
         Ok(task_id)
     }
 
+    /// All scanned entries become durable together; a cancelled/failed scan leaves no partial group.
+    pub(crate) fn create_selection(
+        &mut self,
+        records: Vec<TaskRecord>,
+    ) -> Result<Vec<TaskId>, TaskStoreError> {
+        self.ensure_healthy()?;
+        let mut candidate = self.tasks.clone();
+        let mut ids = Vec::new();
+        for record in records {
+            record.validate()?;
+            if record.state() != TaskState::Scanning
+                || candidate.iter().any(|t| t.task_id() == record.task_id())
+            {
+                return Err(TaskStoreError::Corrupt);
+            }
+            ids.push(record.task_id().clone());
+            candidate.push(record);
+        }
+        sort_tasks(&mut candidate);
+        self.commit_tasks(candidate)?;
+        for id in &ids {
+            let record = self.task(id)?;
+            self.events.record(
+                id.clone(),
+                record.created_at_unix_ms(),
+                TaskEventKind::Created,
+            );
+        }
+        Ok(ids)
+    }
+
     pub(crate) fn transition(
         &mut self,
         task_id: &TaskId,

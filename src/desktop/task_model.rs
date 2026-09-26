@@ -400,6 +400,16 @@ pub struct FileTaskDetails {
     pub manifest: FileManifest,
     pub publish_prepared: bool,
     pub receipt_committed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_root: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectoryTaskDetails {
+    pub relative_path: String,
+    pub publish_prepared: bool,
+    pub receipt_committed: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -418,6 +428,10 @@ pub struct TaskRecord {
     progress_hint: Option<ProgressHint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     file_details: Option<FileTaskDetails>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    directory_details: Option<DirectoryTaskDetails>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    group_id: Option<TaskId>,
 }
 
 impl TaskRecord {
@@ -472,6 +486,8 @@ impl TaskRecord {
             diagnostic: None,
             progress_hint: None,
             file_details: None,
+            directory_details: None,
+            group_id: None,
         };
         record.validate()?;
         Ok(record)
@@ -507,6 +523,7 @@ impl TaskRecord {
             manifest,
             publish_prepared: false,
             receipt_committed: false,
+            source_root: None,
         });
         record.validate()?;
         Ok(record)
@@ -516,26 +533,104 @@ impl TaskRecord {
         self.file_details.as_ref()
     }
 
+    pub fn directory_details(&self) -> Option<&DirectoryTaskDetails> {
+        self.directory_details.as_ref()
+    }
+    pub fn group_id(&self) -> Option<&TaskId> {
+        self.group_id.as_ref()
+    }
+    pub fn relative_path(&self) -> Option<&str> {
+        self.file_details
+            .as_ref()
+            .map(|d| d.relative_path.as_str())
+            .or_else(|| {
+                self.directory_details
+                    .as_ref()
+                    .map(|d| d.relative_path.as_str())
+            })
+    }
+    pub fn receipt_committed(&self) -> bool {
+        self.file_details
+            .as_ref()
+            .is_some_and(|d| d.receipt_committed)
+            || self
+                .directory_details
+                .as_ref()
+                .is_some_and(|d| d.receipt_committed)
+    }
+    pub(crate) fn set_selection_binding(
+        &mut self,
+        group: Option<TaskId>,
+        source_root: Option<PathBuf>,
+    ) -> Result<(), TaskModelError> {
+        if self.state != TaskState::Scanning {
+            return Err(TaskModelError::ImmutableBinding);
+        }
+        self.group_id = group;
+        if let Some(details) = &mut self.file_details {
+            details.source_root = source_root;
+        }
+        self.validate()
+    }
+    pub(crate) fn new_directory(
+        task_id: TaskId,
+        peer_id: PeerId,
+        direction: TaskDirection,
+        local_path: PathBuf,
+        relative_path: String,
+        group_id: Option<TaskId>,
+    ) -> Result<Self, TaskModelError> {
+        let path = match direction {
+            TaskDirection::Send => LocalTaskPath::source(local_path)?,
+            TaskDirection::Receive => LocalTaskPath::receive_root(local_path)?,
+        };
+        let identity = ManifestIdentity::blake3(
+            crate::protocol::manifest::ChunkHash::of(relative_path.as_bytes()).0,
+            0,
+            1,
+        )?;
+        let mut record = Self::new(
+            task_id,
+            peer_id,
+            direction,
+            path,
+            identity,
+            system_time_unix_ms()?,
+        )?;
+        record.directory_details = Some(DirectoryTaskDetails {
+            relative_path,
+            publish_prepared: false,
+            receipt_committed: false,
+        });
+        record.group_id = group_id;
+        record.validate()?;
+        Ok(record)
+    }
     pub(crate) fn prepare_publication(&mut self) -> Result<(), TaskModelError> {
         if self.direction != TaskDirection::Receive || self.state != TaskState::Finalizing {
             return Err(TaskModelError::NotRecoverable);
         }
-        self.file_details
-            .as_mut()
-            .ok_or(TaskModelError::InvalidManifestIdentity)?
-            .publish_prepared = true;
+        if let Some(details) = &mut self.file_details {
+            details.publish_prepared = true;
+        } else if let Some(details) = &mut self.directory_details {
+            details.publish_prepared = true;
+        } else {
+            return Err(TaskModelError::InvalidManifestIdentity);
+        }
         Ok(())
     }
-
     pub(crate) fn commit_receipt(&mut self, now: i64) -> Result<(), TaskModelError> {
-        let details = self
-            .file_details
-            .as_mut()
-            .ok_or(TaskModelError::InvalidManifestIdentity)?;
-        if self.direction == TaskDirection::Receive && !details.publish_prepared {
+        let (prepared, receipt) = if let Some(details) = &mut self.file_details {
+            (details.publish_prepared, &mut details.receipt_committed)
+        } else if let Some(details) = &mut self.directory_details {
+            (details.publish_prepared, &mut details.receipt_committed)
+        } else {
+            return Err(TaskModelError::InvalidManifestIdentity);
+        };
+        if self.direction == TaskDirection::Receive && !prepared {
             return Err(TaskModelError::NotRecoverable);
         }
-        details.receipt_committed = true;
+        *receipt = true;
         self.transition_to(TaskState::Completed, None, now)
     }
 
@@ -611,6 +706,51 @@ impl TaskRecord {
             }
         }
 
+        if self.file_details.is_some() && self.directory_details.is_some() {
+            return Err(TaskModelError::InvalidManifestIdentity);
+        }
+        if let Some(details) = &self.directory_details {
+            super::protocol::validate_relative_path(&details.relative_path)
+                .map_err(|_| TaskModelError::InvalidManifestIdentity)?;
+            if self.manifest_identity
+                != ManifestIdentity::blake3(
+                    crate::protocol::manifest::ChunkHash::of(details.relative_path.as_bytes()).0,
+                    0,
+                    1,
+                )?
+                || details.receipt_committed != (self.state == TaskState::Completed)
+                || (self.direction == TaskDirection::Send && details.publish_prepared)
+                || (self.direction == TaskDirection::Receive
+                    && details.receipt_committed
+                    && !details.publish_prepared)
+            {
+                return Err(TaskModelError::InvalidManifestIdentity);
+            }
+        }
+        if let Some(root) = self
+            .file_details
+            .as_ref()
+            .and_then(|d| d.source_root.as_ref())
+            && (self.direction != TaskDirection::Send
+                || !root.is_absolute()
+                || !self.local_path.path().starts_with(root))
+        {
+            return Err(TaskModelError::InvalidManifestIdentity);
+        }
+        if let Some(details) = &self.file_details
+            && let Some(root) = &details.source_root
+        {
+            let (top, relative) = details
+                .relative_path
+                .split_once('/')
+                .ok_or(TaskModelError::InvalidManifestIdentity)?;
+            if root.file_name().and_then(|n| n.to_str()) != Some(top)
+                || root.join(relative) != self.local_path.path()
+                || root.to_str().is_none()
+            {
+                return Err(TaskModelError::InvalidManifestIdentity);
+            }
+        }
         if !self.local_path.path().is_absolute() {
             return Err(TaskModelError::RelativeLocalPath);
         }
@@ -637,6 +777,11 @@ impl TaskRecord {
             || self.direction != current.direction
             || self.local_path != current.local_path
             || self.manifest_identity != current.manifest_identity
+            || self.group_id != current.group_id
+            || self.directory_details.as_ref().map(|d| &d.relative_path)
+                != current.directory_details.as_ref().map(|d| &d.relative_path)
+            || self.file_details.as_ref().map(|d| &d.source_root)
+                != current.file_details.as_ref().map(|d| &d.source_root)
             || self
                 .file_details
                 .as_ref()

@@ -11,10 +11,13 @@
 //! MIT-licensed application code. See docs/gpui-mvp/THIRD_PARTY_NOTICES.md.
 
 pub(in crate::desktop) mod config;
+mod files;
 pub(in crate::desktop) mod instance_lock;
 mod network_state;
 #[allow(dead_code)] // T005 wire guards are consumed by transfer/speed business in T006-T009.
 mod protocol;
+mod publish;
+pub(crate) mod secure_fs;
 mod session;
 #[allow(dead_code)] // Task list consumers arrive in later GPUI task integrations.
 mod task_events;

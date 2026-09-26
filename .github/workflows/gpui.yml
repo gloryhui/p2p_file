@@ -1,8 +1,10 @@
 name: GPUI desktop build matrix
 
 on:
-  push:
+  # Final candidate branch is pushed once local validation is complete.
+  # PR checks are sufficient; avoid duplicate push runs for the same head.
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read

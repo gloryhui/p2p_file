@@ -138,6 +138,16 @@ impl DesktopSessionHandle {
             .map_err(|_| "传输命令队列已满或会话已关闭".into())
     }
 
+    #[allow(dead_code)] // T010 selection controls.
+    pub fn send_directory(
+        &self,
+        peer: NodeId,
+        source: std::path::PathBuf,
+    ) -> std::result::Result<(), String> {
+        self.commands
+            .try_send(SessionCommand::SendDirectory { peer, source })
+            .map_err(|_| "传输命令队列已满或会话已关闭".into())
+    }
     pub fn is_running(&self) -> bool {
         !self.commands.is_closed()
     }
@@ -148,6 +158,11 @@ impl DesktopSessionHandle {
 }
 
 enum SessionCommand {
+    #[allow(dead_code)] // T010 selection controls.
+    SendDirectory {
+        peer: NodeId,
+        source: std::path::PathBuf,
+    },
     #[allow(dead_code)] // T010 product controls.
     SendFile {
         peer: NodeId,
@@ -355,10 +370,13 @@ async fn run_session(
                 }
             }
             Wake::Command(Some(
-                command @ (SessionCommand::SendFile { .. } | SessionCommand::ResumeTask { .. }),
+                command @ (SessionCommand::SendFile { .. }
+                | SessionCommand::SendDirectory { .. }
+                | SessionCommand::ResumeTask { .. }),
             )) => {
                 let peer = match &command {
                     SessionCommand::SendFile { peer, .. }
+                    | SessionCommand::SendDirectory { peer, .. }
                     | SessionCommand::ResumeTask { peer, .. } => *peer,
                     _ => unreachable!(),
                 };
@@ -391,6 +409,10 @@ async fn run_session(
                             SessionCommand::SendFile { source, .. } => {
                                 let id = service.select_file(peer, source).await?;
                                 service.send_file(&connection, peer, id).await
+                            }
+                            SessionCommand::SendDirectory { source, .. } => {
+                                let ids = service.select_directory(peer, source).await?;
+                                service.send_selection(&connection, peer, ids).await
                             }
                             SessionCommand::ResumeTask { id, .. } => {
                                 service.resume(&connection, peer, id).await

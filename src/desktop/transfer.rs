@@ -161,6 +161,44 @@ impl TransferService {
         self.store(move |store| disk::select_file(store, peer, source).map(|r| r.task_id().clone()))
             .await
     }
+    pub async fn select_directory(&self, peer: NodeId, source: PathBuf) -> Result<Vec<TaskId>> {
+        struct CancelScan(super::files::ScanCancellation);
+        impl Drop for CancelScan {
+            fn drop(&mut self) {
+                self.0.cancel();
+            }
+        }
+        let cancellation = super::files::ScanCancellation::default();
+        let _guard = CancelScan(cancellation.clone());
+        let records =
+            blocking(move || super::files::scan_directory(peer, &source, &cancellation)).await?;
+        self.store(move |store| {
+            let ids = store.create_selection(records).map_err(disk::local_error)?;
+            for id in &ids {
+                disk::transition(store, id, TaskState::Queued)?;
+            }
+            Ok(ids)
+        })
+        .await
+    }
+    /// T007 expands a selection; T008 replaces this sequential executor with its queue.
+    pub async fn send_selection(
+        &self,
+        connection: &Connection,
+        peer: NodeId,
+        ids: Vec<TaskId>,
+    ) -> Result<()> {
+        let mut failure = None;
+        for id in ids {
+            if connection.close_reason().is_some() {
+                return Err(disk::failure("目录传输连接中断，其余任务可手动继续"));
+            }
+            if let Err(error) = self.send_file(connection, peer, id).await {
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
     pub async fn task(&self, id: TaskId) -> Result<TaskRecord> {
         self.read_store(move |store| store.task(&id).map_err(disk::local_error))
             .await
@@ -180,6 +218,22 @@ impl TransferService {
         })
         .await
         .map_err(|_| disk::failure("上次传输清理超时"))?
+    }
+    async fn wait_peer_idle(&self, peer: NodeId) -> Result<()> {
+        let mut changed = self.subscribe();
+        tokio::time::timeout(PAUSE_TIMEOUT, async {
+            loop {
+                if !self.active.lock().unwrap().values().any(|a| a.peer == peer) {
+                    return Ok(());
+                }
+                changed
+                    .changed()
+                    .await
+                    .map_err(|_| disk::failure("任务清理通知已关闭"))?;
+            }
+        })
+        .await
+        .map_err(|_| disk::failure("对端已有任务活动"))?
     }
     fn claim(&self, peer: NodeId, id: &TaskId) -> Result<(ActiveGuard, watch::Receiver<bool>)> {
         let mut active = self.active.lock().unwrap();
@@ -312,6 +366,11 @@ impl TransferService {
         if record.state() == TaskState::Completed {
             return Ok(());
         }
+        if record.directory_details().is_some() {
+            return self
+                .send_directory_entry(connection, peer, &record, continue_reply)
+                .await;
+        }
         let source = record.clone();
         let file = blocking(move || disk::verify_source(&source)).await?;
         let details = record.file_details().unwrap();
@@ -322,7 +381,7 @@ impl TransferService {
         let mut io = TaskIo::new(send, recv, peer, id.clone());
         io.send(Message::Offer {
             task_id: id.clone(),
-            group_id: None,
+            group_id: record.group_id().cloned(),
             relative_path: details.relative_path.clone(),
             entry: Entry::File(Box::new(details.manifest.clone())),
         })
@@ -348,6 +407,62 @@ impl TransferService {
             io.report_error(error).await;
         }
         result
+    }
+    async fn send_directory_entry(
+        &self,
+        connection: &Connection,
+        peer: NodeId,
+        record: &TaskRecord,
+        continue_reply: Option<&mut SendStream>,
+    ) -> Result<()> {
+        let path = record.local_path().to_path_buf();
+        blocking(move || {
+            super::secure_fs::root(&path)?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| disk::failure("源文件不可用"))?;
+        let (send, recv) = tokio::time::timeout(IDLE_TIMEOUT, connection.open_bi())
+            .await
+            .map_err(|_| disk::failure("目录流打开超时"))?
+            .map_err(disk::local_error)?;
+        let id = record.task_id();
+        let mut io = TaskIo::new(send, recv, peer, id.clone());
+        io.send(Message::Offer {
+            task_id: id.clone(),
+            group_id: record.group_id().cloned(),
+            relative_path: record.relative_path().unwrap().to_owned(),
+            entry: Entry::Directory,
+        })
+        .await?;
+        if let Some(reply) = continue_reply {
+            protocol::write(
+                reply,
+                &Frame {
+                    request_id: 1,
+                    message: Message::ResumeTask {
+                        task_id: id.clone(),
+                    },
+                },
+            )
+            .await?;
+            let _ = reply.finish();
+        }
+        self.state(id, TaskState::Transferring).await?;
+        let response = tokio::time::timeout(IDLE_TIMEOUT, io.incoming.recv())
+            .await
+            .map_err(|_| disk::failure("目录回执超时"))?
+            .ok_or_else(|| disk::failure("目录流中断"))??;
+        io.observe(&response)?;
+        match response.message {
+            Message::Completed { .. } => {
+                self.receipt(id).await?;
+                io.finish();
+                Ok(())
+            }
+            Message::Error { code, .. } => Err(remote_error(code)),
+            _ => Err(disk::failure("目录回执非法")),
+        }
     }
     async fn sender_loop(
         &self,
@@ -574,12 +689,19 @@ impl TransferService {
         let Message::Offer {
             task_id,
             relative_path,
-            entry: Entry::File(manifest),
-            group_id: None,
+            entry,
+            group_id,
         } = first.message.clone()
         else {
-            return Err(disk::failure("本阶段仅接受单文件任务"));
+            return Err(disk::failure("需要目录或文件 Offer"));
         };
+        if entry == Entry::Directory {
+            return self.receive_directory(send, recv, peer, first).await;
+        }
+        let Entry::File(manifest) = entry else {
+            unreachable!()
+        };
+        self.wait_peer_idle(peer).await?;
         let (_guard, pause) = self.claim(peer, &task_id)?;
         let mut io = TaskIo::new(send, recv, peer, task_id.clone());
         io.observe(&first)?;
@@ -587,7 +709,7 @@ impl TransferService {
         let id = task_id.clone();
         let record = self
             .store(move |store| {
-                disk::accept_offer(store, peer, &id, &root, relative_path, *manifest)
+                disk::accept_entry(store, peer, &id, &root, relative_path, *manifest, group_id)
             })
             .await?;
         if record.file_details().unwrap().receipt_committed {
@@ -623,6 +745,59 @@ impl TransferService {
                     .checkpoint()
             })
             .await;
+            io.report_error(error).await;
+            self.finish_error(&task_id, error).await;
+        }
+        result
+    }
+    async fn receive_directory(
+        &self,
+        send: SendStream,
+        recv: RecvStream,
+        peer: NodeId,
+        first: Frame,
+    ) -> Result<()> {
+        let Message::Offer {
+            task_id,
+            group_id,
+            relative_path,
+            entry: Entry::Directory,
+        } = first.message.clone()
+        else {
+            return Err(disk::failure("目录 Offer 非法"));
+        };
+        self.wait_peer_idle(peer).await?;
+        let (_guard, _pause) = self.claim(peer, &task_id)?;
+        let mut io = TaskIo::new(send, recv, peer, task_id.clone());
+        io.observe(&first)?;
+        let root = self.receive_root.lock().unwrap().clone();
+        let id = task_id.clone();
+        let record = self
+            .store(move |store| {
+                disk::accept_directory(store, peer, &id, &root, relative_path, group_id)
+            })
+            .await?;
+        let result = async {
+            if !record.receipt_committed() {
+                self.state(&task_id, TaskState::Transferring).await?;
+                self.state(&task_id, TaskState::Finalizing).await?;
+                let local = record.clone();
+                self.store(move |store| super::publish::directory(store, &local))
+                    .await?;
+            }
+            io.send(Message::Completed {
+                task_id: task_id.clone(),
+                root_hash: crate::protocol::manifest::ChunkHash::of(
+                    record.relative_path().unwrap().as_bytes(),
+                ),
+                receipt_version: 1,
+            })
+            .await?;
+            io.finish();
+            Ok(())
+        }
+        .await;
+        if let Err(error) = &result {
             io.report_error(error).await;
             self.finish_error(&task_id, error).await;
         }
@@ -1548,7 +1723,8 @@ mod tests {
         let pair = Pair::new().await;
         let (id, bytes) = pair.select(300 * 1024).await;
         let target = pair.root.join("b-receive/文件.bin");
-        fs::write(&target, b"previous user data").unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("previous.bin"), b"previous user data").unwrap();
         assert!(
             pair.a
                 .send_file(&pair.ca, pair.ib, id.clone())
@@ -1561,8 +1737,11 @@ mod tests {
             assert_eq!(record.state(), TaskState::Failed);
             assert!(!record.file_details().unwrap().receipt_committed);
         }
-        assert_eq!(fs::read(&target).unwrap(), b"previous user data");
-        fs::remove_file(&target).unwrap();
+        assert_eq!(
+            fs::read(target.join("previous.bin")).unwrap(),
+            b"previous user data"
+        );
+        fs::remove_dir_all(&target).unwrap();
         pair.b.resume(&pair.cb, pair.ia, id.clone()).await.unwrap();
         wait_state(&pair.a, &id, TaskState::Completed).await;
         wait_state(&pair.b, &id, TaskState::Completed).await;
@@ -1632,6 +1811,110 @@ mod tests {
             record.diagnostic().unwrap().code(),
             TaskErrorCode::SourceChanged
         );
+        pair.shutdown().await;
+    }
+    #[tokio::test]
+    async fn authenticated_directory_preserves_structure_empty_entries_and_collision_backups() {
+        let pair = Pair::new().await;
+        let source = pair.root.join("目录");
+        fs::create_dir_all(source.join("nested/空目录")).unwrap();
+        fs::write(source.join("nested/空文件.txt"), []).unwrap();
+        fs::write(source.join("中文.txt"), b"new selected content").unwrap();
+        fs::create_dir(pair.root.join("b-receive/目录")).unwrap();
+        fs::write(pair.root.join("b-receive/目录/中文.txt"), b"old content").unwrap();
+        let ids = pair.a.select_directory(pair.ib, source).await.unwrap();
+        assert_eq!(ids.len(), 5);
+        pair.a
+            .send_selection(&pair.ca, pair.ib, ids.clone())
+            .await
+            .unwrap();
+        for id in &ids {
+            wait_state(&pair.a, id, TaskState::Completed).await;
+            wait_state(&pair.b, id, TaskState::Completed).await;
+        }
+        assert!(pair.root.join("b-receive/目录/nested/空目录").is_dir());
+        assert_eq!(
+            fs::read(pair.root.join("b-receive/目录/nested/空文件.txt")).unwrap(),
+            Vec::<u8>::new()
+        );
+        assert_eq!(
+            fs::read(pair.root.join("b-receive/目录/中文.txt")).unwrap(),
+            b"new selected content"
+        );
+        let backups = fs::read_dir(pair.root.join("b-receive/目录"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("中文+")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read(&backups[0]).unwrap(), b"old content");
+        let records = pair.b.snapshot().await.unwrap();
+        assert!(
+            records
+                .iter()
+                .all(|r| r.group_id() == records[0].group_id())
+        );
+        // Completed task replay does not create another backup or another record.
+        pair.a.send_selection(&pair.ca, pair.ib, ids).await.unwrap();
+        assert_eq!(pair.b.snapshot().await.unwrap().len(), 5);
+        assert_eq!(
+            fs::read_dir(pair.root.join("b-receive/目录"))
+                .unwrap()
+                .filter(|e| e
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("中文+"))
+                .count(),
+            1
+        );
+        pair.shutdown().await;
+    }
+    #[tokio::test]
+    async fn rejected_directory_scan_leaves_no_partial_persistent_group() {
+        let pair = Pair::new().await;
+        let source = pair.root.join("invalid");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("CON.txt"), []).unwrap();
+        assert!(pair.a.select_directory(pair.ib, source).await.is_err());
+        assert!(pair.a.snapshot().await.unwrap().is_empty());
+        pair.shutdown().await;
+    }
+    #[tokio::test]
+    async fn directory_group_keeps_original_receive_root_after_settings_change() {
+        let pair = Pair::new().await;
+        let source = pair.root.join("selected-dir");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("file.txt"), b"bound to original root").unwrap();
+        let ids = pair.a.select_directory(pair.ib, source).await.unwrap();
+        assert_eq!(ids.len(), 2);
+        pair.a
+            .send_file(&pair.ca, pair.ib, ids[0].clone())
+            .await
+            .unwrap();
+        let changed_root = pair.root.join("changed-root");
+        fs::create_dir(&changed_root).unwrap();
+        pair.b.set_receive_root(changed_root.clone());
+        pair.a
+            .send_file(&pair.ca, pair.ib, ids[1].clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read(pair.root.join("b-receive/selected-dir/file.txt")).unwrap(),
+            b"bound to original root"
+        );
+        assert_eq!(fs::read_dir(changed_root).unwrap().count(), 0);
+        for record in pair.b.snapshot().await.unwrap() {
+            assert_eq!(record.local_path(), pair.root.join("b-receive"));
+        }
         pair.shutdown().await;
     }
 }

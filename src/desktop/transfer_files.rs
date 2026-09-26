@@ -30,8 +30,7 @@ pub fn local_error(error: impl std::fmt::Display) -> Error {
 pub fn validate_single_file(manifest: &FileManifest, relative: &str) -> Result<()> {
     protocol::validate_relative_path(relative)?;
     manifest.validate()?;
-    if relative.contains('/')
-        || relative != manifest.file_name
+    if relative.rsplit('/').next() != Some(manifest.file_name.as_str())
         || manifest.chunk_size > MAX_DESKTOP_CHUNK
         || manifest.chunks.len() > protocol::MAX_CHUNKS
     {
@@ -100,7 +99,9 @@ pub fn select_file(store: &mut TaskStore, peer: NodeId, source: PathBuf) -> Resu
 
 pub fn bound_task(store: &TaskStore, peer: NodeId, id: &TaskId) -> Result<TaskRecord> {
     let record = store.task(id).map_err(local_error)?;
-    if record.peer_id() != &PeerId::from_node_id(peer) || record.file_details().is_none() {
+    if record.peer_id() != &PeerId::from_node_id(peer)
+        || (record.file_details().is_none() && record.directory_details().is_none())
+    {
         return Err(failure("任务未授权给该对端"));
     }
     Ok(record)
@@ -128,6 +129,7 @@ pub fn begin_attempt(store: &mut TaskStore, id: &TaskId) -> Result<TaskRecord> {
     store.task(id).map_err(local_error)
 }
 
+#[cfg(test)]
 pub fn accept_offer(
     store: &mut TaskStore,
     peer: NodeId,
@@ -136,25 +138,97 @@ pub fn accept_offer(
     relative: String,
     manifest: FileManifest,
 ) -> Result<TaskRecord> {
+    accept_entry(store, peer, id, root, relative, manifest, None)
+}
+
+fn receive_selection_root(
+    store: &TaskStore,
+    peer: NodeId,
+    group: Option<&TaskId>,
+    root: &Path,
+) -> PathBuf {
+    if let Some(group) = group
+        && let Some(existing) = store.list().iter().find(|t| {
+            t.direction() == TaskDirection::Receive
+                && t.peer_id() == &PeerId::from_node_id(peer)
+                && t.group_id() == Some(group)
+        })
+    {
+        return existing.local_path().to_path_buf();
+    }
+    root.to_path_buf()
+}
+
+pub fn accept_entry(
+    store: &mut TaskStore,
+    peer: NodeId,
+    id: &TaskId,
+    root: &Path,
+    relative: String,
+    manifest: FileManifest,
+    group: Option<TaskId>,
+) -> Result<TaskRecord> {
     validate_single_file(&manifest, &relative)?;
     if store.list().iter().any(|task| task.task_id() == id) {
         let existing = bound_task(store, peer, id)?;
-        let details = existing.file_details().unwrap();
+        let details = existing
+            .file_details()
+            .ok_or_else(|| failure("已有目录任务不能变成文件"))?;
         if existing.direction() != TaskDirection::Receive
             || details.relative_path != relative
             || details.manifest != manifest
+            || existing.group_id() != group.as_ref()
         {
             return Err(failure("已有任务与 Offer 身份不符"));
         }
         return begin_attempt(store, id);
     }
-    let record = TaskRecord::new_file(
+    let mut record = TaskRecord::new_file(
         id.clone(),
         PeerId::from_node_id(peer),
         TaskDirection::Receive,
-        root.to_path_buf(),
+        receive_selection_root(store, peer, group.as_ref(), root),
         relative,
         manifest,
+    )
+    .map_err(local_error)?;
+    record
+        .set_selection_binding(group, None)
+        .map_err(local_error)?;
+    store.create(record).map_err(local_error)?;
+    transition(store, id, TaskState::Queued)?;
+    begin_attempt(store, id)
+}
+
+pub fn accept_directory(
+    store: &mut TaskStore,
+    peer: NodeId,
+    id: &TaskId,
+    root: &Path,
+    relative: String,
+    group: Option<TaskId>,
+) -> Result<TaskRecord> {
+    protocol::validate_relative_path(&relative)?;
+    if store.list().iter().any(|t| t.task_id() == id) {
+        let existing = bound_task(store, peer, id)?;
+        if existing.direction() != TaskDirection::Receive
+            || existing
+                .directory_details()
+                .map(|d| d.relative_path.as_str())
+                != Some(relative.as_str())
+            || existing.group_id() != group.as_ref()
+        {
+            return Err(failure("已有目录任务与 Offer 不符"));
+        }
+        return begin_attempt(store, id);
+    }
+    let record = TaskRecord::new_directory(
+        id.clone(),
+        PeerId::from_node_id(peer),
+        TaskDirection::Receive,
+        receive_selection_root(store, peer, group.as_ref(), root),
+        relative,
+        group,
     )
     .map_err(local_error)?;
     store.create(record).map_err(local_error)?;
@@ -165,33 +239,69 @@ pub fn accept_offer(
 #[derive(Debug)]
 pub struct VerifiedSource {
     file: File,
-    path: PathBuf,
+    parent: cap_std::fs::Dir,
+    name: String,
+}
+
+pub fn source_parent(record: &TaskRecord) -> Result<(cap_std::fs::Dir, String)> {
+    let details = record
+        .file_details()
+        .ok_or_else(|| failure("缺少文件任务绑定"))?;
+    if let Some(root) = &details.source_root {
+        let dir = super::secure_fs::root(root)?;
+        let (_, relative) = details
+            .relative_path
+            .split_once('/')
+            .ok_or_else(|| failure("目录源绑定非法"))?;
+        if root.join(relative) != record.local_path() {
+            return Err(failure("目录源绑定非法"));
+        }
+        super::secure_fs::parent(&dir, relative, false)
+    } else {
+        let parent = record
+            .local_path()
+            .parent()
+            .ok_or_else(|| failure("源路径不可用"))?;
+        let name = record
+            .local_path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| failure("源路径不可用"))?;
+        Ok((
+            cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority())?,
+            name.to_owned(),
+        ))
+    }
 }
 
 pub fn verify_source(record: &TaskRecord) -> Result<VerifiedSource> {
+    use std::io::Read;
     if record.direction() != TaskDirection::Send {
         return Err(failure("任务不是本机发送任务"));
     }
-    regular_file(record.local_path()).map_err(|_| failure("源文件不可用"))?;
+    let (parent, name) = source_parent(record).map_err(|_| failure("源文件不可用"))?;
+    let file = super::secure_fs::open(&parent, &name, false, false)
+        .map_err(|_| failure("源文件不可用"))?;
     let manifest = &record
         .file_details()
         .ok_or_else(|| failure("缺少文件任务绑定"))?
         .manifest;
-    let current = bounded_manifest(record.local_path(), manifest.chunk_size, manifest.total_len)
-        .map_err(|error| {
-            if matches!(error, Error::Io(_)) {
-                failure("源文件不可用")
-            } else {
-                failure("源文件内容已变化")
-            }
-        })?;
-    if &current != manifest {
+    if file.metadata()?.len() != manifest.total_len {
         return Err(failure("源文件内容已变化"));
     }
-    Ok(VerifiedSource {
-        file: File::open(record.local_path())?,
-        path: record.local_path().to_path_buf(),
-    })
+    let mut reader =
+        std::io::BufReader::new(file.try_clone()?.take(manifest.total_len.saturating_add(1)));
+    let current = manifest_from_reader(&manifest.file_name, manifest.chunk_size, &mut reader)
+        .map_err(|_| failure("源文件不可用"))?;
+    if current != *manifest {
+        return Err(failure("源文件内容已变化"));
+    }
+    let opened = super::secure_fs::open(&parent, &name, false, false)
+        .map_err(|_| failure("源文件不可用"))?;
+    if !same_handles(&file, &opened)? {
+        return Err(failure("源文件内容已变化"));
+    }
+    Ok(VerifiedSource { file, parent, name })
 }
 
 pub fn source_chunk(
@@ -199,170 +309,90 @@ pub fn source_chunk(
     manifest: &FileManifest,
     index: u32,
 ) -> Result<Vec<u8>> {
-    regular_file(&source.path).map_err(|_| failure("源文件不可用"))?;
-    let current = File::open(&source.path).map_err(|_| failure("源文件不可用"))?;
-    if !same_handles(&source.file, &current)? {
-        return Err(failure("源文件内容已变化"));
-    }
-    let file = &mut source.file;
-    if file.metadata()?.len() != manifest.total_len {
+    let current = super::secure_fs::open(&source.parent, &source.name, false, false)
+        .map_err(|_| failure("源文件不可用"))?;
+    if !same_handles(&source.file, &current)? || source.file.metadata()?.len() != manifest.total_len
+    {
         return Err(failure("源文件内容已变化"));
     }
     let (offset, len) = manifest
         .chunk_range(index)
         .ok_or_else(|| failure("分片索引非法"))?;
-    let bytes = read_chunk(file, offset, len).map_err(|_| failure("源文件不可用或内容已变化"))?;
+    let bytes = read_chunk(&mut source.file, offset, len)
+        .map_err(|_| failure("源文件不可用或内容已变化"))?;
     if !manifest.verify_chunk(index, &bytes) {
         return Err(failure("源文件内容已变化"));
     }
     Ok(bytes)
 }
 
+#[cfg(test)]
 pub fn stage_dir(record: &TaskRecord) -> Result<PathBuf> {
-    let mut path = record.local_path().to_path_buf();
-    let metadata = fs::symlink_metadata(&path)?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(failure("接收根目录不可用"));
-    }
-    for component in [
-        ".p2p-desktop",
-        record.peer_id().as_str(),
-        record.task_id().as_str(),
-    ] {
-        path.push(component);
-        super::config::ensure_private_app_dir(&path)?;
-    }
-    Ok(path)
+    let _ = stage_capability(record)?;
+    Ok(record
+        .local_path()
+        .join(".p2p-desktop")
+        .join(record.peer_id().as_str())
+        .join(record.task_id().as_str()))
 }
-
+pub fn stage_capability(record: &TaskRecord) -> Result<cap_std::fs::Dir> {
+    let root = super::secure_fs::root(record.local_path())?;
+    let internal = super::secure_fs::child(&root, ".p2p-desktop", true)?;
+    #[cfg(unix)]
+    {
+        use cap_std::fs::PermissionsExt;
+        internal.set_permissions(".", cap_std::fs::Permissions::from_mode(0o700))?;
+    }
+    let peer = super::secure_fs::child(&internal, record.peer_id().as_str(), true)?;
+    super::secure_fs::child(&peer, record.task_id().as_str(), true)
+}
 pub fn open_download(record: &TaskRecord) -> Result<PartialDownload> {
     let details = record
         .file_details()
         .ok_or_else(|| failure("缺少文件任务绑定"))?;
-    PartialDownload::create(&stage_dir(record)?, details.manifest.clone())
+    let dir = std::sync::Arc::new(stage_capability(record)?);
+    let path = record
+        .local_path()
+        .join(".p2p-desktop")
+        .join(record.peer_id().as_str())
+        .join(record.task_id().as_str());
+    PartialDownload::create_desktop(&path, dir, details.manifest.clone())
 }
-
-/// No collision replacement in T006. T007 adds its separate backup transaction.
-/// Retain the staged inode until receipt commit, so recovery can prove ownership.
 pub fn publish(
     store: &mut TaskStore,
     record: &TaskRecord,
     download: &mut PartialDownload,
 ) -> Result<PathBuf> {
-    let id = record.task_id();
-    let details = record
-        .file_details()
-        .ok_or_else(|| failure("缺少文件任务绑定"))?;
-    let staged = download.prepare_desktop_publication()?;
-    store.prepare_publication(id).map_err(local_error)?;
-    let target = record.local_path().join(&details.relative_path);
-    match fs::hard_link(&staged, &target) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            regular_file(&target)?;
-            if !same_file(&staged, &target)? {
-                return Err(failure("接收目标已存在，等待重名发布处理"));
-            }
-        }
-        Err(error) => return Err(error.into()),
-    }
-    fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&target)?
-        .sync_all()?;
-    sync_dir(record.local_path())?;
-    // A staged inode can be modified by an external process after linking.
-    if bounded_manifest(
-        &target,
-        details.manifest.chunk_size,
-        details.manifest.total_len,
-    )? != details.manifest
-    {
-        return Err(failure("发布内容校验失败"));
-    }
-    store
-        .commit_receipt(id, system_time_unix_ms().map_err(local_error)?)
-        .map_err(local_error)?;
-    if cleanup_staging(record).is_err() {
-        tracing::warn!("完成回执已持久化；临时文件清理将在恢复时重试");
-    }
-    Ok(target)
+    super::publish::file(store, record, download)
 }
-
 pub fn cleanup_staging(record: &TaskRecord) -> Result<()> {
-    let directory = stage_dir(record)?;
+    let dir = stage_capability(record)?;
     let manifest = &record
         .file_details()
         .ok_or_else(|| failure("缺少文件任务绑定"))?
         .manifest;
     for path in [
-        PartialDownload::temp_path_for(&directory, manifest),
-        PartialDownload::state_path_for(&directory, manifest),
+        PartialDownload::temp_path_for(Path::new(""), manifest),
+        PartialDownload::state_path_for(Path::new(""), manifest),
+        PathBuf::from("publish.json"),
+        PathBuf::from("data.part"),
+        PathBuf::from("data.bitmap"),
     ] {
-        match fs::remove_file(path) {
+        match dir.remove_file(path) {
             Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
     }
-    sync_dir(&directory)
+    super::secure_fs::sync(&dir)
 }
-
-#[cfg(unix)]
+#[cfg(test)]
 fn sync_dir(path: &Path) -> Result<()> {
-    File::open(path)?.sync_all()?;
-    Ok(())
-}
-#[cfg(not(unix))]
-fn sync_dir(_path: &Path) -> Result<()> {
-    Ok(())
+    super::secure_fs::sync(&super::secure_fs::root(path)?)
 }
 
-fn same_file(a: &Path, b: &Path) -> Result<bool> {
-    same_handles(&File::open(a)?, &File::open(b)?)
-}
-#[cfg(unix)]
 fn same_handles(a: &File, b: &File) -> Result<bool> {
-    use std::os::unix::fs::MetadataExt;
-    let (a, b) = (a.metadata()?, b.metadata()?);
-    Ok(a.dev() == b.dev() && a.ino() == b.ino())
-}
-#[cfg(windows)]
-fn same_handles(a: &File, b: &File) -> Result<bool> {
-    use std::os::windows::io::AsRawHandle;
-    #[repr(C)]
-    #[derive(Default)]
-    struct FileInformation {
-        attributes: u32,
-        creation: [u32; 2],
-        access: [u32; 2],
-        write: [u32; 2],
-        volume: u32,
-        size: [u32; 2],
-        links: u32,
-        index: [u32; 2],
-    }
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetFileInformationByHandle(
-            handle: *mut std::ffi::c_void,
-            info: *mut FileInformation,
-        ) -> i32;
-    }
-    let identity = |file: &File| -> Result<(u32, [u32; 2])> {
-        let mut info = FileInformation::default();
-        // File holds a valid handle and info has the documented C structure layout.
-        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        Ok((info.volume, info.index))
-    };
-    Ok(identity(a)? == identity(b)?)
-}
-#[cfg(not(any(unix, windows)))]
-fn same_handles(_a: &File, _b: &File) -> Result<bool> {
-    Err(failure("此平台不支持文件身份校验"))
+    Ok(super::secure_fs::identity(a)? == super::secure_fs::identity(b)?)
 }
 
 #[cfg(test)]
@@ -449,24 +479,43 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    fn finalize_conflict_does_not_claim_receipt_even_for_identical_content() {
+    fn identical_existing_content_is_backed_up_not_mistaken_for_prior_receipt() {
         let (root, mut store, record, bytes) = fixture();
         let target = record.local_path().join("selected.bin");
         fs::write(&target, &bytes).unwrap();
         let mut download = open_download(&record).unwrap();
         fill(&mut download, &bytes);
         transition(&mut store, record.task_id(), TaskState::Finalizing).unwrap();
-        assert!(publish(&mut store, &record, &mut download).is_err());
+        let staged = download.temp_path().to_path_buf();
+        let before = super::super::secure_fs::identity(&File::open(&target).unwrap()).unwrap();
+        publish(&mut store, &record, &mut download).unwrap();
         assert!(
-            !store
+            store
                 .task(record.task_id())
                 .unwrap()
                 .file_details()
                 .unwrap()
                 .receipt_committed
         );
-        assert_eq!(fs::read(target).unwrap(), bytes);
-        assert!(download.temp_path().exists());
+        assert_eq!(fs::read(&target).unwrap(), bytes);
+        assert!(!staged.exists());
+        assert_ne!(
+            before,
+            super::super::secure_fs::identity(&File::open(&target).unwrap()).unwrap()
+        );
+        let backups = fs::read_dir(record.local_path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("selected+")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read(&backups[0]).unwrap(), bytes);
         drop(download);
         drop(store);
         fs::remove_dir_all(root).unwrap();
@@ -534,5 +583,48 @@ mod tests {
         );
         drop(store);
         fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn longest_portable_basename_uses_fixed_staging_names() {
+        let (root, mut store, _, bytes) = fixture();
+        let name = "x".repeat(255);
+        let source = root.join(&name);
+        fs::write(&source, &bytes).unwrap();
+        let manifest = manifest_from_path(&source, MIN_CHUNK_SIZE).unwrap();
+        let record = accept_offer(
+            &mut store,
+            Identity::generate().node_id(),
+            &TaskId::generate(),
+            &root.join("receive"),
+            name.clone(),
+            manifest,
+        )
+        .unwrap();
+        transition(&mut store, record.task_id(), TaskState::Transferring).unwrap();
+        let mut download = open_download(&record).unwrap();
+        assert_eq!(download.temp_path().file_name().unwrap(), "data.part");
+        fill(&mut download, &bytes);
+        transition(&mut store, record.task_id(), TaskState::Finalizing).unwrap();
+        publish(&mut store, &record, &mut download).unwrap();
+        assert_eq!(fs::read(root.join("receive").join(name)).unwrap(), bytes);
+        drop(download);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn staging_part_and_bitmap_symlinks_cannot_touch_unselected_files() {
+        use std::os::unix::fs::symlink;
+        for entry in ["data.part", "data.bitmap"] {
+            let (root, store, record, _) = fixture();
+            let outside = root.join("unselected.bin");
+            fs::write(&outside, b"private untouched data").unwrap();
+            let stage = stage_dir(&record).unwrap();
+            symlink(&outside, stage.join(entry)).unwrap();
+            assert!(open_download(&record).is_err());
+            assert_eq!(fs::read(outside).unwrap(), b"private untouched data");
+            drop(store);
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 }

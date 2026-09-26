@@ -21,7 +21,8 @@ pub const CAP_RELATIVE_ENTRIES: u64 = 2;
 pub const CAP_PAUSE_RESUME: u64 = 4;
 pub const CAP_SPEED_OWNERSHIP: u64 = 8;
 pub const CAP_FILE_TRANSFER: u64 = 16;
-pub const REQUIRED_CAPABILITIES: u64 = 15 | CAP_FILE_TRANSFER;
+pub const CAP_DIRECTORY_TRANSFER: u64 = 32;
+pub const REQUIRED_CAPABILITIES: u64 = 15 | CAP_FILE_TRANSFER | CAP_DIRECTORY_TRANSFER;
 pub const MAX_FRAME_BYTES: u32 = 4 * 1024 * 1024;
 pub const MAX_CHUNKS: usize = 65_536;
 pub const MAX_TASKS_PER_PEER: usize = 128;
@@ -38,7 +39,8 @@ pub fn validate_relative_path(path: &str) -> Result<()> {
         return Err(invalid("桌面相对路径长度或深度非法"));
     }
     for component in path.split('/') {
-        if component.is_empty()
+        if component.eq_ignore_ascii_case(".p2p-desktop")
+            || component.is_empty()
             || component == "."
             || component == ".."
             || component.len() > 255
@@ -801,7 +803,7 @@ mod tests {
                 capabilities: REQUIRED_CAPABILITIES,
             },
         };
-        assert_eq!(hello.encode().unwrap(), b"P2PD\x01\x00\x00\x01\x1f");
+        assert_eq!(hello.encode().unwrap(), b"P2PD\x01\x00\x00\x01\x3f");
         assert_eq!(
             Frame {
                 request_id: 0,
@@ -948,6 +950,15 @@ mod tests {
     #[tokio::test]
     async fn unsupported_version_missing_capability_and_old_cli_are_explicit_errors() {
         for response in [
+            Frame {
+                request_id: 0,
+                message: Message::Hello {
+                    version: VERSION,
+                    capabilities: REQUIRED_CAPABILITIES & !CAP_DIRECTORY_TRANSFER,
+                },
+            }
+            .encode()
+            .unwrap(),
             Frame {
                 request_id: 0,
                 message: Message::Hello {
