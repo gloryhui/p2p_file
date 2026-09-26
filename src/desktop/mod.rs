@@ -12,6 +12,8 @@
 
 pub(in crate::desktop) mod config;
 pub(in crate::desktop) mod instance_lock;
+mod network_state;
+mod session;
 #[allow(dead_code)] // Task list consumers arrive in later GPUI task integrations.
 mod task_events;
 #[allow(dead_code)] // T003 establishes the domain model before transfer consumers exist.
@@ -21,9 +23,10 @@ mod task_recovery;
 #[allow(dead_code)] // Durable mutation API is intentionally staged ahead of its UI consumer.
 mod task_store;
 
+use std::collections::HashMap;
 use std::{ops::Range, path::PathBuf};
 
-use crate::identity::Identity;
+use crate::identity::{Identity, NodeId};
 use config::{AppPaths, ConfigError, DesktopConfig, SettingsDraft, SpeedtestDirection};
 use instance_lock::InstanceLock;
 use task_store::TaskStore;
@@ -66,11 +69,13 @@ struct DesktopStartup {
     task_store: Option<TaskStore>,
     task_store_status: String,
     identity_id: Option<String>,
+    identity: Option<Identity>,
     identity_status: String,
     config_file: PathBuf,
     settings: SettingsDraft,
     config_note: String,
     can_save_settings: bool,
+    has_saved_network_config: bool,
 }
 
 impl DesktopStartup {
@@ -97,49 +102,58 @@ impl DesktopStartup {
                 Err(error) => (None, format!("任务记录不可用，原文件已保留：{error}")),
             };
 
-        let (identity_id, identity_status) = match Identity::load_or_create(&paths.identity_file())
-        {
-            Ok(identity) => (
-                Some(identity.node_id().to_hex()),
-                "本机身份已就绪".to_owned(),
-            ),
-            Err(error) => (None, format!("本机身份不可用：{error}")),
-        };
+        let (identity, identity_id, identity_status) =
+            match Identity::load_or_create(&paths.identity_file()) {
+                Ok(identity) => (
+                    Some(identity.clone()),
+                    Some(identity.node_id().to_hex()),
+                    "本机身份已就绪".to_owned(),
+                ),
+                Err(error) => (None, None, format!("本机身份不可用：{error}")),
+            };
 
         let config_file = paths.config_file();
         let defaults = || SettingsDraft::defaults(paths.downloads_dir.clone());
-        let (settings, config_note, can_save_settings) = match DesktopConfig::load(&config_file) {
-            Ok(Some(config)) => config::restore_saved_settings(config),
-            Ok(None) => {
-                let note = if paths.downloads_dir.is_some() {
-                    "尚未保存信令设置；请填写主机和端口".to_owned()
-                } else {
-                    "未找到系统 Downloads，请选择接收目录".to_owned()
-                };
-                (defaults(), note, true)
-            }
-            Err(ConfigError::Corrupt(error)) => (
-                defaults(),
-                format!("配置损坏，原文件已保留；保存已禁用：{error}"),
-                false,
-            ),
-            Err(error) => (
-                defaults(),
-                format!("配置读取失败，保存已禁用：{error}"),
-                false,
-            ),
-        };
+        let (settings, config_note, can_save_settings, has_saved_network_config) =
+            match DesktopConfig::load(&config_file) {
+                Ok(Some(config)) => {
+                    let (settings, note, can_save) = config::restore_saved_settings(config);
+                    (settings, note, can_save, true)
+                }
+                Ok(None) => {
+                    let note = if paths.downloads_dir.is_some() {
+                        "尚未保存信令设置；请填写主机和端口".to_owned()
+                    } else {
+                        "未找到系统 Downloads，请选择接收目录".to_owned()
+                    };
+                    (defaults(), note, true, false)
+                }
+                Err(ConfigError::Corrupt(error)) => (
+                    defaults(),
+                    format!("配置损坏，原文件已保留；保存已禁用：{error}"),
+                    false,
+                    false,
+                ),
+                Err(error) => (
+                    defaults(),
+                    format!("配置读取失败，保存已禁用：{error}"),
+                    false,
+                    false,
+                ),
+            };
 
         Ok(Self {
             instance_lock,
             task_store,
             task_store_status,
             identity_id,
+            identity,
             identity_status,
             config_file,
             settings,
             config_note,
             can_save_settings,
+            has_saved_network_config,
         })
     }
 }
@@ -181,6 +195,14 @@ fn marked_selection_to_utf8(
 ) -> Range<usize> {
     insertion_offset + utf8_offset_from_utf16(new_text, selection_utf16.start)
         ..insertion_offset + utf8_offset_from_utf16(new_text, selection_utf16.end)
+}
+
+fn signal_server_spec(host: &str, port: &str) -> String {
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 fn mouse_index_for_layout(content: &str, layout_text: &str, index: usize) -> Option<usize> {
@@ -780,6 +802,7 @@ struct DesktopShell {
     selected_folder: Option<PathBuf>,
     settings: SettingsDraft,
     identity_id: Option<String>,
+    identity: Option<Identity>,
     identity_status: SharedString,
     config_file: PathBuf,
     config_note: SharedString,
@@ -787,14 +810,166 @@ struct DesktopShell {
     is_saving_settings: bool,
     _instance_lock: InstanceLock,
     _task_store: Option<TaskStore>,
+    network_session: Option<session::DesktopSessionHandle>,
+    network_status: SharedString,
+    peer_status: SharedString,
+    network_epoch: u64,
+    peer_generations: HashMap<NodeId, u64>,
     status: SharedString,
     focus_handle: FocusHandle,
+}
+
+impl Drop for DesktopShell {
+    fn drop(&mut self) {
+        if let Some(session) = self.network_session.as_ref() {
+            session.shutdown();
+        }
+    }
 }
 
 impl DesktopShell {
     fn set_status(&mut self, status: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.status = status.into();
         cx.notify();
+    }
+
+    fn start_network_session(
+        &mut self,
+        config: session::DesktopSessionConfig,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(identity) = self.identity.clone() else {
+            self.network_status = "本机身份不可用；网络会话未启动".into();
+            self.set_status(self.network_status.clone(), cx);
+            return false;
+        };
+        match session::spawn(identity, config) {
+            Ok((handle, mut session_events)) => {
+                self.network_epoch = self.network_epoch.wrapping_add(1);
+                let network_epoch = self.network_epoch;
+                self.peer_generations.clear();
+                self.network_session = Some(handle);
+                self.network_status = "正在准备 UDP 并连接信令".into();
+                self.set_status(self.network_status.clone(), cx);
+                cx.spawn(async move |shell, cx| {
+                    while let Some(event) = session_events.recv().await {
+                        if shell
+                            .update(cx, |shell, cx| {
+                                if shell.network_epoch != network_epoch {
+                                    return;
+                                }
+                                match event {
+                                    session::SessionEvent::Lifecycle(lifecycle) => {
+                                        let label = lifecycle.label();
+                                        if matches!(lifecycle,
+                                            network_state::NetworkLifecycle::Unconfigured
+                                            | network_state::NetworkLifecycle::ConnectingSignal
+                                            | network_state::NetworkLifecycle::SignalOnline
+                                            | network_state::NetworkLifecycle::ReconnectingSignal { .. }
+                                            | network_state::NetworkLifecycle::Failed { .. }
+                                        ) {
+                                            shell.network_status = label.clone().into();
+                                        }
+                                        shell.set_status(label, cx);
+                                    }
+                                    session::SessionEvent::PeerState {
+                                        peer,
+                                        generation,
+                                        state,
+                                    } => {
+                                        if shell
+                                            .peer_generations
+                                            .get(&peer)
+                                            .is_some_and(|current| generation < *current)
+                                        {
+                                            return;
+                                        }
+                                        if !shell.peer_generations.contains_key(&peer)
+                                            && shell.peer_generations.len() >= network_state::MAX_PEERS
+                                            && let Some(oldest) = shell.peer_generations.iter()
+                                                .min_by_key(|(_, generation)| **generation).map(|(peer, _)| *peer)
+                                        {
+                                            shell.peer_generations.remove(&oldest);
+                                        }
+                                        shell.peer_generations.insert(peer, generation);
+                                        let label = match state {
+                                            network_state::PeerLifecycle::PeerPending => {
+                                                "等待对端候选地址".to_owned()
+                                            }
+                                            network_state::PeerLifecycle::Punching => {
+                                                "正在验证 UDP 打洞来源".to_owned()
+                                            }
+                                            network_state::PeerLifecycle::Authenticating => {
+                                                "正在执行 QUIC 与身份认证".to_owned()
+                                            }
+                                            network_state::PeerLifecycle::Connected => {
+                                                "已认证连接".to_owned()
+                                            }
+                                            network_state::PeerLifecycle::Disconnected => {
+                                                "连接已断开".to_owned()
+                                            }
+                                            network_state::PeerLifecycle::Failed(detail) => {
+                                                format!("连接失败：{detail}")
+                                            }
+                                        };
+                                        let message = format!("对端 {}：{label}", peer.short());
+                                        shell.peer_status = message.clone().into();
+                                        shell.set_status(message, cx);
+                                    }
+                                    session::SessionEvent::SignalIdentityRegistered(peer) => {
+                                        let label =
+                                            format!("信令在线；已登记本机身份 {}", peer.short());
+                                        shell.network_status = label.clone().into();
+                                        shell.set_status(label, cx);
+                                    }
+                                    session::SessionEvent::Diagnostic(detail) => {
+                                        shell.set_status(detail, cx);
+                                    }
+                                }
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+                true
+            }
+            Err(error) => {
+                let detail = format!("创建网络会话失败：{error}");
+                self.network_status = detail.clone().into();
+                self.set_status(detail, cx);
+                false
+            }
+        }
+    }
+
+    fn connect_peer(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let peer_text = self.peer_id.read(cx).content.to_string();
+        let peer = match NodeId::from_hex(peer_text.trim()) {
+            Ok(peer) => peer,
+            Err(error) => {
+                self.set_status(format!("对端 Node ID 无效：{error}"), cx);
+                return;
+            }
+        };
+        if self
+            .identity
+            .as_ref()
+            .is_some_and(|identity| identity.node_id() == peer)
+        {
+            self.set_status("不能连接本机 Node ID", cx);
+            return;
+        }
+        let Some(session) = self.network_session.as_ref() else {
+            self.set_status("请先保存有效的信令配置；网络会话尚未启动", cx);
+            return;
+        };
+        match session.connect_peer(peer) {
+            Ok(()) => self.set_status(format!("已提交对端 {} 的连接请求", peer.short()), cx),
+            Err(error) => self.set_status(error, cx),
+        }
     }
 
     fn copy_node_id(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -848,6 +1023,7 @@ impl DesktopShell {
         draft.signal_host = self.signal_host.read(cx).content.to_string();
         draft.signal_port = self.signal_port.read(cx).content.to_string();
         let config_file = self.config_file.clone();
+        let signal_server = signal_server_spec(&draft.signal_host, &draft.signal_port);
         let background = cx.background_executor().clone();
         self.is_saving_settings = true;
         self.set_status("正在验证并保存设置…", cx);
@@ -861,9 +1037,33 @@ impl DesktopShell {
                     shell.is_saving_settings = false;
                     match result {
                         Ok(()) => {
-                            shell.config_note =
-                                "设置已保存；接收目录写能力检查通过；网络功能待接入".into();
-                            shell.set_status("设置已保存；当前仍未连接，网络功能待接入", cx);
+                            shell.config_note = "设置已保存；接收目录写能力检查通过。".into();
+                            let mut started = false;
+                            if let Some(session) = shell
+                                .network_session
+                                .as_ref()
+                                .filter(|session| session.is_running())
+                            {
+                                match session.reconfigure_signal(signal_server.clone()) {
+                                    Ok(()) => {
+                                        shell.network_status = "正在使用新信令配置重连".into();
+                                        shell.set_status(shell.network_status.clone(), cx);
+                                        started = true;
+                                    }
+                                    Err(error) => {
+                                        shell.set_status(
+                                            format!("设置已保存；网络重配置失败：{error}"),
+                                            cx,
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                            if !started {
+                                shell.network_session = None;
+                                let config = session::DesktopSessionConfig::new(signal_server);
+                                shell.start_network_session(config, cx);
+                            }
                         }
                         Err(error) => {
                             shell.set_status(format!("设置未保存：{error}"), cx);
@@ -984,19 +1184,6 @@ impl DesktopShell {
         .detach();
     }
 
-    fn unavailable_control(label: &'static str) -> impl IntoElement {
-        div()
-            .px_2()
-            .py_2()
-            .bg(rgb(0xf0f2f5))
-            .border_1()
-            .border_color(rgb(0xd9dee7))
-            .rounded_md()
-            .text_color(rgb(0x737e8d))
-            .cursor(CursorStyle::Arrow)
-            .child(label)
-    }
-
     fn choose_files_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .px_2()
@@ -1081,6 +1268,33 @@ impl DesktopShell {
                 })
         }
     }
+
+    fn connect_peer_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.identity.is_some() && self.network_session.is_some() {
+            div()
+                .px_3()
+                .py_2()
+                .bg(rgb(0x2456a6))
+                .border_1()
+                .border_color(rgb(0x2456a6))
+                .rounded_md()
+                .text_color(white())
+                .child("连接")
+                .hover(|style| style.bg(rgb(0x1d478c)).cursor_pointer())
+                .on_mouse_up(MouseButton::Left, cx.listener(Self::connect_peer))
+        } else {
+            div()
+                .px_2()
+                .py_2()
+                .bg(rgb(0xf0f2f5))
+                .border_1()
+                .border_color(rgb(0xd9dee7))
+                .rounded_md()
+                .text_color(rgb(0x737e8d))
+                .cursor(CursorStyle::Arrow)
+                .child("先保存信令配置")
+        }
+    }
 }
 
 impl Focusable for DesktopShell {
@@ -1141,9 +1355,9 @@ impl Render for DesktopShell {
                             .px_2()
                             .py_1()
                             .rounded_md()
-                            .bg(rgb(0xfff3d6))
-                            .text_color(rgb(0x8b5a00))
-                            .child("未连接 · 网络功能待接入"),
+                            .bg(rgb(0xeaf1ff))
+                            .text_color(rgb(0x2456a6))
+                            .child(self.network_status.clone()),
                     ),
             )
             .child(
@@ -1277,7 +1491,7 @@ impl Render for DesktopShell {
                         div()
                             .text_sm()
                             .text_color(rgb(0x8b5a00))
-                            .child("保存设置仅记录上线意图；网络功能待接入，不会显示在线。"),
+                            .child("保存后自动登记信令；只有通过身份认证的对端才显示为已连接。"),
                     ),
             )
             .child(
@@ -1347,8 +1561,9 @@ impl Render for DesktopShell {
                                     .gap_2()
                                     .items_center()
                                     .child(self.peer_id.clone())
-                                    .child(Self::unavailable_control("连接（网络未接入）")),
-                            ),
+                                    .child(self.connect_peer_button(cx)),
+                            )
+                            .child(div().text_sm().child(self.peer_status.clone())),
                     ),
             )
             .child(
@@ -1483,25 +1698,42 @@ pub fn run() {
             task_store,
             task_store_status,
             identity_id,
+            identity,
             identity_status,
             config_file,
             settings,
             config_note,
             can_save_settings,
+            has_saved_network_config,
         } = startup;
         let initial_status = if task_store.is_none() || !task_store_status.contains("已就绪") {
             task_store_status.clone()
         } else if identity_id.is_some() {
             if settings.signal_host.is_empty() {
-                "未配置信令；网络功能待接入".to_owned()
+                "未配置有效信令；请保存设置后上线".to_owned()
             } else {
-                "未连接；网络功能待接入".to_owned()
+                "信令设置已保存；正在启动会话".to_owned()
             }
         } else {
             identity_status.clone()
         };
         let initial_host = settings.signal_host.clone();
         let initial_port = settings.signal_port.clone();
+        let startup_session_config = if has_saved_network_config && identity.is_some() {
+            Some(session::DesktopSessionConfig::new(signal_server_spec(
+                &settings.signal_host,
+                &settings.signal_port,
+            )))
+        } else {
+            None
+        };
+        let initial_network_status = if has_saved_network_config {
+            "正在准备长期在线网络会话".to_owned()
+        } else if identity_id.is_some() {
+            network_state::NetworkLifecycle::Unconfigured.label()
+        } else {
+            "本机身份不可用；网络会话未启动".to_owned()
+        };
         let window = cx.open_window(
             WindowOptions {
                 titlebar: Some(gpui::TitlebarOptions {
@@ -1532,6 +1764,7 @@ pub fn run() {
                     selected_folder: None,
                     settings,
                     identity_id,
+                    identity,
                     identity_status: identity_status.into(),
                     config_file,
                     config_note: config_note.into(),
@@ -1539,6 +1772,11 @@ pub fn run() {
                     is_saving_settings: false,
                     _instance_lock: instance_lock,
                     _task_store: task_store,
+                    network_session: None,
+                    network_status: initial_network_status.into(),
+                    peer_status: "尚未连接对端".into(),
+                    network_epoch: 0,
+                    peer_generations: HashMap::new(),
                     status: initial_status.into(),
                     focus_handle: cx.focus_handle(),
                 })
@@ -1548,9 +1786,12 @@ pub fn run() {
         match window {
             Ok(window) => {
                 window
-                    .update(cx, |shell, window, cx| {
+                    .update(cx, move |shell, window, cx| {
                         window.focus(&shell.signal_host.focus_handle(cx));
                         cx.activate(true);
+                        if let Some(config) = startup_session_config {
+                            shell.start_network_session(config, cx);
+                        }
                     })
                     .expect("新建 GPUI 窗口后初始化焦点失败");
                 cx.on_action(|_: &Quit, cx| cx.quit());

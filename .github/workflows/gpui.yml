@@ -40,8 +40,8 @@ jobs:
         run: cargo check --locked --features gui --bin p2p-desktop --target ${{ matrix.target }}
       - name: Build native desktop shell
         run: cargo build --locked --features gui --bin p2p-desktop --target ${{ matrix.target }}
-      - name: Run desktop platform, configuration, and single-instance tests
-        run: "cargo test --locked --features gui --lib desktop::"
+      - name: Run full GUI library regressions
+        run: "cargo test --locked --features gui --lib"
       - name: Run GUI Clippy
         if: runner.os == 'Linux'
         run: cargo clippy --locked --features gui --all-targets -- -D warnings
