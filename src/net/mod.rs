@@ -33,7 +33,8 @@ use crate::nat::punch::{PunchConfig, simultaneous_open_any};
 use crate::nat::stun::resolve_server;
 use crate::transport::handshake::handshake_initiator;
 use crate::transport::quic::{
-    ACCEPT_FIRST_BI_STREAM_TIMEOUT, ChannelBinding, endpoint_from_socket,
+    ACCEPT_FIRST_BI_STREAM_TIMEOUT, ChannelBinding, PunchSocketHandle, endpoint_from_socket,
+    endpoint_from_socket_with_punch_dispatcher,
 };
 
 /// 默认 STUN 服务器。
@@ -44,6 +45,47 @@ pub const DEFAULT_STUN_SERVERS: &[&str] = &[
     "stun.l.google.com:19302",
     "stun.cloudflare.com:3478",
 ];
+
+/// Network preparation settings for the long-lived desktop session.
+#[derive(Clone, Debug)]
+pub struct DesktopNetworkConfig {
+    pub local_port: u16,
+    pub stun_servers: Vec<String>,
+    pub stun_timeout: Duration,
+    pub advertise: Vec<SocketAddr>,
+    pub include_loopback: bool,
+}
+
+impl Default for DesktopNetworkConfig {
+    fn default() -> Self {
+        Self {
+            local_port: 0,
+            stun_servers: DEFAULT_STUN_SERVERS
+                .iter()
+                .map(|server| server.to_string())
+                .collect(),
+            stun_timeout: Duration::from_secs(3),
+            advertise: Vec::new(),
+            include_loopback: false,
+        }
+    }
+}
+
+/// One prepared UDP socket, its advertised candidates, and the QUIC endpoint that owns reads.
+pub struct DesktopNetwork {
+    pub endpoint: quinn::Endpoint,
+    pub punch_socket: PunchSocketHandle,
+    pub local_addr: SocketAddr,
+    pub local_candidates: Vec<Candidate>,
+    pub mapping: MappingBehavior,
+    pub public_addr: Option<SocketAddr>,
+}
+
+impl DesktopNetwork {
+    pub fn reachable_candidates(&self, candidates: &[Candidate]) -> Vec<SocketAddr> {
+        filter_reachable(candidates, self.local_addr)
+    }
+}
 
 /// 建立直连所需的参数。
 #[derive(Clone, Debug)]
@@ -272,10 +314,16 @@ pub async fn establish(identity: &Identity, config: &DirectConfig) -> Result<Dir
     info!(port = local_port, "打洞 socket 就绪");
 
     // ---- 2. STUN 探自己的公网映射 ----
-    let (public_addr, mapping) = probe_public_addr(&socket, config).await?;
+    let (public_addr, mapping) =
+        probe_public_addr(&socket, &config.stun_servers, config.stun_timeout).await?;
 
     // ---- 3. 组装候选地址 ----
-    let mut candidates = build_candidates(local_port, public_addr, config);
+    let mut candidates = build_candidates(
+        local_port,
+        public_addr,
+        &config.advertise,
+        config.include_loopback,
+    );
     dedup_candidates(&mut candidates);
     sort_candidates(&mut candidates);
     let local_candidates = candidates.clone();
@@ -378,6 +426,45 @@ pub async fn establish(identity: &Identity, config: &DirectConfig) -> Result<Dir
     })
 }
 
+/// Bind and probe the desktop UDP socket, then transfer receive ownership to the QUIC
+/// endpoint's punch-aware adapter. STUN, punch sends, and QUIC all use this same socket.
+pub async fn prepare_desktop_network(config: &DesktopNetworkConfig) -> Result<DesktopNetwork> {
+    let bind = SocketAddr::from(([0, 0, 0, 0], config.local_port));
+    let socket = UdpSocket::bind(bind)
+        .await
+        .map_err(|err| Error::Transport(format!("绑定本地 UDP 端口 {bind} 失败: {err}")))?;
+    let local_addr = socket.local_addr()?;
+    let (public_addr, mapping) =
+        probe_public_addr(&socket, &config.stun_servers, config.stun_timeout).await?;
+    let mut candidates = build_candidates(
+        local_addr.port(),
+        public_addr,
+        &config.advertise,
+        config.include_loopback,
+    );
+    dedup_candidates(&mut candidates);
+    sort_candidates(&mut candidates);
+
+    let std_socket = socket
+        .into_std()
+        .map_err(|err| Error::Transport(format!("取回 desktop UDP socket 失败: {err}")))?;
+    let (endpoint, punch_socket) = endpoint_from_socket_with_punch_dispatcher(std_socket)?;
+    if endpoint.local_addr()? != local_addr {
+        return Err(Error::Transport(
+            "desktop QUIC endpoint 未复用 STUN 探测时的 UDP 地址".into(),
+        ));
+    }
+
+    Ok(DesktopNetwork {
+        endpoint,
+        punch_socket,
+        local_addr,
+        local_candidates: candidates,
+        mapping,
+        public_addr,
+    })
+}
+
 /// 等对端上线。`timeout` 为 0 表示一直等下去。
 ///
 /// 无限等待时会周期性重查：既避免长时间没有推送，也顺便刷新服务器侧的登记。
@@ -412,15 +499,16 @@ async fn resolve_peer_waiting(
 /// 跑 RFC 5780 mapping probing，拿到公网映射和有证据支撑的 NAT 映射行为。
 async fn probe_public_addr(
     socket: &UdpSocket,
-    config: &DirectConfig,
+    stun_servers: &[String],
+    stun_timeout: Duration,
 ) -> Result<(Option<SocketAddr>, MappingBehavior)> {
-    if config.stun_servers.is_empty() {
+    if stun_servers.is_empty() {
         info!("没有配置 STUN 服务器，跳过公网探测");
         return Ok((None, MappingBehavior::Unknown));
     }
 
     let mut servers = Vec::new();
-    for spec in &config.stun_servers {
+    for spec in stun_servers {
         match resolve_server(spec).await {
             Ok(addr) => servers.push(addr),
             Err(err) => warn!(%spec, error = %err, "解析 STUN 服务器失败，跳过"),
@@ -429,7 +517,7 @@ async fn probe_public_addr(
 
     let mut fallback = None;
     for server in servers {
-        match probe_rfc5780(socket, server, config.stun_timeout).await {
+        match probe_rfc5780(socket, server, stun_timeout).await {
             Ok(probe) => {
                 for observation in &probe.observations {
                     info!(
@@ -476,14 +564,15 @@ async fn probe_public_addr(
 fn build_candidates(
     local_port: u16,
     public_addr: Option<SocketAddr>,
-    config: &DirectConfig,
+    advertise: &[SocketAddr],
+    include_loopback: bool,
 ) -> Vec<Candidate> {
     let mut candidates = Vec::new();
 
     if let Some(addr) = public_addr {
         candidates.push(Candidate::reflexive(addr));
     }
-    for addr in &config.advertise {
+    for addr in advertise {
         candidates.push(Candidate::reflexive(*addr));
     }
     for ip in local_ip_addresses() {
@@ -498,7 +587,7 @@ fn build_candidates(
         }
         candidates.push(Candidate::host(SocketAddr::new(ip, local_port)));
     }
-    if config.include_loopback {
+    if include_loopback {
         candidates.push(Candidate::host(SocketAddr::new(
             IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             local_port,
@@ -577,6 +666,26 @@ mod tests {
         assert!(!config.include_loopback);
     }
 
+    #[tokio::test]
+    async fn desktop网络探测与quinn端点保持同一udp地址() {
+        let config = DesktopNetworkConfig {
+            local_port: 0,
+            stun_servers: Vec::new(),
+            stun_timeout: Duration::from_millis(20),
+            advertise: Vec::new(),
+            include_loopback: true,
+        };
+        let network = prepare_desktop_network(&config).await.unwrap();
+        let endpoint_addr = network.endpoint.local_addr().unwrap();
+        assert_eq!(network.local_addr, endpoint_addr);
+        assert!(network.local_candidates.iter().any(|candidate| {
+            candidate.addr
+                == SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, endpoint_addr.port()))
+        }));
+        network.endpoint.close(0u32.into(), b"test complete");
+        network.endpoint.wait_idle().await;
+    }
+
     #[test]
     fn 地址族不匹配的候选会被过滤掉() {
         let local: SocketAddr = "0.0.0.0:9000".parse().unwrap();
@@ -614,8 +723,12 @@ mod tests {
             advertise: vec!["198.51.100.9:4000".parse().unwrap()],
             ..DirectConfig::new("127.0.0.1:7000", Identity::generate().node_id())
         };
-        let candidates =
-            build_candidates(9123, Some("203.0.113.7:41234".parse().unwrap()), &config);
+        let candidates = build_candidates(
+            9123,
+            Some("203.0.113.7:41234".parse().unwrap()),
+            &config.advertise,
+            config.include_loopback,
+        );
         assert!(
             candidates
                 .iter()

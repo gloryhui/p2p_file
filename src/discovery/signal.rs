@@ -555,9 +555,14 @@ pub async fn run_signal_server_on_with(
 
     // 连接所有权凭证：单调递增，保证「旧连接断开」不会误删「新连接」的记录。
     let mut next_connection_id: u64 = 1;
+    let mut clients = tokio::task::JoinSet::new();
 
     loop {
-        let (stream, remote) = match listener.accept().await {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            _ = clients.join_next(), if !clients.is_empty() => continue,
+        };
+        let (stream, remote) = match accepted {
             Ok(pair) => pair,
             Err(err) => {
                 tracing::warn!(error = %err, "接受连接失败，继续监听");
@@ -574,11 +579,19 @@ pub async fn run_signal_server_on_with(
 
         let registry = Arc::clone(&registry);
         let config = Arc::clone(&config);
-        tokio::spawn(async move {
+        clients.spawn(async move {
             if let Err(err) = handle_signal_client(stream, registry, connection_id, config).await {
                 tracing::debug!(%remote, error = %err, "信令连接结束");
             }
         });
+    }
+}
+
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -611,6 +624,7 @@ async fn handle_signal_client(
     // `send(true)` 时才就绪，不会因为记录被移除而误触发。
     let (close_tx, mut close_rx) = watch::channel(false);
     let mut writer = tokio::spawn(writer_loop(write_half, inbox, Arc::clone(&config)));
+    let _writer_guard = AbortOnDrop(writer.abort_handle());
 
     let mut reader = BufReader::new(read_half);
     let mut pending: Option<PendingRegistration> = None;
@@ -1109,6 +1123,34 @@ impl SignalingClient {
         candidates: Vec<Candidate>,
         heartbeat_interval: Option<Duration>,
     ) -> Result<Self> {
+        Self::connect_with_options(server, identity, candidates, heartbeat_interval, false).await
+    }
+
+    /// Connect with the normal registration/heartbeat behavior while exposing Pong
+    /// events to the single event consumer. Desktop sessions should use this API and
+    /// continuously drain [`Self::next_event`]; one-shot CLI users keep Pong filtering.
+    pub async fn connect_with_events(
+        server: &str,
+        identity: &Identity,
+        candidates: Vec<Candidate>,
+    ) -> Result<Self> {
+        Self::connect_with_options(
+            server,
+            identity,
+            candidates,
+            Some(DEFAULT_HEARTBEAT_INTERVAL),
+            true,
+        )
+        .await
+    }
+
+    async fn connect_with_options(
+        server: &str,
+        identity: &Identity,
+        candidates: Vec<Candidate>,
+        heartbeat_interval: Option<Duration>,
+        forward_pongs: bool,
+    ) -> Result<Self> {
         // 服务端也会拦，但客户端自己收一下，避免明知超限还去发一个大包。
         let mut candidates = candidates;
         if candidates.len() > MAX_CANDIDATES {
@@ -1152,7 +1194,7 @@ impl SignalingClient {
         let (events_tx, events) = mpsc::channel::<SignalMessage>(CLIENT_EVENT_CAPACITY);
 
         let writer = tokio::spawn(client_writer_loop(write_half, outbox, heartbeat_interval));
-        let reader_task = tokio::spawn(client_reader_loop(reader, events_tx));
+        let reader_task = tokio::spawn(client_reader_loop(reader, events_tx, forward_pongs));
 
         Ok(Self {
             node_id,
@@ -1172,6 +1214,29 @@ impl SignalingClient {
 
     pub fn server(&self) -> &str {
         &self.server
+    }
+
+    /// Enqueue an active peer lookup without consuming any response event.
+    ///
+    /// Long-lived desktop sessions use this together with [`Self::next_event`] so a
+    /// single owner can route lookup responses, passive offers, heartbeat replies, and
+    /// disconnects through one event loop. The legacy [`Self::lookup`] helper remains
+    /// available to one-shot CLI callers.
+    pub async fn request_lookup(&self, peer: NodeId) -> Result<()> {
+        self.outgoing
+            .try_send(SignalMessage::Lookup { node_id: peer })
+            .map_err(|error| Error::Discovery(format!("信令查询队列不可用: {error}")))
+    }
+
+    /// Receive the next server event from the sole signaling reader.
+    ///
+    /// Callers that use this API must route every returned event; selectively waiting
+    /// for one peer and discarding other messages can lose passive offers.
+    pub async fn next_event(&mut self) -> Result<SignalMessage> {
+        self.events
+            .recv()
+            .await
+            .ok_or_else(|| Error::Discovery("信令服务器断开了连接".into()))
     }
 
     /// 查询对端候选地址。
@@ -1343,21 +1408,29 @@ async fn client_writer_loop(
 
 /// 客户端 reader 任务：持续读帧。
 ///
-/// 关键在于**一直读**：`Pong` 直接丢掉，避免上层长时间不碰信令时心跳回包把
-/// TCP 缓冲撑满，反过来把服务器的 writer 卡死。任务退出（连接断开）时 sender
+/// 关键在于**一直读**，避免心跳回包把 TCP 缓冲撑满。传统一次性调用方继续
+/// 丢弃 Pong；长期桌面会话将 Pong 转交给唯一事件消费者。任务退出时 sender
 /// 被 drop，前台等待者会看到 `None` 并报「连接已断开」。
 async fn client_reader_loop(
     mut reader: BufReader<OwnedReadHalf>,
     events: mpsc::Sender<SignalMessage>,
+    forward_pongs: bool,
 ) {
     loop {
         match read_raw_frame_limited(&mut reader, MAX_SIGNAL_FRAME_LEN).await {
             Ok(Some(payload)) => match SignalMessage::decode(&payload) {
-                Ok(SignalMessage::Pong) => continue,
                 Ok(message) => {
+                    if matches!(message, SignalMessage::Pong) && !forward_pongs {
+                        continue;
+                    }
                     // 队列满说明前台长期没消费；这里用 try_send 保证读取不被阻塞。
                     // 丢掉的推送最多是「别人查到了我们」，对端下次查询会重新牵线。
                     if events.try_send(message).is_err() {
+                        if forward_pongs {
+                            // Never silently lose a desktop offer. Surface disconnect;
+                            // the session reconnects and retries pending discovery.
+                            break;
+                        }
                         tracing::debug!("客户端事件队列已满，丢弃一条服务器推送");
                     }
                 }
@@ -1984,6 +2057,69 @@ mod tests {
 
         let ghost = Identity::generate().node_id();
         assert_eq!(client.lookup(ghost).await.unwrap(), LookupOutcome::Pending);
+    }
+
+    #[tokio::test]
+    async fn 单事件接口保留心跳与查询响应供同一分发器处理() {
+        let addr = spawn_signal_server().await;
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let carol = Identity::generate();
+        let mut client_alice =
+            SignalingClient::connect_with_events(&addr.to_string(), &alice, vec![])
+                .await
+                .unwrap();
+        let mut client_bob = SignalingClient::connect_with_events(&addr.to_string(), &bob, vec![])
+            .await
+            .unwrap();
+        let client_carol = SignalingClient::connect(&addr.to_string(), &carol, vec![])
+            .await
+            .unwrap();
+
+        // Bob actively looks up Alice while Carol independently offers Bob as a
+        // passive target. One dispatcher must retain both peer events.
+        client_bob.request_lookup(alice.node_id()).await.unwrap();
+        client_carol.request_lookup(bob.node_id()).await.unwrap();
+        client_bob.ping().await.unwrap();
+
+        let mut bob_peers = HashSet::new();
+        let mut got_pong = false;
+        for _ in 0..4 {
+            let event = tokio::time::timeout(Duration::from_secs(3), client_bob.next_event())
+                .await
+                .expect("同一 reader 应持续路由所有事件")
+                .unwrap();
+            match event {
+                SignalMessage::PeerCandidates { node_id, .. } => {
+                    bob_peers.insert(node_id);
+                }
+                SignalMessage::Pong => got_pong = true,
+                other => panic!("意外事件：{other:?}"),
+            }
+            if bob_peers.contains(&alice.node_id())
+                && bob_peers.contains(&carol.node_id())
+                && got_pong
+            {
+                break;
+            }
+        }
+        assert!(
+            bob_peers.contains(&alice.node_id()),
+            "主动查询 A 的响应不能丢"
+        );
+        assert!(
+            bob_peers.contains(&carol.node_id()),
+            "主动查询 C 的响应不能丢"
+        );
+        assert!(got_pong, "lookup 之间的 Pong 不能被吞");
+
+        let passive = tokio::time::timeout(Duration::from_secs(3), client_alice.next_event())
+            .await
+            .expect("被动目标 A 应收到 Bob 的 offer")
+            .unwrap();
+        assert!(
+            matches!(passive, SignalMessage::PeerCandidates { node_id, .. } if node_id == bob.node_id())
+        );
     }
 
     #[tokio::test]
