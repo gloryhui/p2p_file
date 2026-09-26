@@ -1,5 +1,7 @@
 //! Handle-relative filesystem operations. Remote names never become ambient paths.
 use crate::error::{Error, Result};
+#[cfg(unix)]
+use cap_fs_ext::OpenOptionsSyncExt;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
 use serde::{Deserialize, Serialize};
@@ -93,6 +95,11 @@ pub fn open(dir: &Dir, name: &str, write: bool, create: bool) -> Result<File> {
         .write(write)
         .create(create)
         .follow(FollowSymlinks::No);
+    // A pre-existing FIFO must not block before its type can be rejected.
+    // O_NONBLOCK has no effect on normal disk files and also closes a local
+    // file-to-FIFO replacement race between lookup and metadata validation.
+    #[cfg(unix)]
+    options.nonblock(true);
     let file = dir.open_with(name, &options)?.into_std();
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -272,6 +279,38 @@ mod tests {
         let path = std::env::temp_dir().join(format!("p2p-secure-dir-{}", rand::random::<u128>()));
         ambient::create_dir(&path).unwrap();
         path
+    }
+    #[cfg(unix)]
+    #[test]
+    fn existing_fifo_is_rejected_without_waiting_for_another_process() {
+        let path = fixture();
+        let dir = root(&path).unwrap();
+        rustix::fs::mkfifoat(
+            &dir,
+            "pipe",
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .unwrap();
+        drop(dir);
+        let worker_path = path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let dir = root(&worker_path).unwrap();
+            tx.send(open(&dir, "pipe", false, false).unwrap_err().to_string())
+                .unwrap();
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(3));
+        if result.is_err() {
+            // Release the old blocking implementation so a failing regression
+            // never leaves a stuck worker or an incomplete test process.
+            let _writer = ambient::OpenOptions::new()
+                .write(true)
+                .open(path.join("pipe"))
+                .unwrap();
+        }
+        worker.join().unwrap();
+        ambient::remove_dir_all(path).unwrap();
+        assert!(result.is_ok_and(|message| message.contains("普通文件")));
     }
     #[cfg(unix)]
     #[test]
