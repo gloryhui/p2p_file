@@ -12,11 +12,13 @@
 
 pub(in crate::desktop) mod config;
 mod files;
+mod frame_budget;
 pub(in crate::desktop) mod instance_lock;
 mod network_state;
 #[allow(dead_code)] // T005 wire guards are consumed by transfer/speed business in T006-T009.
 mod protocol;
 mod publish;
+mod queue;
 pub(crate) mod secure_fs;
 mod session;
 #[allow(dead_code)] // Task list consumers arrive in later GPUI task integrations.
@@ -1036,6 +1038,7 @@ impl DesktopShell {
         let config_file = self.config_file.clone();
         let signal_server = signal_server_spec(&draft.signal_host, &draft.signal_port);
         let saved_receive_root = draft.receive_directory.clone();
+        let saved_send_limit = draft.send_concurrency;
         let background = cx.background_executor().clone();
         self.is_saving_settings = true;
         self.set_status("正在验证并保存设置…", cx);
@@ -1054,6 +1057,12 @@ impl DesktopShell {
                                 (&shell.transfer_service, &saved_receive_root)
                             {
                                 service.set_receive_root(root.clone());
+                            }
+                            if let Some(service) = shell.transfer_service.as_ref()
+                                && let Err(error) = service.set_send_limit(saved_send_limit)
+                            {
+                                shell.set_status(error.to_string(), cx);
+                                return;
                             }
                             let mut started = false;
                             if let Some(session) = shell
@@ -1735,10 +1744,15 @@ pub fn run() {
             identity_status.clone()
         };
         let transfer_service = task_store.map(|store| {
-            transfer::TransferService::new(
+            let service = transfer::TransferService::new(
                 store,
                 settings.receive_directory.clone().unwrap_or_default(),
-            )
+            );
+            // Settings were already validated (or replaced with safe defaults).
+            service
+                .set_send_limit(settings.send_concurrency)
+                .expect("validated concurrency");
+            service
         });
         let initial_host = settings.signal_host.clone();
         let initial_port = settings.signal_port.clone();

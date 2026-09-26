@@ -30,7 +30,7 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const PAUSE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 const WINDOW: usize = 4;
-const MAX_ACTIVE: usize = 3;
+const MAX_RECEIVE_FILES: usize = 3;
 
 #[cfg(test)]
 type TestGate = Arc<
@@ -49,6 +49,11 @@ pub(crate) struct TransferService {
     active: Arc<Mutex<HashMap<TaskId, Active>>>,
     changed: watch::Sender<u64>,
     epoch: Arc<std::sync::atomic::AtomicU64>,
+    fair_writes: super::queue::FairWrites,
+    frame_budget: super::frame_budget::FrameBudget,
+    rate_origin: Instant,
+    rates: Arc<Mutex<HashMap<TaskId, super::queue::RateSampler>>>,
+    sender_queue: Arc<Mutex<super::queue::TaskQueue>>,
     #[cfg(test)]
     drop_completion: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
@@ -56,9 +61,40 @@ pub(crate) struct TransferService {
     #[cfg(test)]
     checkpoint_gate: TestGate,
 }
+#[allow(dead_code)] // T010 consumes these safe domain fields in its task list.
+pub(crate) struct TransferPresentation {
+    pub tasks: Vec<TaskRecord>,
+    pub events: Vec<super::task_events::TaskEvent>,
+    pub resync_required: bool,
+    pub bytes_per_second: HashMap<TaskId, f64>,
+    pub groups: HashMap<TaskId, super::queue::GroupProgress>,
+    pub queue: super::queue::QueueMetrics,
+}
 struct Active {
     peer: NodeId,
+    direction: TaskDirection,
+    metadata: bool,
     pause: watch::Sender<bool>,
+}
+pub(crate) struct ScheduledSend {
+    pub entry: super::queue::QueueEntry,
+    generation: u64,
+    _slot: SendSlot,
+}
+struct SendSlot {
+    service: TransferService,
+    id: TaskId,
+    generation: u64,
+}
+impl Drop for SendSlot {
+    fn drop(&mut self) {
+        self.service
+            .sender_queue
+            .lock()
+            .unwrap()
+            .finish_if(&self.id, self.generation);
+        self.service.changed.send_modify(|v| *v = v.wrapping_add(1));
+    }
 }
 struct ActiveGuard {
     service: TransferService,
@@ -67,6 +103,7 @@ struct ActiveGuard {
 impl Drop for ActiveGuard {
     fn drop(&mut self) {
         self.service.active.lock().unwrap().remove(&self.id);
+        self.service.rates.lock().unwrap().remove(&self.id);
         self.service
             .changed
             .send_modify(|version| *version = version.wrapping_add(1));
@@ -95,6 +132,11 @@ impl TransferService {
             active: Arc::new(Mutex::new(HashMap::new())),
             changed,
             epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            fair_writes: super::queue::FairWrites::default(),
+            frame_budget: super::frame_budget::FrameBudget::default(),
+            rate_origin: Instant::now(),
+            rates: Arc::new(Mutex::new(HashMap::new())),
+            sender_queue: Arc::new(Mutex::new(super::queue::TaskQueue::default())),
             #[cfg(test)]
             drop_completion: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
@@ -131,8 +173,190 @@ impl TransferService {
         let store = self.store.clone();
         blocking(move || work(&*store.lock().map_err(|_| disk::failure("任务库锁不可用"))?)).await
     }
+    pub fn set_send_limit(&self, value: u8) -> Result<()> {
+        self.sender_queue
+            .lock()
+            .unwrap()
+            .set_limit(value)
+            .map_err(disk::failure)?;
+        self.changed.send_modify(|v| *v = v.wrapping_add(1));
+        Ok(())
+    }
+    pub fn queue_metrics(&self) -> super::queue::QueueMetrics {
+        self.sender_queue.lock().unwrap().metrics()
+    }
+    pub fn dispatch_ready(&self, connections: &HashMap<NodeId, Connection>) -> Vec<ScheduledSend> {
+        let mut queue = self.sender_queue.lock().unwrap();
+        let mut selected = Vec::new();
+        while let Some(entry) = queue.dispatch(|peer| {
+            connections
+                .get(&peer)
+                .is_some_and(|c| c.close_reason().is_none())
+        }) {
+            let generation = queue.slot_generation(&entry.id).unwrap();
+            let slot = SendSlot {
+                service: self.clone(),
+                id: entry.id.clone(),
+                generation,
+            };
+            selected.push(ScheduledSend {
+                entry,
+                generation,
+                _slot: slot,
+            });
+        }
+        selected
+    }
+    /// Only explicitly queued tasks enter the current-run executor. Restored
+    /// Interrupted/Paused records require a new user continuation command.
+    pub async fn enqueue_tasks(&self, peer: NodeId, ids: Vec<TaskId>) -> Result<()> {
+        let generation = self.epoch.load(std::sync::atomic::Ordering::Acquire);
+        let queue = self.sender_queue.clone();
+        let entries = self
+            .store(move |store| {
+                let mut entries = Vec::new();
+                for id in ids {
+                    let record = disk::bound_task(store, peer, &id)?;
+                    if record.direction() != TaskDirection::Send {
+                        return Err(disk::failure("接收任务不能加入发送队列"));
+                    }
+                    if record.state() == TaskState::Completed {
+                        continue;
+                    }
+                    if queue.lock().unwrap().slot_generation(&id).is_some() {
+                        continue;
+                    }
+                    if record.state() != TaskState::Queued && !can_continue(&record) {
+                        return Err(disk::failure("任务当前不能继续"));
+                    }
+                    entries.push(super::queue::QueueEntry {
+                        id,
+                        peer,
+                        metadata: record.directory_details().is_some(),
+                    });
+                }
+                // Validate every ID/peer/state before changing any record.
+                for entry in &entries {
+                    if store.task(&entry.id).map_err(disk::local_error)?.state()
+                        != TaskState::Queued
+                    {
+                        disk::transition(store, &entry.id, TaskState::Queued)?;
+                    }
+                }
+                Ok(entries)
+            })
+            .await?;
+        let admission = {
+            let mut queue = self.sender_queue.lock().unwrap();
+            if generation != self.epoch.load(std::sync::atomic::Ordering::Acquire) {
+                Err("旧传输会话已取消")
+            } else {
+                queue.enqueue(entries.clone())
+            }
+        };
+        if let Err(message) = admission {
+            // Retain every durable selection; a capacity failure must not leave
+            // an orphan Queued record that the user cannot manually continue.
+            let queue = self.sender_queue.clone();
+            self.store(move |store| {
+                for entry in entries {
+                    let retained = {
+                        let queue = queue.lock().unwrap();
+                        queue.is_queued(&entry.id) || queue.slot_generation(&entry.id).is_some()
+                    };
+                    if !retained
+                        && store.task(&entry.id).map_err(disk::local_error)?.state()
+                            == TaskState::Queued
+                    {
+                        disk::transition(store, &entry.id, TaskState::Interrupted)?;
+                    }
+                }
+                Ok(())
+            })
+            .await?;
+            return Err(disk::failure(message));
+        }
+        self.changed.send_modify(|v| *v = v.wrapping_add(1));
+        Ok(())
+    }
+    pub async fn execute_queued(
+        &self,
+        scheduled: ScheduledSend,
+        connection: Connection,
+    ) -> Result<()> {
+        let ScheduledSend {
+            entry,
+            generation,
+            _slot,
+        } = scheduled;
+        let _owned_slot = _slot;
+        self.execute_send(&connection, entry.peer, entry.id, generation)
+            .await
+    }
+    async fn reserve_send(&self, peer: NodeId, id: TaskId) -> Result<SendSlot> {
+        let lookup = id.clone();
+        let record = self
+            .read_store(move |store| disk::bound_task(store, peer, &lookup))
+            .await?;
+        if record.direction() != TaskDirection::Send {
+            return Err(disk::failure("只能发送本机已选择任务"));
+        }
+        let generation = self
+            .sender_queue
+            .lock()
+            .unwrap()
+            .reserve_direct(super::queue::QueueEntry {
+                id: id.clone(),
+                peer,
+                metadata: record.directory_details().is_some(),
+            })
+            .map_err(disk::failure)?;
+        Ok(SendSlot {
+            service: self.clone(),
+            id,
+            generation,
+        })
+    }
+    pub async fn pause_task(&self, id: TaskId) -> Result<()> {
+        let active = self.active.clone();
+        let queue = self.sender_queue.clone();
+        self.store(move |store| {
+            // Serialize the durable state with admission. A reserved executor
+            // has not necessarily claimed its stream yet; cancel its nonce too.
+            let active = active.lock().unwrap();
+            if let Some(task) = active.get(&id) {
+                task.pause.send_if_modified(|paused| {
+                    if *paused {
+                        false
+                    } else {
+                        *paused = true;
+                        true
+                    }
+                });
+                return Ok(());
+            }
+            let mut queue = queue.lock().unwrap();
+            let queued = queue.is_queued(&id);
+            let generation = queue.slot_generation(&id);
+            if !queued && generation.is_none() {
+                return Err(disk::failure("任务当前未传输或排队"));
+            }
+            if store.task(&id).map_err(disk::local_error)?.state() != TaskState::Queued {
+                return Err(disk::failure("任务当前不能暂停"));
+            }
+            disk::transition(store, &id, TaskState::Pausing)?;
+            disk::transition(store, &id, TaskState::Paused)?;
+            queue.remove_queued(&id);
+            if let Some(generation) = generation {
+                queue.finish_if(&id, generation);
+            }
+            Ok(())
+        })
+        .await
+    }
     pub async fn interrupt_all(&self) -> Result<()> {
         self.epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.sender_queue.lock().unwrap().clear();
         self.store(|store| {
             let ids = store
                 .list()
@@ -158,8 +382,24 @@ impl TransferService {
         *self.receive_root.lock().unwrap() = root;
     }
     pub async fn select_file(&self, peer: NodeId, source: PathBuf) -> Result<TaskId> {
-        self.store(move |store| disk::select_file(store, peer, source).map(|r| r.task_id().clone()))
-            .await
+        struct CancelScan(super::files::ScanCancellation);
+        impl Drop for CancelScan {
+            fn drop(&mut self) {
+                self.0.cancel();
+            }
+        }
+        let cancellation = super::files::ScanCancellation::default();
+        let _guard = CancelScan(cancellation.clone());
+        // Hashing may take minutes. It never holds the task-store writer lock.
+        let record =
+            blocking(move || disk::scan_selected_file(peer, source, &cancellation)).await?;
+        self.store(move |store| {
+            let id = record.task_id().clone();
+            store.create(record).map_err(disk::local_error)?;
+            disk::transition(store, &id, TaskState::Queued)?;
+            Ok(id)
+        })
+        .await
     }
     pub async fn select_directory(&self, peer: NodeId, source: PathBuf) -> Result<Vec<TaskId>> {
         struct CancelScan(super::files::ScanCancellation);
@@ -181,7 +421,8 @@ impl TransferService {
         })
         .await
     }
-    /// T007 expands a selection; T008 replaces this sequential executor with its queue.
+    /// Test convenience for existing directory protocol regressions.
+    #[cfg(test)]
     pub async fn send_selection(
         &self,
         connection: &Connection,
@@ -219,32 +460,56 @@ impl TransferService {
         .await
         .map_err(|_| disk::failure("上次传输清理超时"))?
     }
-    async fn wait_peer_idle(&self, peer: NodeId) -> Result<()> {
-        let mut changed = self.subscribe();
-        tokio::time::timeout(PAUSE_TIMEOUT, async {
-            loop {
-                if !self.active.lock().unwrap().values().any(|a| a.peer == peer) {
-                    return Ok(());
-                }
-                changed
-                    .changed()
-                    .await
-                    .map_err(|_| disk::failure("任务清理通知已关闭"))?;
-            }
-        })
-        .await
-        .map_err(|_| disk::failure("对端已有任务活动"))?
-    }
-    fn claim(&self, peer: NodeId, id: &TaskId) -> Result<(ActiveGuard, watch::Receiver<bool>)> {
+    fn claim(
+        &self,
+        peer: NodeId,
+        id: &TaskId,
+        direction: TaskDirection,
+        metadata: bool,
+        send_generation: Option<u64>,
+    ) -> Result<(ActiveGuard, watch::Receiver<bool>)> {
         let mut active = self.active.lock().unwrap();
-        if active.len() >= MAX_ACTIVE
-            || active.contains_key(id)
-            || active.values().any(|a| a.peer == peer)
-        {
-            return Err(disk::failure("已有文件任务活动，请稍后继续"));
+        if active.contains_key(id) {
+            return Err(disk::failure("同一任务已有传输活动"));
+        }
+        if direction == TaskDirection::Send {
+            if self.sender_queue.lock().unwrap().slot_generation(id) != send_generation
+                || send_generation.is_none()
+            {
+                return Err(disk::failure("发送槽已失效"));
+            }
+        } else {
+            let global = active
+                .values()
+                .filter(|a| a.direction == TaskDirection::Receive && a.metadata == metadata)
+                .count();
+            let per_peer = active
+                .values()
+                .filter(|a| {
+                    a.direction == TaskDirection::Receive
+                        && a.metadata == metadata
+                        && a.peer == peer
+                })
+                .count();
+            let (global_limit, peer_limit) = if metadata {
+                (super::queue::MAX_METADATA_ACTIVE, 2)
+            } else {
+                (MAX_RECEIVE_FILES, 3)
+            };
+            if global >= global_limit || per_peer >= peer_limit {
+                return Err(disk::failure("接收资源忙，请稍后继续"));
+            }
         }
         let (pause, rx) = watch::channel(false);
-        active.insert(id.clone(), Active { peer, pause });
+        active.insert(
+            id.clone(),
+            Active {
+                peer,
+                direction,
+                metadata,
+                pause,
+            },
+        );
         Ok((
             ActiveGuard {
                 service: self.clone(),
@@ -253,6 +518,37 @@ impl TransferService {
             rx,
         ))
     }
+    async fn claim_receive(
+        &self,
+        send: &mut SendStream,
+        peer: NodeId,
+        id: &TaskId,
+        metadata: bool,
+    ) -> Result<(ActiveGuard, watch::Receiver<bool>)> {
+        match self.claim(peer, id, TaskDirection::Receive, metadata, None) {
+            Ok(claim) => Ok(claim),
+            Err(error) => {
+                tokio::time::timeout(
+                    IDLE_TIMEOUT,
+                    protocol::write(
+                        send,
+                        &Frame {
+                            request_id: 1,
+                            message: Message::Error {
+                                task_id: id.clone(),
+                                code: ErrorCode::Busy,
+                            },
+                        },
+                    ),
+                )
+                .await
+                .map_err(|_| disk::failure("接收资源忙回执超时"))??;
+                let _ = send.finish();
+                Err(error)
+            }
+        }
+    }
+    #[cfg(test)]
     pub fn pause(&self, id: &TaskId) -> Result<()> {
         let active = self.active.lock().unwrap();
         let pause = &active
@@ -276,6 +572,8 @@ impl TransferService {
             (TaskState::Failed, TaskErrorCode::SourceChanged, false)
         } else if text.contains("源文件不可用") {
             (TaskState::Failed, TaskErrorCode::SourceUnavailable, true)
+        } else if text.contains("资源忙") {
+            (TaskState::Failed, TaskErrorCode::PeerBusy, true)
         } else if is_storage_error(error) {
             (TaskState::Failed, TaskErrorCode::StorageUnavailable, true)
         } else {
@@ -302,17 +600,84 @@ impl TransferService {
             })
             .await;
     }
+    fn monotonic_ms(&self) -> u64 {
+        self.rate_origin
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64
+    }
+    fn reset_rate(&self, id: &TaskId, bytes: u64) {
+        self.rates
+            .lock()
+            .unwrap()
+            .entry(id.clone())
+            .or_default()
+            .reset(self.monotonic_ms(), bytes);
+    }
     async fn progress(&self, id: &TaskId, bytes: u64) -> Result<()> {
-        let id = id.clone();
+        let lookup = id.clone();
         self.store(move |store| {
             store
                 .set_progress_hint(
-                    &id,
+                    &lookup,
                     ProgressHint::new(bytes, system_time_unix_ms().map_err(disk::local_error)?),
                 )
                 .map_err(disk::local_error)
         })
-        .await
+        .await?;
+        self.rates
+            .lock()
+            .unwrap()
+            .entry(id.clone())
+            .or_default()
+            .observe(self.monotonic_ms(), bytes);
+        Ok(())
+    }
+    /// An authoritative snapshot accompanies bounded/coalesced events. A UI
+    /// rebuilds from tasks when resync_required, rather than trusting a lost delta.
+    #[allow(dead_code)] // T010 consumes the T008 presentation contract.
+    pub async fn presentation(&self) -> Result<TransferPresentation> {
+        let store = self.store.clone();
+        let (tasks, events, resync_required) = blocking(move || {
+            let mut store = store.lock().map_err(|_| disk::failure("任务库锁不可用"))?;
+            let tasks = store.list().to_vec();
+            let events = store.drain_events();
+            let resync = store.take_event_resync_required();
+            Ok((tasks, events, resync))
+        })
+        .await?;
+        let now = self.monotonic_ms();
+        let rates = self.rates.lock().unwrap();
+        let bytes_per_second = tasks
+            .iter()
+            .map(|record| {
+                let value = rates.get(record.task_id()).map_or(0.0, |rate| {
+                    rate.bytes_per_second(now, record.state() == TaskState::Transferring)
+                });
+                (record.task_id().clone(), value)
+            })
+            .collect();
+        let mut children: HashMap<TaskId, Vec<TaskRecord>> = HashMap::new();
+        for record in &tasks {
+            if let Some(group) = record.group_id() {
+                children
+                    .entry(group.clone())
+                    .or_default()
+                    .push(record.clone());
+            }
+        }
+        let groups = children
+            .into_iter()
+            .map(|(id, children)| (id, super::queue::group_progress(&children)))
+            .collect();
+        Ok(TransferPresentation {
+            tasks,
+            events,
+            resync_required,
+            bytes_per_second,
+            groups,
+            queue: self.queue_metrics(),
+        })
     }
     async fn receipt(&self, id: &TaskId) -> Result<()> {
         self.state(id, TaskState::Finalizing).await?;
@@ -324,7 +689,20 @@ impl TransferService {
         })
         .await
     }
+    #[cfg(test)]
     pub async fn send_file(&self, connection: &Connection, peer: NodeId, id: TaskId) -> Result<()> {
+        self.wait_previous_attempt(&id).await?;
+        let slot = self.reserve_send(peer, id.clone()).await?;
+        self.execute_send(connection, peer, id, slot.generation)
+            .await
+    }
+    async fn execute_send(
+        &self,
+        connection: &Connection,
+        peer: NodeId,
+        id: TaskId,
+        generation: u64,
+    ) -> Result<()> {
         let lookup = id.clone();
         self.read_store(move |store| {
             let record = disk::bound_task(store, peer, &lookup)?;
@@ -338,7 +716,13 @@ impl TransferService {
         if can_continue(&current) {
             self.wait_previous_attempt(&id).await?;
         }
-        let (_guard, pause) = self.claim(peer, &id)?;
+        let (_guard, pause) = self.claim(
+            peer,
+            &id,
+            TaskDirection::Send,
+            current.directory_details().is_some(),
+            Some(generation),
+        )?;
         let result = self.send_inner(connection, peer, &id, pause, None).await;
         if let Err(error) = &result {
             self.finish_error(&id, error).await;
@@ -378,7 +762,7 @@ impl TransferService {
             .await
             .map_err(|_| disk::failure("文件流打开超时"))?
             .map_err(disk::local_error)?;
-        let mut io = TaskIo::new(send, recv, peer, id.clone());
+        let mut io = TaskIo::new(send, recv, peer, id.clone(), self.frame_budget.clone());
         io.send(Message::Offer {
             task_id: id.clone(),
             group_id: record.group_id().cloned(),
@@ -427,7 +811,7 @@ impl TransferService {
             .map_err(|_| disk::failure("目录流打开超时"))?
             .map_err(disk::local_error)?;
         let id = record.task_id();
-        let mut io = TaskIo::new(send, recv, peer, id.clone());
+        let mut io = TaskIo::new(send, recv, peer, id.clone(), self.frame_budget.clone());
         io.send(Message::Offer {
             task_id: id.clone(),
             group_id: record.group_id().cloned(),
@@ -453,6 +837,10 @@ impl TransferService {
             .await
             .map_err(|_| disk::failure("目录回执超时"))?
             .ok_or_else(|| disk::failure("目录流中断"))??;
+        let super::frame_budget::BufferedFrame {
+            frame: response,
+            _lease,
+        } = response;
         io.observe(&response)?;
         match response.message {
             Message::Completed { .. } => {
@@ -473,6 +861,7 @@ impl TransferService {
         mut pause: watch::Receiver<bool>,
     ) -> Result<()> {
         let file = Arc::new(Mutex::new(file));
+        let writer_ticket = self.fair_writes.ticket(id.clone())?;
         let mut resumed = false;
         let mut pending_pause = false;
         let mut acknowledged = HashSet::new();
@@ -486,6 +875,9 @@ impl TransferService {
                 io.finish();
                 return Ok(());
             }
+            // No prepared payload while waiting for a request/ACK or reading disk.
+            // Keep remaining byte credit, release the unused share immediately.
+            writer_ticket.park();
             let incoming = next_input(io, &mut pause, pausing).await?;
             let frame = match incoming {
                 Input::Pause => {
@@ -505,11 +897,13 @@ impl TransferService {
                 }
                 Input::Frame(frame) => frame,
             };
+            let super::frame_budget::BufferedFrame { frame, _lease } = frame;
             match frame.message {
                 Message::Resume { have, .. } => {
                     let bitmap = ChunkBitmap::from_bytes(manifest.chunk_count(), &have)?;
                     acknowledged.extend(bitmap.present());
                     bytes = bytes_for(manifest, &acknowledged);
+                    self.reset_rate(id, bytes);
                     resumed = true;
                     self.progress(id, bytes).await?;
                     if pending_pause {
@@ -538,11 +932,14 @@ impl TransferService {
                         )
                     })
                     .await?;
-                    io.send(Message::Chunk {
-                        task_id: id.clone(),
-                        index,
-                        data,
-                    })
+                    io.send_chunk(
+                        &writer_ticket,
+                        Message::Chunk {
+                            task_id: id.clone(),
+                            index,
+                            data,
+                        },
+                    )
                     .await?;
                 }
                 Message::ChunkAck { index, .. } => {
@@ -594,9 +991,10 @@ impl TransferService {
                     if streams.len()>=8 {let _=send.reset(4u32.into());let _=recv.stop(4u32.into());continue;}
                     let service=self.clone();let connection=connection.clone();
                     streams.spawn(async move {
-                        let first=tokio::time::timeout(Duration::from_secs(5),protocol::read(&mut recv)).await.map_err(|_|disk::failure("文件流首帧超时"))??;
+                        let buffered=tokio::time::timeout(Duration::from_secs(5),service.frame_budget.read(&mut recv,None)).await.map_err(|_|disk::failure("文件流首帧超时"))??;
+                        let super::frame_budget::BufferedFrame {frame:first,_lease}=buffered;
                         match &first.message {
-                            Message::Offer{..} => service.receive_offer(send,recv,peer,first).await,
+                            Message::Offer{..} => service.receive_offer(send,recv,peer,super::frame_budget::BufferedFrame{frame:first,_lease}).await,
                             Message::ResumeTask{task_id} if first.request_id==1 => {
                                 let id=task_id.clone();let lookup=id.clone();
                                 let checked=service.read_store(move|store|disk::bound_task(store,peer,&lookup)).await;
@@ -613,7 +1011,12 @@ impl TransferService {
                                     let _=send.finish();return Err(remote_error(code));
                                 }
                                 service.wait_previous_attempt(&id).await?;
-                                let (_guard,pause)=match service.claim(peer,&id) {
+                                let slot=match service.reserve_send(peer,id.clone()).await {
+                                    Ok(slot)=>slot,
+                                    Err(error)=> {protocol::write(&mut send,&Frame{request_id:1,message:Message::Error{task_id:id.clone(),code:ErrorCode::Busy}}).await?;let _=send.finish();return Err(error);}
+                                };
+                                let metadata=checked.as_ref().unwrap().directory_details().is_some();
+                                let (_guard,pause)=match service.claim(peer,&id,TaskDirection::Send,metadata,Some(slot.generation)) {
                                     Ok(claim)=>claim,
                                     Err(error)=> {
                                         protocol::write(&mut send,&Frame{request_id:1,message:Message::Error{task_id:id.clone(),code:ErrorCode::Busy}}).await?;
@@ -643,7 +1046,10 @@ impl TransferService {
             .read_store(move |store| disk::bound_task(store, peer, &lookup))
             .await?;
         if record.direction() == TaskDirection::Send {
+            #[cfg(test)]
             return self.send_file(connection, peer, id).await;
+            #[cfg(not(test))]
+            return self.enqueue_tasks(peer, vec![id]).await;
         }
         if !can_continue(&record) {
             return Err(disk::failure("任务当前不能继续"));
@@ -681,11 +1087,15 @@ impl TransferService {
     }
     async fn receive_offer(
         &self,
-        send: SendStream,
+        mut send: SendStream,
         recv: RecvStream,
         peer: NodeId,
-        first: Frame,
+        buffered: super::frame_budget::BufferedFrame,
     ) -> Result<()> {
+        let super::frame_budget::BufferedFrame {
+            frame: first,
+            _lease,
+        } = buffered;
         let Message::Offer {
             task_id,
             relative_path,
@@ -696,15 +1106,25 @@ impl TransferService {
             return Err(disk::failure("需要目录或文件 Offer"));
         };
         if entry == Entry::Directory {
-            return self.receive_directory(send, recv, peer, first).await;
+            return self
+                .receive_directory(
+                    send,
+                    recv,
+                    peer,
+                    super::frame_budget::BufferedFrame {
+                        frame: first,
+                        _lease,
+                    },
+                )
+                .await;
         }
         let Entry::File(manifest) = entry else {
             unreachable!()
         };
-        self.wait_peer_idle(peer).await?;
-        let (_guard, pause) = self.claim(peer, &task_id)?;
-        let mut io = TaskIo::new(send, recv, peer, task_id.clone());
+        let (_guard, pause) = self.claim_receive(&mut send, peer, &task_id, false).await?;
+        let mut io = TaskIo::new(send, recv, peer, task_id.clone(), self.frame_budget.clone());
         io.observe(&first)?;
+        drop(first);
         let root = self.receive_root.lock().unwrap().clone();
         let id = task_id.clone();
         let record = self
@@ -712,6 +1132,7 @@ impl TransferService {
                 disk::accept_entry(store, peer, &id, &root, relative_path, *manifest, group_id)
             })
             .await?;
+        drop(_lease);
         if record.file_details().unwrap().receipt_committed {
             let completed = record.clone();
             if blocking(move || disk::cleanup_staging(&completed))
@@ -759,11 +1180,15 @@ impl TransferService {
     }
     async fn receive_directory(
         &self,
-        send: SendStream,
+        mut send: SendStream,
         recv: RecvStream,
         peer: NodeId,
-        first: Frame,
+        buffered: super::frame_budget::BufferedFrame,
     ) -> Result<()> {
+        let super::frame_budget::BufferedFrame {
+            frame: first,
+            _lease,
+        } = buffered;
         let Message::Offer {
             task_id,
             group_id,
@@ -773,10 +1198,10 @@ impl TransferService {
         else {
             return Err(disk::failure("目录 Offer 非法"));
         };
-        self.wait_peer_idle(peer).await?;
-        let (_guard, _pause) = self.claim(peer, &task_id)?;
-        let mut io = TaskIo::new(send, recv, peer, task_id.clone());
+        let (_guard, _pause) = self.claim_receive(&mut send, peer, &task_id, true).await?;
+        let mut io = TaskIo::new(send, recv, peer, task_id.clone(), self.frame_budget.clone());
         io.observe(&first)?;
+        drop(first);
         let root = self.receive_root.lock().unwrap().clone();
         let id = task_id.clone();
         let record = self
@@ -784,6 +1209,7 @@ impl TransferService {
                 disk::accept_directory(store, peer, &id, &root, relative_path, group_id)
             })
             .await?;
+        drop(_lease);
         let result = async {
             if !record.receipt_committed() {
                 self.state(&task_id, TaskState::Transferring).await?;
@@ -844,6 +1270,7 @@ impl TransferService {
             have,
         })
         .await?;
+        self.reset_rate(id, bytes);
         self.progress(id, bytes).await?;
         loop {
             if bytes == manifest.total_len {
@@ -929,6 +1356,7 @@ impl TransferService {
                 }
                 Input::Frame(frame) => frame,
             };
+            let super::frame_budget::BufferedFrame { frame, _lease } = frame;
             match frame.message {
                 Message::Chunk { index, data, .. } => {
                     if !outstanding.remove(&index) {
@@ -1036,13 +1464,14 @@ fn remote_error(code: ErrorCode) -> Error {
         ErrorCode::SourceChanged => "源文件内容已变化",
         ErrorCode::SourceMissing => "源文件不可用",
         ErrorCode::Storage => "对端存储不可用",
+        ErrorCode::Busy => "对端资源忙，请稍后继续",
         _ => "对端传输中断",
     })
 }
 
 struct TaskIo {
     send: SendStream,
-    incoming: mpsc::Receiver<Result<Frame>>,
+    incoming: mpsc::Receiver<Result<super::frame_budget::BufferedFrame>>,
     reader: JoinHandle<()>,
     gate: TaskProtocol,
     peer: NodeId,
@@ -1054,11 +1483,18 @@ impl Drop for TaskIo {
     }
 }
 impl TaskIo {
-    fn new(send: SendStream, mut recv: RecvStream, peer: NodeId, id: TaskId) -> Self {
-        let (tx, incoming) = mpsc::channel(8);
+    fn new(
+        send: SendStream,
+        mut recv: RecvStream,
+        peer: NodeId,
+        id: TaskId,
+        budget: super::frame_budget::FrameBudget,
+    ) -> Self {
+        let (tx, incoming) = mpsc::channel(2);
+        let task_limit = super::frame_budget::FrameBudget::task_limit();
         let reader = tokio::spawn(async move {
             loop {
-                let frame = protocol::read(&mut recv).await;
+                let frame = budget.read(&mut recv, Some(task_limit.clone())).await;
                 let failed = frame.is_err();
                 if tx.send(frame).await.is_err() || failed {
                     break;
@@ -1087,6 +1523,44 @@ impl TaskIo {
             .await
             .map_err(|_| disk::failure("文件控制帧发送超时"))?
     }
+    async fn send_chunk(
+        &mut self,
+        ticket: &super::queue::WriteTicket,
+        message: Message,
+    ) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let frame = Frame {
+            request_id: self.gate.next_request_id(&self.id, Actor::Local)?,
+            message,
+        };
+        self.gate.observe(self.peer, Actor::Local, &frame)?;
+        let Message::Chunk { data, .. } = &frame.message else {
+            return Err(disk::failure("字节调度仅接受分片数据"));
+        };
+        let encoded = frame.encode()?;
+        // Chunk.data is the final postcard field. Keep framing/control bytes
+        // outside the payload quantum; verify the layout instead of guessing.
+        if !encoded.ends_with(data) {
+            return Err(disk::failure("分片编码布局不受支持"));
+        }
+        let prefix = encoded.len() - data.len();
+        drop(frame);
+        tokio::time::timeout(IDLE_TIMEOUT, async {
+            self.send
+                .write_all(&(encoded.len() as u32).to_le_bytes())
+                .await
+                .map_err(disk::local_error)?;
+            self.send
+                .write_all(&encoded[..prefix])
+                .await
+                .map_err(disk::local_error)?;
+            ticket.write_all(&mut self.send, &encoded[prefix..]).await?;
+            self.send.flush().await.map_err(disk::local_error)?;
+            Ok::<(), Error>(())
+        })
+        .await
+        .map_err(|_| disk::failure("文件数据帧发送超时"))?
+    }
     fn finish(&mut self) {
         let _ = self.send.finish();
     }
@@ -1102,7 +1576,7 @@ impl TaskIo {
 }
 enum Input {
     Pause,
-    Frame(Frame),
+    Frame(super::frame_budget::BufferedFrame),
 }
 async fn next_input(
     io: &mut TaskIo,
@@ -1118,7 +1592,7 @@ async fn next_input(
     tokio::select! {
         biased;
         changed=pause.changed()=> {changed.map_err(|_|disk::failure("暂停控制已关闭"))?;Ok(Input::Pause)}
-        frame=io.incoming.recv()=> {let frame=frame.ok_or_else(||disk::failure("文件流已关闭"))??;io.observe(&frame)?;Ok(Input::Frame(frame))}
+        frame=io.incoming.recv()=> {let frame=frame.ok_or_else(||disk::failure("文件流已关闭"))??;io.observe(&frame.frame)?;Ok(Input::Frame(frame))}
         _=tokio::time::sleep(timeout)=>Err(disk::failure(if pausing.is_some(){"暂停确认超时"}else{"文件传输超时"})),
     }
 }
@@ -1924,6 +2398,358 @@ mod tests {
         for record in pair.b.snapshot().await.unwrap() {
             assert_eq!(record.local_path(), pair.root.join("b-receive"));
         }
+        pair.shutdown().await;
+    }
+    #[tokio::test]
+    async fn reserved_but_unstarted_pause_cancels_nonce_and_preserves_manual_retry() {
+        let pair = Pair::new().await;
+        let (id, _) = pair.select(64 * 1024).await;
+        pair.a
+            .enqueue_tasks(pair.ib, vec![id.clone()])
+            .await
+            .unwrap();
+        assert!(pair.a.dispatch_ready(&HashMap::new()).is_empty());
+        assert_eq!(pair.a.queue_metrics().pending, 1);
+        let connections = HashMap::from([(pair.ib, pair.ca.clone())]);
+        let old = pair.a.dispatch_ready(&connections).pop().unwrap();
+        assert_eq!(pair.a.queue_metrics().active_files, 1);
+        pair.a.pause_task(id.clone()).await.unwrap();
+        assert_eq!(
+            pair.a.task(id.clone()).await.unwrap().state(),
+            TaskState::Paused
+        );
+        assert_eq!(pair.a.queue_metrics().active_files, 0);
+        // A new attempt may be reserved before the old future even starts.
+        pair.a
+            .enqueue_tasks(pair.ib, vec![id.clone()])
+            .await
+            .unwrap();
+        let retry = pair.a.dispatch_ready(&connections).pop().unwrap();
+        assert!(pair.a.execute_queued(old, pair.ca.clone()).await.is_err());
+        assert_eq!(pair.a.queue_metrics().active_files, 1);
+        pair.a.execute_queued(retry, pair.ca.clone()).await.unwrap();
+        assert_eq!(
+            pair.a.task(id.clone()).await.unwrap().state(),
+            TaskState::Completed
+        );
+        assert_eq!(pair.b.task(id).await.unwrap().state(), TaskState::Completed);
+        pair.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn real_queue_runs_one_two_three_files_on_the_same_authenticated_peer() {
+        for limit in 1..=3 {
+            let pair = Pair::new().await;
+            pair.a.set_send_limit(limit).unwrap();
+            let connections = HashMap::from([(pair.ib, pair.ca.clone())]);
+            let mut ids = Vec::new();
+            for index in 0..4 {
+                let path = pair.root.join(format!("queued-{index}.bin"));
+                fs::write(&path, vec![index as u8; 96 * 1024]).unwrap();
+                ids.push(pair.a.select_file(pair.ib, path).await.unwrap());
+            }
+            pair.a.enqueue_tasks(pair.ib, ids.clone()).await.unwrap();
+            let first = pair.a.dispatch_ready(&connections);
+            assert_eq!(first.len(), limit as usize);
+            assert_eq!(pair.a.queue_metrics().pending, 4 - limit as usize);
+            let mut running = JoinSet::new();
+            for scheduled in first {
+                let service = pair.a.clone();
+                let connection = pair.ca.clone();
+                running.spawn(async move { service.execute_queued(scheduled, connection).await });
+            }
+            while let Some(result) = running.join_next().await {
+                result.unwrap().unwrap();
+                for scheduled in pair.a.dispatch_ready(&connections) {
+                    let service = pair.a.clone();
+                    let connection = pair.ca.clone();
+                    running
+                        .spawn(async move { service.execute_queued(scheduled, connection).await });
+                }
+                assert!(pair.a.queue_metrics().active_files <= limit as usize);
+            }
+            for id in ids {
+                assert!(pair.a.task(id.clone()).await.unwrap().receipt_committed());
+                assert!(pair.b.task(id).await.unwrap().receipt_committed());
+            }
+            assert_eq!(pair.a.queue_metrics().pending, 0);
+            assert_eq!(pair.a.queue_metrics().active_files, 0);
+            assert!(pair.a.set_send_limit(0).is_err());
+            assert!(pair.a.set_send_limit(4).is_err());
+            pair.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn independent_receive_cap_reports_busy_before_creating_a_task_and_is_retryable() {
+        let pair = Pair::new().await;
+        let mut receive_guards = Vec::new();
+        for _ in 0..3 {
+            receive_guards.push(
+                pair.b
+                    .claim(
+                        pair.ia,
+                        &TaskId::generate(),
+                        TaskDirection::Receive,
+                        false,
+                        None,
+                    )
+                    .unwrap(),
+            );
+        }
+        // Receiving directory metadata has its own budget, as does sending.
+        let metadata = pair
+            .b
+            .claim(
+                pair.ia,
+                &TaskId::generate(),
+                TaskDirection::Receive,
+                true,
+                None,
+            )
+            .unwrap();
+        assert!(
+            pair.b
+                .claim(
+                    pair.ia,
+                    &TaskId::generate(),
+                    TaskDirection::Receive,
+                    false,
+                    None
+                )
+                .is_err()
+        );
+        let (id, bytes) = pair.select(64 * 1024).await;
+        pair.a
+            .enqueue_tasks(pair.ib, vec![id.clone()])
+            .await
+            .unwrap();
+        let connections = HashMap::from([(pair.ib, pair.ca.clone())]);
+        let scheduled = pair.a.dispatch_ready(&connections).pop().unwrap();
+        assert!(
+            pair.a
+                .execute_queued(scheduled, pair.ca.clone())
+                .await
+                .is_err()
+        );
+        let rejected = pair.a.task(id.clone()).await.unwrap();
+        assert_eq!(rejected.state(), TaskState::Failed);
+        assert_eq!(
+            rejected.diagnostic().unwrap().code(),
+            TaskErrorCode::PeerBusy
+        );
+        assert!(can_continue(&rejected));
+        assert!(pair.b.snapshot().await.unwrap().is_empty());
+        assert!(!pair.root.join("b-receive/文件.bin").exists());
+        receive_guards.pop();
+        drop(metadata);
+        pair.a
+            .enqueue_tasks(pair.ib, vec![id.clone()])
+            .await
+            .unwrap();
+        let scheduled = pair.a.dispatch_ready(&connections).pop().unwrap();
+        pair.a
+            .execute_queued(scheduled, pair.ca.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read(pair.root.join("b-receive/文件.bin")).unwrap(),
+            bytes
+        );
+        drop(receive_guards);
+        pair.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn queued_pause_and_invalid_batch_leave_no_unowned_or_rebound_task() {
+        let pair = Pair::new().await;
+        let (id, _) = pair.select(1024).await;
+        pair.a
+            .enqueue_tasks(pair.ib, vec![id.clone()])
+            .await
+            .unwrap();
+        pair.a.pause_task(id.clone()).await.unwrap();
+        assert_eq!(pair.a.queue_metrics().pending, 0);
+        assert_eq!(
+            pair.a.task(id.clone()).await.unwrap().state(),
+            TaskState::Paused
+        );
+        assert!(
+            pair.a
+                .enqueue_tasks(pair.ib, vec![id.clone(), TaskId::generate()])
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            pair.a.task(id.clone()).await.unwrap().state(),
+            TaskState::Paused
+        );
+        assert!(
+            pair.a
+                .enqueue_tasks(pair.ia, vec![id.clone()])
+                .await
+                .is_err()
+        );
+        let view = pair.a.presentation().await.unwrap();
+        assert_eq!(view.bytes_per_second[&id], 0.0);
+        assert_eq!(view.queue.pending, 0);
+        pair.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn directory_group_counts_partial_failure_without_claiming_complete() {
+        let pair = Pair::new().await;
+        let source = pair.root.join("group");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("good.bin"), vec![7; 3000]).unwrap();
+        fs::write(source.join("missing.bin"), vec![8; 4000]).unwrap();
+        let ids = pair
+            .a
+            .select_directory(pair.ib, source.clone())
+            .await
+            .unwrap();
+        let group = pair
+            .a
+            .task(ids[0].clone())
+            .await
+            .unwrap()
+            .group_id()
+            .unwrap()
+            .clone();
+        fs::remove_file(source.join("missing.bin")).unwrap();
+        pair.a.enqueue_tasks(pair.ib, ids).await.unwrap();
+        let connections = HashMap::from([(pair.ib, pair.ca.clone())]);
+        let mut failures = 0;
+        loop {
+            let scheduled = pair.a.dispatch_ready(&connections);
+            if scheduled.is_empty() {
+                break;
+            }
+            for scheduled in scheduled {
+                failures += usize::from(
+                    pair.a
+                        .execute_queued(scheduled, pair.ca.clone())
+                        .await
+                        .is_err(),
+                );
+            }
+        }
+        assert_eq!(failures, 1);
+        let view = pair.a.presentation().await.unwrap();
+        let aggregate = &view.groups[&group];
+        assert_eq!(aggregate.children, 3);
+        assert_eq!(aggregate.completed, 2);
+        assert_eq!(aggregate.failed, 1);
+        assert_eq!(aggregate.total_bytes, 7000);
+        assert_eq!(aggregate.confirmed_bytes, 3000);
+        assert!(!aggregate.complete);
+        assert_eq!(
+            fs::read(pair.root.join("b-receive/group/good.bin")).unwrap(),
+            vec![7; 3000]
+        );
+        pair.shutdown().await;
+    }
+    #[tokio::test]
+    async fn blocked_file_does_not_stop_ready_file_and_pause_releases_pending_slot() {
+        let pair = Pair::new().await;
+        pair.a.set_send_limit(2).unwrap();
+        let connections = HashMap::from([(pair.ib, pair.ca.clone())]);
+        let (slow, _) = pair.select(4 * 1024 * 1024).await;
+        let mut others = Vec::new();
+        for index in 0..2 {
+            let path = pair.root.join(format!("independent-{index}.bin"));
+            fs::write(&path, vec![index as u8; 96 * 1024]).unwrap();
+            others.push(pair.a.select_file(pair.ib, path).await.unwrap());
+        }
+        pair.a
+            .enqueue_tasks(
+                pair.ib,
+                vec![slow.clone(), others[0].clone(), others[1].clone()],
+            )
+            .await
+            .unwrap();
+        let (reached, release) = pair.gate();
+        // Start only the first selected executor, so the injected disk gate
+        // deterministically belongs to it rather than a second racing stream.
+        let mut selected = pair.a.dispatch_ready(&connections);
+        let first = selected.remove(0);
+        let service = pair.a.clone();
+        let conn = pair.ca.clone();
+        let blocked = tokio::spawn(async move { service.execute_queued(first, conn).await });
+        tokio::time::timeout(Duration::from_secs(10), reached)
+            .await
+            .unwrap()
+            .unwrap();
+        pair.a
+            .execute_queued(selected.pop().unwrap(), pair.ca.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            pair.a.task(others[0].clone()).await.unwrap().state(),
+            TaskState::Completed
+        );
+        assert!(!blocked.is_finished());
+        pair.a.pause_task(slow.clone()).await.unwrap();
+        release.send(()).unwrap();
+        blocked.await.unwrap().unwrap();
+        assert_eq!(
+            pair.a.task(slow.clone()).await.unwrap().state(),
+            TaskState::Paused
+        );
+        assert_eq!(pair.a.queue_metrics().active_files, 0);
+        let pending = pair.a.dispatch_ready(&connections).pop().unwrap();
+        assert_eq!(pending.entry.id, others[1]);
+        pair.a
+            .execute_queued(pending, pair.ca.clone())
+            .await
+            .unwrap();
+        let presentation = pair.a.presentation().await.unwrap();
+        assert_eq!(presentation.bytes_per_second[&slow], 0.0);
+        assert_eq!(pair.a.task(slow).await.unwrap().state(), TaskState::Paused);
+        pair.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bounded_event_overflow_is_repaired_by_authoritative_lifecycle_snapshot() {
+        let pair = Pair::new().await;
+        let path = pair.root.join("snapshot.bin");
+        fs::write(&path, b"snapshot").unwrap();
+        let peer = pair.ib;
+        let ids = pair
+            .a
+            .store(move |store| {
+                let records = (0..140)
+                    .map(|_| {
+                        disk::scan_selected_file(
+                            peer,
+                            path.clone(),
+                            &super::super::files::ScanCancellation::default(),
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let ids = store.create_selection(records).map_err(disk::local_error)?;
+                for id in &ids {
+                    disk::transition(store, id, TaskState::Queued)?;
+                }
+                Ok(ids)
+            })
+            .await
+            .unwrap();
+        pair.a.interrupt_all().await.unwrap();
+        let view = pair.a.presentation().await.unwrap();
+        assert!(view.resync_required);
+        assert_eq!(view.events.len(), 256);
+        assert_eq!(view.tasks.len(), ids.len());
+        assert!(
+            view.tasks
+                .iter()
+                .all(|task| task.state() == TaskState::Interrupted)
+        );
+        assert_eq!(view.queue.pending, 0);
+        let next = pair.a.presentation().await.unwrap();
+        assert!(!next.resync_required);
+        assert!(next.events.is_empty());
+        assert_eq!(next.tasks.len(), ids.len());
         pair.shutdown().await;
     }
 }
