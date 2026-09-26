@@ -136,6 +136,26 @@ def pe_imports(path):
     raise ValueError('unterminated PE import table')
 
 
+def macos_minimum(load_commands):
+    minimum = []
+    for block in re.split(r'Load command \d+', load_commands):
+        if re.search(r'^\s*cmd\s+LC_BUILD_VERSION\s*$', block, re.MULTILINE):
+            # LC_BUILD_VERSION also contains linker-tool `version` records. Only
+            # `minos` is the deployment minimum; sdk/tool versions are unrelated.
+            matches = re.findall(r'^\s*minos\s+(\d+\.\d+(?:\.\d+)?)\s*$', block, re.MULTILINE)
+        elif re.search(r'^\s*cmd\s+LC_VERSION_MIN_MACOSX\s*$', block, re.MULTILINE):
+            matches = re.findall(r'^\s*version\s+(\d+\.\d+(?:\.\d+)?)\s*$', block, re.MULTILINE)
+        else:
+            continue
+        if len(matches) != 1:
+            raise ValueError('missing/ambiguous Mach-O deployment minimum')
+        minimum.extend(matches)
+    versions = [tuple(map(int, (v.split('.') + ['0', '0'])[:3])) for v in minimum]
+    if not versions or any(v > (13, 0, 0) for v in versions):
+        raise ValueError('binary deployment minimum exceeds the product macOS13 minimum')
+    return minimum
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
@@ -204,13 +224,7 @@ def main():
         inspection['dynamic_dependencies'] = run(['otool', '-L', str(executable)])
         inspection['mach_o_load_commands'] = run(['otool', '-l', str(executable)])
         # Read only the actual build/min-version load command, not framework versions.
-        blocks = re.split(r'Load command \d+', inspection['mach_o_load_commands'])
-        minimum = []
-        for block in blocks:
-            if 'LC_BUILD_VERSION' in block or 'LC_VERSION_MIN_MACOSX' in block:
-                minimum += re.findall(r'(?:minos|version)\s+(\d+\.\d+(?:\.\d+)?)', block)
-        if not minimum or any(tuple(map(int, v.split('.'))) > (13, 0, 0) for v in minimum):
-            raise ValueError('binary deployment minimum exceeds the product macOS13 minimum')
+        inspection['deployment_minimum_versions'] = macos_minimum(inspection['mach_o_load_commands'])
     else:
         signature_env = os.environ.copy()
         signature_env['P2P_PACKAGE_EXECUTABLE'] = str(executable)

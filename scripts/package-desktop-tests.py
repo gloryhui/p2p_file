@@ -65,6 +65,27 @@ class Boundaries(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'unmapped'):
                 pack.pe_imports(file)
 
+    def test_macos_minimum_is_not_the_sdk_or_linker_tool_version(self):
+        load = """Load command 10
+              cmd LC_BUILD_VERSION
+          cmdsize 32
+         platform macos
+            minos 13.0
+              sdk 26.0
+           ntools 1
+             tool ld
+          version 1167.5
+        """
+        self.assertEqual(pack.macos_minimum(load), ['13.0'])
+        with self.assertRaisesRegex(ValueError, 'exceeds'):
+            pack.macos_minimum(load.replace('minos 13.0', 'minos 14.0'))
+        with self.assertRaisesRegex(ValueError, 'missing'):
+            pack.macos_minimum(load.replace('minos 13.0', 'tool_version 13.0'))
+        legacy = 'Load command 7\n cmd LC_VERSION_MIN_MACOSX\n version 13.0.0\n sdk 26.0\n'
+        self.assertEqual(pack.macos_minimum(legacy), ['13.0.0'])
+        with self.assertRaisesRegex(ValueError, 'exceeds'):
+            pack.macos_minimum(legacy.replace('13.0.0', '13.0.1'))
+
     def test_paths_reject_traversal_and_windows_forms(self):
         for name in ['../identity.key', '/etc/passwd', 'C:/private', 'folder\\..\\secret']:
             with self.assertRaises(ValueError):
