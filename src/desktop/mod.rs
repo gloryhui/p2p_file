@@ -24,6 +24,8 @@ mod task_model;
 mod task_recovery;
 #[allow(dead_code)] // Durable mutation API is intentionally staged ahead of its UI consumer.
 mod task_store;
+mod transfer;
+mod transfer_files;
 
 use std::collections::HashMap;
 use std::{ops::Range, path::PathBuf};
@@ -811,7 +813,7 @@ struct DesktopShell {
     can_save_settings: bool,
     is_saving_settings: bool,
     _instance_lock: InstanceLock,
-    _task_store: Option<TaskStore>,
+    transfer_service: Option<transfer::TransferService>,
     network_session: Option<session::DesktopSessionHandle>,
     network_status: SharedString,
     peer_status: SharedString,
@@ -837,7 +839,7 @@ impl DesktopShell {
 
     fn start_network_session(
         &mut self,
-        config: session::DesktopSessionConfig,
+        mut config: session::DesktopSessionConfig,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(identity) = self.identity.clone() else {
@@ -845,6 +847,7 @@ impl DesktopShell {
             self.set_status(self.network_status.clone(), cx);
             return false;
         };
+        config.transfer = self.transfer_service.clone();
         match session::spawn(identity, config) {
             Ok((handle, mut session_events)) => {
                 self.network_epoch = self.network_epoch.wrapping_add(1);
@@ -1029,6 +1032,7 @@ impl DesktopShell {
         draft.signal_port = self.signal_port.read(cx).content.to_string();
         let config_file = self.config_file.clone();
         let signal_server = signal_server_spec(&draft.signal_host, &draft.signal_port);
+        let saved_receive_root = draft.receive_directory.clone();
         let background = cx.background_executor().clone();
         self.is_saving_settings = true;
         self.set_status("正在验证并保存设置…", cx);
@@ -1043,6 +1047,11 @@ impl DesktopShell {
                     match result {
                         Ok(()) => {
                             shell.config_note = "设置已保存；接收目录写能力检查通过。".into();
+                            if let (Some(service), Some(root)) =
+                                (&shell.transfer_service, &saved_receive_root)
+                            {
+                                service.set_receive_root(root.clone());
+                            }
                             let mut started = false;
                             if let Some(session) = shell
                                 .network_session
@@ -1722,6 +1731,12 @@ pub fn run() {
         } else {
             identity_status.clone()
         };
+        let transfer_service = task_store.map(|store| {
+            transfer::TransferService::new(
+                store,
+                settings.receive_directory.clone().unwrap_or_default(),
+            )
+        });
         let initial_host = settings.signal_host.clone();
         let initial_port = settings.signal_port.clone();
         let startup_session_config = if has_saved_network_config && identity.is_some() {
@@ -1776,7 +1791,7 @@ pub fn run() {
                     can_save_settings,
                     is_saving_settings: false,
                     _instance_lock: instance_lock,
-                    _task_store: task_store,
+                    transfer_service,
                     network_session: None,
                     network_status: initial_network_status.into(),
                     peer_status: "尚未连接对端".into(),

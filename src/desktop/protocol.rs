@@ -20,7 +20,8 @@ pub const CAP_TASK_PROTOCOL: u64 = 1;
 pub const CAP_RELATIVE_ENTRIES: u64 = 2;
 pub const CAP_PAUSE_RESUME: u64 = 4;
 pub const CAP_SPEED_OWNERSHIP: u64 = 8;
-pub const REQUIRED_CAPABILITIES: u64 = 15;
+pub const CAP_FILE_TRANSFER: u64 = 16;
+pub const REQUIRED_CAPABILITIES: u64 = 15 | CAP_FILE_TRANSFER;
 pub const MAX_FRAME_BYTES: u32 = 4 * 1024 * 1024;
 pub const MAX_CHUNKS: usize = 65_536;
 pub const MAX_TASKS_PER_PEER: usize = 128;
@@ -154,6 +155,19 @@ pub enum Message {
         code: ErrorCode,
     },
     Speed(SpeedControl),
+    RequestChunk {
+        task_id: TaskId,
+        index: u32,
+    },
+    Chunk {
+        task_id: TaskId,
+        index: u32,
+        data: Vec<u8>,
+    },
+    ChunkAck {
+        task_id: TaskId,
+        index: u32,
+    },
 }
 
 impl Message {
@@ -167,7 +181,10 @@ impl Message {
             | Self::Paused { task_id, .. }
             | Self::ResumeTask { task_id }
             | Self::Completed { task_id, .. }
-            | Self::Error { task_id, .. } => Some(task_id),
+            | Self::Error { task_id, .. }
+            | Self::RequestChunk { task_id, .. }
+            | Self::Chunk { task_id, .. }
+            | Self::ChunkAck { task_id, .. } => Some(task_id),
         }
     }
 
@@ -179,6 +196,9 @@ impl Message {
                 ..
             } => entry.validate(relative_path),
             Self::Speed(control) => control.validate(),
+            Self::Chunk { data, .. } if data.len() > 1024 * 1024 => {
+                Err(invalid("桌面数据分片超限"))
+            }
             Self::Resume { have, .. } if have.len() > MAX_CHUNKS.div_ceil(8) => {
                 Err(invalid("桌面恢复位图超限"))
             }
@@ -364,6 +384,15 @@ impl TaskProtocol {
         self.tasks.get(task).map(|binding| binding.state)
     }
 
+    pub fn next_request_id(&self, task: &TaskId, actor: Actor) -> Result<u64> {
+        self.tasks
+            .get(task)
+            .map_or(Some(1), |binding| {
+                binding.sequence[actor.index()].checked_add(1)
+            })
+            .ok_or_else(|| invalid("桌面请求序号已耗尽"))
+    }
+
     /// Caller restores only task IDs already authorized in its durable store.
     pub fn restore(
         &mut self,
@@ -449,6 +478,28 @@ impl TaskProtocol {
             return Err(invalid("重复或乱序的桌面任务请求"));
         }
         match &frame.message {
+            Message::RequestChunk { index, .. } | Message::ChunkAck { index, .. } => {
+                if actor == binding.sender
+                    || *index as usize >= binding.chunks
+                    || !matches!(
+                        binding.state,
+                        WireTaskState::Transferring | WireTaskState::Pausing
+                    )
+                {
+                    return Err(invalid("桌面分片请求方向、索引或状态不符"));
+                }
+            }
+            Message::Chunk { index, .. } => {
+                if actor != binding.sender
+                    || *index as usize >= binding.chunks
+                    || !matches!(
+                        binding.state,
+                        WireTaskState::Transferring | WireTaskState::Pausing
+                    )
+                {
+                    return Err(invalid("桌面分片方向、索引或状态不符"));
+                }
+            }
             Message::Resume {
                 root_hash, have, ..
             } => {
@@ -507,7 +558,9 @@ impl TaskProtocol {
                     || binding.root != *root_hash
                     || !matches!(
                         binding.state,
-                        WireTaskState::Transferring | WireTaskState::Pausing
+                        WireTaskState::Offered
+                            | WireTaskState::Transferring
+                            | WireTaskState::Pausing
                     )
                 {
                     return Err(invalid("完成回执身份、方向或任务状态不符"));
@@ -748,7 +801,19 @@ mod tests {
                 capabilities: REQUIRED_CAPABILITIES,
             },
         };
-        assert_eq!(hello.encode().unwrap(), b"P2PD\x01\x00\x00\x01\x0f");
+        assert_eq!(hello.encode().unwrap(), b"P2PD\x01\x00\x00\x01\x1f");
+        assert_eq!(
+            Frame {
+                request_id: 0,
+                message: Message::Hello {
+                    version: 1,
+                    capabilities: 15
+                }
+            }
+            .encode()
+            .unwrap(),
+            b"P2PD\x01\x00\x00\x01\x0f"
+        );
         assert_eq!(
             Frame {
                 request_id: 0,
@@ -883,6 +948,15 @@ mod tests {
     #[tokio::test]
     async fn unsupported_version_missing_capability_and_old_cli_are_explicit_errors() {
         for response in [
+            Frame {
+                request_id: 0,
+                message: Message::Hello {
+                    version: VERSION,
+                    capabilities: REQUIRED_CAPABILITIES & !CAP_FILE_TRANSFER,
+                },
+            }
+            .encode()
+            .unwrap(),
             Frame {
                 request_id: 0,
                 message: Message::Hello {
@@ -1209,5 +1283,97 @@ mod tests {
         assert!(coordinator.finish(higher, &lease).is_err());
         coordinator.finish(higher, &new_lease).unwrap();
         assert!(coordinator.can_start_file());
+    }
+    #[test]
+    fn appended_chunk_frames_preserve_tags_and_enforce_direction_index_and_size() {
+        let request = Frame {
+            request_id: 2,
+            message: Message::RequestChunk {
+                task_id: task(),
+                index: 0,
+            },
+        };
+        let mut golden = b"P2PD
+ "
+        .to_vec();
+        golden.extend_from_slice(task().as_str().as_bytes());
+        golden.push(0);
+        assert_eq!(request.encode().unwrap(), golden);
+        assert_eq!(Frame::decode(&golden).unwrap(), request);
+        let peer = Identity::generate().node_id();
+        let root = ChunkHash::of(b"one");
+        let mut gate = TaskProtocol::new(peer);
+        gate.restore(task(), Actor::Local, root, 1, false).unwrap();
+        gate.observe(
+            peer,
+            Actor::Remote,
+            &Frame {
+                request_id: 1,
+                message: Message::Resume {
+                    task_id: task(),
+                    root_hash: root,
+                    have: vec![0],
+                },
+            },
+        )
+        .unwrap();
+        assert!(
+            gate.observe(
+                peer,
+                Actor::Local,
+                &Frame {
+                    request_id: 1,
+                    ..request.clone()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            gate.observe(
+                peer,
+                Actor::Remote,
+                &Frame {
+                    request_id: 2,
+                    message: Message::RequestChunk {
+                        task_id: task(),
+                        index: 1
+                    }
+                }
+            )
+            .is_err()
+        );
+        gate.observe(peer, Actor::Remote, &request).unwrap();
+        let chunk = Frame {
+            request_id: 1,
+            message: Message::Chunk {
+                task_id: task(),
+                index: 0,
+                data: vec![1],
+            },
+        };
+        assert!(
+            gate.observe(
+                peer,
+                Actor::Remote,
+                &Frame {
+                    request_id: 3,
+                    ..chunk.clone()
+                }
+            )
+            .is_err()
+        );
+        gate.observe(peer, Actor::Local, &chunk).unwrap();
+        assert!(
+            Frame {
+                request_id: 2,
+                message: Message::Chunk {
+                    task_id: task(),
+                    index: 0,
+                    data: vec![0; 1024 * 1024 + 1]
+                }
+            }
+            .encode()
+            .is_err()
+        );
     }
 }

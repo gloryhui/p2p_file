@@ -212,6 +212,38 @@ impl TaskStore {
         Ok(())
     }
 
+    pub(crate) fn prepare_publication(&mut self, id: &TaskId) -> Result<(), TaskStoreError> {
+        self.ensure_healthy()?;
+        let mut candidate = self.tasks.clone();
+        candidate
+            .iter_mut()
+            .find(|t| t.task_id() == id)
+            .ok_or(TaskStoreError::TaskNotFound)?
+            .prepare_publication()?;
+        self.commit_tasks(candidate)
+    }
+
+    pub(crate) fn commit_receipt(&mut self, id: &TaskId, now: i64) -> Result<(), TaskStoreError> {
+        self.ensure_healthy()?;
+        let mut candidate = self.tasks.clone();
+        let task = candidate
+            .iter_mut()
+            .find(|t| t.task_id() == id)
+            .ok_or(TaskStoreError::TaskNotFound)?;
+        let from = task.state();
+        task.commit_receipt(now)?;
+        self.commit_tasks(candidate)?;
+        self.events.record(
+            id.clone(),
+            now,
+            TaskEventKind::StateChanged {
+                from,
+                to: TaskState::Completed,
+            },
+        );
+        Ok(())
+    }
+
     /// Progress is an in-memory display hint. Call `flush_progress_hints`
     /// explicitly at a coalesced boundary; never fsync once per chunk.
     pub(crate) fn set_progress_hint(
@@ -369,6 +401,12 @@ where
     let bytes = serde_json::to_vec(snapshot).map_err(|error| {
         SnapshotWriteError::BeforeReplace(io::Error::new(io::ErrorKind::InvalidData, error))
     })?;
+    if bytes.len() as u64 > MAX_STORE_BYTES {
+        return Err(SnapshotWriteError::BeforeReplace(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "task store exceeds its size limit",
+        )));
+    }
     let (temp_path, mut temp_file) = create_unique_temp(
         parent,
         path.file_name().ok_or_else(|| {

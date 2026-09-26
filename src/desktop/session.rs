@@ -44,6 +44,7 @@ fn is_current_signal_generation(current: u64, result_generation: u64) -> bool {
 pub struct DesktopSessionConfig {
     pub signal_server: String,
     pub network: DesktopNetworkConfig,
+    pub(crate) transfer: Option<super::transfer::TransferService>,
 }
 
 impl DesktopSessionConfig {
@@ -51,6 +52,7 @@ impl DesktopSessionConfig {
         Self {
             signal_server: signal_server.into(),
             network: DesktopNetworkConfig::default(),
+            transfer: None,
         }
     }
 }
@@ -109,6 +111,33 @@ impl DesktopSessionHandle {
             .map_err(|error| format!("网络会话暂时无法接收配置变更：{error}"))
     }
 
+    #[allow(dead_code)] // T010 product controls call this tested backend command.
+    pub fn send_file(
+        &self,
+        peer: NodeId,
+        source: std::path::PathBuf,
+    ) -> std::result::Result<(), String> {
+        self.commands
+            .try_send(SessionCommand::SendFile { peer, source })
+            .map_err(|_| "传输命令队列已满或会话已关闭".into())
+    }
+    #[allow(dead_code)] // T010 product controls call this tested backend command.
+    pub fn pause_task(&self, id: super::task_model::TaskId) -> std::result::Result<(), String> {
+        self.commands
+            .try_send(SessionCommand::PauseTask(id))
+            .map_err(|_| "传输命令队列已满或会话已关闭".into())
+    }
+    #[allow(dead_code)] // T010 product controls call this tested backend command.
+    pub fn resume_task(
+        &self,
+        peer: NodeId,
+        id: super::task_model::TaskId,
+    ) -> std::result::Result<(), String> {
+        self.commands
+            .try_send(SessionCommand::ResumeTask { peer, id })
+            .map_err(|_| "传输命令队列已满或会话已关闭".into())
+    }
+
     pub fn is_running(&self) -> bool {
         !self.commands.is_closed()
     }
@@ -119,6 +148,18 @@ impl DesktopSessionHandle {
 }
 
 enum SessionCommand {
+    #[allow(dead_code)] // T010 product controls.
+    SendFile {
+        peer: NodeId,
+        source: std::path::PathBuf,
+    },
+    #[allow(dead_code)] // T010 product controls.
+    PauseTask(super::task_model::TaskId),
+    #[allow(dead_code)] // T010 product controls.
+    ResumeTask {
+        peer: NodeId,
+        id: super::task_model::TaskId,
+    },
     ConnectPeer(NodeId),
     ReconfigureSignal(String),
     #[cfg(test)]
@@ -163,35 +204,38 @@ pub fn spawn(
     let thread_events = event_tx.clone();
     let (stop, mut stopped) = watch::channel(false);
     let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let thread = std::thread::Builder::new()
-        .name("p2p-desktop-network".into())
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build();
-            match runtime {
-                Ok(runtime) => {
-                    runtime.block_on(async move {
+    let thread =
+        std::thread::Builder::new()
+            .name("p2p-desktop-network".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build();
+                match runtime {
+                    Ok(runtime) => {
+                        runtime.block_on(async move {
+                        let transfer = config.transfer.clone();
                         tokio::select! {
                             biased;
                             _ = stopped.changed() => {},
                             _ = event_tx.closed() => {},
                             _ = run_session(identity, config, command_rx, event_tx.clone()) => {},
                         }
+                        if let Some(transfer) = transfer { let _ = transfer.interrupt_all().await; }
                     });
-                    runtime.shutdown_timeout(Duration::from_secs(1));
+                        runtime.shutdown_timeout(Duration::from_secs(1));
+                    }
+                    Err(error) => {
+                        let _ = thread_events.blocking_send(SessionEvent::Lifecycle(
+                            NetworkLifecycle::Failed {
+                                detail: format!("创建网络运行时失败：{error}"),
+                            },
+                        ));
+                    }
                 }
-                Err(error) => {
-                    let _ = thread_events.blocking_send(SessionEvent::Lifecycle(
-                        NetworkLifecycle::Failed {
-                            detail: format!("创建网络运行时失败：{error}"),
-                        },
-                    ));
-                }
-            }
-            let _ = done_tx.send(());
-        })?;
+                let _ = done_tx.send(());
+            })?;
     Ok((
         DesktopSessionHandle {
             commands: command_tx,
@@ -238,6 +282,7 @@ async fn run_session(
 
     let semaphore = Arc::new(Semaphore::new(MAX_PENDING_PEERS));
     let mut peer_tasks = JoinSet::new();
+    let transfer_commands = Arc::new(Semaphore::new(3));
     let mut peers = PeerRegistry::default();
     let mut connections: HashMap<NodeId, (u64, quinn::Connection)> = HashMap::new();
     let mut pending_inbound: HashMap<(NodeId, u64), oneshot::Sender<quinn::Incoming>> =
@@ -300,6 +345,67 @@ async fn run_session(
             Wake::Command(None) => {
                 session_shutdown = true;
             }
+            Wake::Command(Some(SessionCommand::PauseTask(id))) => {
+                if let Some(service) = &config.transfer
+                    && let Err(error) = service.pause(&id)
+                {
+                    let _ = events
+                        .send(SessionEvent::Diagnostic(error.to_string()))
+                        .await;
+                }
+            }
+            Wake::Command(Some(
+                command @ (SessionCommand::SendFile { .. } | SessionCommand::ResumeTask { .. }),
+            )) => {
+                let peer = match &command {
+                    SessionCommand::SendFile { peer, .. }
+                    | SessionCommand::ResumeTask { peer, .. } => *peer,
+                    _ => unreachable!(),
+                };
+                let Some(service) = config.transfer.clone() else {
+                    let _ = events
+                        .send(SessionEvent::Diagnostic("任务存储尚未就绪".into()))
+                        .await;
+                    continue;
+                };
+                let Some((_, connection)) = connections.get(&peer) else {
+                    let _ = events
+                        .send(SessionEvent::Diagnostic("请先连接任务绑定的对端".into()))
+                        .await;
+                    continue;
+                };
+                let connection = connection.clone();
+                let Ok(permit) = transfer_commands.clone().try_acquire_owned() else {
+                    let _ = events
+                        .send(SessionEvent::Diagnostic(
+                            "文件后台任务已达上限，请稍后重试".into(),
+                        ))
+                        .await;
+                    continue;
+                };
+                let events = events.clone();
+                peer_tasks.spawn(async move {
+                    let _permit = permit;
+                    let result = async {
+                        match command {
+                            SessionCommand::SendFile { source, .. } => {
+                                let id = service.select_file(peer, source).await?;
+                                service.send_file(&connection, peer, id).await
+                            }
+                            SessionCommand::ResumeTask { id, .. } => {
+                                service.resume(&connection, peer, id).await
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    .await;
+                    if let Err(error) = result {
+                        let _ = events
+                            .send(SessionEvent::Diagnostic(error.to_string()))
+                            .await;
+                    }
+                });
+            }
             Wake::Command(Some(SessionCommand::ConnectPeer(peer))) => {
                 if peer == local_node {
                     let _ = events
@@ -350,6 +456,9 @@ async fn run_session(
                 // and authenticated peers. An involuntary outage below preserves them.
                 peer_tasks.abort_all();
                 while peer_tasks.join_next().await.is_some() {}
+                if let Some(service) = &config.transfer {
+                    let _ = service.interrupt_all().await;
+                }
                 pending_inbound.clear();
                 queued_lookups.clear();
                 for (_, (_, connection)) in connections.drain() {
@@ -561,6 +670,19 @@ async fn run_session(
                 connections.insert(peer, (generation, connection.clone()));
                 emit_peer_state(&events, peer, generation, PeerLifecycle::Connected).await;
                 emit_lifecycle(&events, NetworkLifecycle::Connected { peer }).await;
+                if let Some(service) = config.transfer.clone() {
+                    let transfer_connection = connection.clone();
+                    let transfer_events = events.clone();
+                    peer_tasks.spawn(async move {
+                        if service.serve_peer(transfer_connection, peer).await.is_err() {
+                            let _ = transfer_events
+                                .send(SessionEvent::Diagnostic(
+                                    "文件会话已中断，任务可手动继续".into(),
+                                ))
+                                .await;
+                        }
+                    });
+                }
                 let closed_inputs = input_tx.clone();
                 peer_tasks.spawn(async move {
                     let detail = connection.closed().await.to_string();
@@ -1054,6 +1176,7 @@ mod tests {
     fn local_config(signal_server: SocketAddr) -> DesktopSessionConfig {
         DesktopSessionConfig {
             signal_server: signal_server.to_string(),
+            transfer: None,
             network: DesktopNetworkConfig {
                 local_port: 0,
                 stun_servers: Vec::new(),
@@ -1495,5 +1618,62 @@ mod tests {
             new_generation,
             old_generation
         ));
+    }
+    #[tokio::test]
+    async fn session_command_sends_to_passive_peer_using_owned_transfer_service() {
+        use super::super::{
+            task_model::TaskState, task_store::TaskStore, transfer::TransferService,
+        };
+        let root =
+            std::env::temp_dir().join(format!("p2p-session-transfer-{}", rand::random::<u128>()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(root.join("a-receive")).unwrap();
+        std::fs::create_dir(root.join("b-receive")).unwrap();
+        let (a_store, _) = TaskStore::open(&root.join("a-state/tasks.json")).unwrap();
+        let (b_store, _) = TaskStore::open(&root.join("b-state/tasks.json")).unwrap();
+        let a = TransferService::new(a_store, root.join("a-receive"));
+        let b = TransferService::new(b_store, root.join("b-receive"));
+        let (address, server) = start_local_server().await;
+        let ia = Identity::generate();
+        let ib = Identity::generate();
+        let mut ca = local_config(address);
+        ca.transfer = Some(a.clone());
+        let mut cb = local_config(address);
+        cb.transfer = Some(b.clone());
+        let (ha, mut ea) = spawn(ia.clone(), ca).unwrap();
+        let (hb, mut eb) = spawn(ib.clone(), cb).unwrap();
+        wait_signal_online(&mut ea).await;
+        wait_signal_online(&mut eb).await;
+        ha.connect_peer(ib.node_id()).unwrap();
+        wait_connected(&mut ea, &[ib.node_id()]).await;
+        wait_connected(&mut eb, &[ia.node_id()]).await;
+        let bytes = vec![55; 1024 * 1024];
+        let source = root.join("selected.bin");
+        std::fs::write(&source, &bytes).unwrap();
+        ha.send_file(ib.node_id(), source).unwrap();
+        time::timeout(Duration::from_secs(10), async {
+            let mut changed = a.subscribe();
+            loop {
+                let tasks = a.snapshot().await.unwrap();
+                if tasks.len() == 1 && tasks[0].state() == TaskState::Completed {
+                    break;
+                }
+                changed.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(b.snapshot().await.unwrap()[0].state(), TaskState::Completed);
+        assert_eq!(
+            std::fs::read(root.join("b-receive/selected.bin")).unwrap(),
+            bytes
+        );
+        ha.shutdown();
+        hb.shutdown();
+        drop((ha, hb));
+        server.abort();
+        let _ = server.await;
+        drop((a, b));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
