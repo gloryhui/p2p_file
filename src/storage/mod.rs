@@ -51,6 +51,7 @@ impl Default for CheckpointPolicy {
 /// 一个进行中的下载。
 pub struct PartialDownload {
     manifest: FileManifest,
+    directory: DownloadDirectory,
     target_path: PathBuf,
     temp_path: PathBuf,
     state_path: PathBuf,
@@ -65,6 +66,75 @@ pub struct PartialDownload {
     /// 最近一次成功 durable checkpoint 的时间。
     last_checkpoint: Instant,
     checkpoint_policy: CheckpointPolicy,
+}
+
+// Desktop operations retain a directory capability across checkpoint/recovery.
+// CLI continues to use its existing ambient directory and publication behavior.
+struct DownloadDirectory {
+    path: PathBuf,
+    #[cfg(feature = "gui")]
+    capability: Option<std::sync::Arc<cap_std::fs::Dir>>,
+}
+impl DownloadDirectory {
+    fn open_part(&self, path: &Path) -> Result<File> {
+        #[cfg(feature = "gui")]
+        if let Some(dir) = &self.capability {
+            return crate::desktop::secure_fs::open(
+                dir,
+                path.file_name().unwrap().to_str().unwrap(),
+                true,
+                true,
+            );
+        }
+        Ok(OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?)
+    }
+    fn load(&self, path: &Path, chunks: u32) -> Result<(ChunkBitmap, bool)> {
+        #[cfg(feature = "gui")]
+        if let Some(dir) = &self.capability {
+            let name = path.file_name().unwrap().to_str().unwrap();
+            return match crate::desktop::secure_fs::open(dir, name, false, false) {
+                Ok(file) => {
+                    let mut bytes = Vec::new();
+                    file.take(u64::from(chunks.div_ceil(8)) + 1)
+                        .read_to_end(&mut bytes)?;
+                    Ok(match ChunkBitmap::from_bytes(chunks, &bytes) {
+                        Ok(bitmap) => (bitmap, false),
+                        Err(_) => (ChunkBitmap::new(chunks), true),
+                    })
+                }
+                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok((ChunkBitmap::new(chunks), false))
+                }
+                Err(error) => Err(error),
+            };
+        }
+        load_bitmap(path, chunks)
+    }
+    fn save(&self, path: &Path, bitmap: &ChunkBitmap) -> Result<()> {
+        #[cfg(feature = "gui")]
+        if let Some(dir) = &self.capability {
+            use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+            let name = path.file_name().unwrap().to_str().unwrap();
+            let temp = format!("bitmap-{:032x}.tmp", rand::random::<u128>());
+            let mut options = cap_std::fs::OpenOptions::new();
+            options
+                .write(true)
+                .create_new(true)
+                .follow(FollowSymlinks::No);
+            let mut file = dir.open_with(&temp, &options)?;
+            file.write_all(&bitmap.to_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            dir.rename(&temp, dir, name)?;
+            return crate::desktop::secure_fs::sync(dir);
+        }
+        save_bitmap(path, bitmap)
+    }
 }
 
 impl PartialDownload {
@@ -105,20 +175,68 @@ impl PartialDownload {
     ) -> Result<Self> {
         manifest.validate()?;
         fs::create_dir_all(dir)?;
+        Self::create_in(
+            DownloadDirectory {
+                path: dir.to_path_buf(),
+                #[cfg(feature = "gui")]
+                capability: None,
+            },
+            manifest,
+            checkpoint_policy,
+        )
+    }
 
+    #[cfg(feature = "gui")]
+    pub(crate) fn create_desktop(
+        path: &Path,
+        dir: std::sync::Arc<cap_std::fs::Dir>,
+        manifest: FileManifest,
+    ) -> Result<Self> {
+        Self::create_in(
+            DownloadDirectory {
+                path: path.to_path_buf(),
+                capability: Some(dir),
+            },
+            manifest,
+            CheckpointPolicy::default(),
+        )
+    }
+
+    fn create_in(
+        directory: DownloadDirectory,
+        manifest: FileManifest,
+        checkpoint_policy: CheckpointPolicy,
+    ) -> Result<Self> {
+        manifest.validate()?;
+        let dir = &directory.path;
         let target_path = Self::target_path_for(dir, &manifest);
         let temp_path = Self::temp_path_for(dir, &manifest);
         let state_path = Self::state_path_for(dir, &manifest);
+        #[cfg(feature = "gui")]
+        let (temp_path, state_path) = if let Some(capability) = &directory.capability {
+            // Preserve T006 staging on recovery. New tasks use fixed internal names,
+            // so a portable 255-byte source name does not exceed filesystem limits.
+            let legacy_name = temp_path.file_name().unwrap();
+            match if legacy_name.to_str().unwrap().len() <= 255 {
+                capability.symlink_metadata(legacy_name)
+            } else {
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            } {
+                Ok(_) => (temp_path, state_path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    (dir.join("data.part"), dir.join("data.bitmap"))
+                }
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            (temp_path, state_path)
+        };
 
-        let (mut bitmap, bitmap_needs_repair) = load_bitmap(&state_path, manifest.chunk_count())?;
+        let (mut bitmap, bitmap_needs_repair) =
+            directory.load(&state_path, manifest.chunk_count())?;
 
         // 已有的临时文件长度对不上就整个作废，从头来。
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&temp_path)?;
+        let mut file = directory.open_part(&temp_path)?;
 
         let existing_len = file.metadata()?.len();
         if existing_len != manifest.total_len {
@@ -127,7 +245,7 @@ impl PartialDownload {
             // 不允许空位图在文件长度尚未安全落盘时成为恢复状态。
             file.sync_all()?;
             bitmap = ChunkBitmap::new(manifest.chunk_count());
-            save_bitmap(&state_path, &bitmap)?;
+            directory.save(&state_path, &bitmap)?;
         } else {
             // bitmap 只说明“上次曾经认为这些片完成”，不能跳过磁盘数据校验。
             // 每次只分配一个受 manifest 限制的 chunk 缓冲区，避免恢复路径被状态文件
@@ -153,13 +271,14 @@ impl PartialDownload {
                 }
             }
             if bitmap_changed {
-                save_bitmap(&state_path, &bitmap)?;
+                directory.save(&state_path, &bitmap)?;
             }
         }
 
         let durable_bitmap = bitmap.clone();
         Ok(Self {
             manifest,
+            directory,
             target_path,
             temp_path,
             state_path,
@@ -256,7 +375,7 @@ impl PartialDownload {
         file.sync_data()?;
 
         let snapshot = self.written_bitmap.clone();
-        save_bitmap(&self.state_path, &snapshot)?;
+        self.directory.save(&self.state_path, &snapshot)?;
         self.durable_bitmap = snapshot;
         self.dirty_bytes = 0;
         self.last_checkpoint = Instant::now();
@@ -300,6 +419,11 @@ impl PartialDownload {
 
     /// Desktop publication keeps the staged inode/bitmap until its durable receipt.
     /// The caller owns its task-specific directory and the no-replace publication.
+    #[cfg(feature = "gui")]
+    pub(crate) fn desktop_directory(&self) -> Option<std::sync::Arc<cap_std::fs::Dir>> {
+        self.directory.capability.clone()
+    }
+
     #[cfg(feature = "gui")]
     pub(crate) fn prepare_desktop_publication(&mut self) -> Result<PathBuf> {
         if !self.written_bitmap.is_complete() {

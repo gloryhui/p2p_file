@@ -13,6 +13,10 @@ license = "MIT"
 default = []
 gui = [
     "dep:dirs",
+    "dep:cap-std",
+    "dep:cap-fs-ext",
+    "dep:unicode-normalization",
+    "dep:rustix",
     "dep:gpui",
     "dep:serde_json",
     "dep:unicode-segmentation",
@@ -38,8 +42,14 @@ gpui = { version = "=0.2.2", optional = true }
 dirs = { version = "=5.0.1", optional = true }
 serde_json = { version = "=1.0.151", optional = true }
 unicode-segmentation = { version = "1.13.3", optional = true }
+cap-std = { version = "=3.4.6", optional = true }
+cap-fs-ext = { version = "=3.4.6", optional = true }
+unicode-normalization = { version = "=0.1.25", optional = true }
 
 [[bin]]
 name = "p2p-desktop"
 path = "src/bin/p2p-desktop.rs"
 required-features = ["gui"]
+
+[target."cfg(unix)".dependencies]
+rustix = { version = "=1.1.5", features = ["fs"], optional = true }
