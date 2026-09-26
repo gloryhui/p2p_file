@@ -52,7 +52,7 @@ impl NetworkLifecycle {
             Self::PeerPending { peer } => format!("等待对端 {} 上线", peer.short()),
             Self::Punching { peer } => format!("正在连接对端 {}", peer.short()),
             Self::Authenticating { peer } => format!("正在认证对端 {}", peer.short()),
-            Self::Connected { peer } => format!("已认证连接 {}", peer.short()),
+            Self::Connected { peer } => format!("桌面协议已就绪 {}", peer.short()),
             Self::Disconnected { peer, detail } => match peer {
                 Some(peer) => format!("对端 {} 已断开：{detail}", peer.short()),
                 None => format!("网络已断开：{detail}"),
@@ -67,6 +67,7 @@ pub enum PeerLifecycle {
     PeerPending,
     Punching,
     Authenticating,
+    Negotiating,
     Connected,
     Disconnected,
     Failed(String),
@@ -76,7 +77,7 @@ impl PeerLifecycle {
     fn is_pending(&self) -> bool {
         matches!(
             self,
-            Self::PeerPending | Self::Punching | Self::Authenticating
+            Self::PeerPending | Self::Punching | Self::Authenticating | Self::Negotiating
         )
     }
 

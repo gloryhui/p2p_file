@@ -900,6 +900,17 @@ async fn run_peer_attempt(
         authenticate_incoming(incoming, &identity, peer).await?
     };
 
+    let _ = inputs
+        .send(SessionInput::PeerProgress {
+            peer,
+            generation,
+            state: PeerLifecycle::Negotiating,
+        })
+        .await;
+    super::protocol::negotiate(&connection, should_initiate_quic(local_node, peer))
+        .await
+        .map_err(|error| error.to_string())?;
+
     inputs
         .send(SessionInput::PeerConnected {
             peer,
@@ -1318,6 +1329,47 @@ mod tests {
         client.close(0u32.into(), b"test complete");
         client.wait_idle().await;
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_legacy_peer_is_rejected_by_desktop_negotiation() {
+        time::timeout(Duration::from_secs(10), async {
+            let local = Identity::generate();
+            let remote = Identity::generate();
+            let expected = remote.node_id();
+            let server =
+                crate::transport::quic::server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+            let address = server.local_addr().unwrap();
+            let server_task = tokio::spawn(async move {
+                let connection = server.accept().await.unwrap().await.unwrap();
+                let binding = ChannelBinding::from_connection(&connection).unwrap();
+                let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+                handshake_responder(&mut send, &mut recv, &remote, &binding)
+                    .await
+                    .unwrap();
+                send.finish().unwrap();
+                let (send, mut recv) = connection.accept_bi().await.unwrap();
+                assert!(crate::protocol::frame::read_frame(&mut recv).await.is_err());
+                drop(send);
+                connection.closed().await;
+                server.wait_idle().await;
+            });
+            let client =
+                crate::transport::quic::client_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+            let connection = authenticate_outgoing(&client, address, &local, expected)
+                .await
+                .unwrap();
+            let error = super::super::protocol::negotiate(&connection, true)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("桌面版本或能力不兼容"));
+            assert!(connection.close_reason().is_some());
+            client.close(0u32.into(), b"test complete");
+            client.wait_idle().await;
+            server_task.await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
