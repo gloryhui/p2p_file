@@ -776,6 +776,37 @@ impl TransferService {
             queue: self.queue_metrics(),
         })
     }
+    /// Called only on GPUI's background executor. Copy small display fields,
+    /// never chunk manifests, while holding the store reader. No UI disk/locks.
+    pub(super) fn ui_snapshot(&self) -> Result<super::ui_model::Snapshot> {
+        let now = self.monotonic_ms();
+        let mut tasks = {
+            let store = self
+                .store
+                .lock()
+                .map_err(|_| disk::failure("任务库锁不可用"))?;
+            let rates = self.rates.lock().unwrap();
+            store
+                .list()
+                .iter()
+                .map(|record| {
+                    let rate = rates.get(record.task_id()).map_or(0.0, |r| {
+                        r.bytes_per_second(now, record.state() == TaskState::Transferring)
+                    });
+                    (
+                        record.created_at_unix_ms(),
+                        super::ui_model::TaskRow::from_record(record, rate),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        tasks.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.id.cmp(&b.1.id)));
+        Ok(super::ui_model::Snapshot {
+            tasks: tasks.into_iter().map(|(_, row)| row).collect(),
+            queue: self.queue_metrics(),
+            speeds: self.speed_snapshots(),
+        })
+    }
     async fn receipt(&self, id: &TaskId) -> Result<()> {
         self.state(id, TaskState::Finalizing).await?;
         let id = id.clone();
@@ -3561,6 +3592,53 @@ mod tests {
         let second = next.await.unwrap().unwrap();
         assert_ne!(second.test_id, first.test_id);
         assert_eq!(second.direction, SpeedDirection::Download);
+        pair.shutdown().await;
+    }
+    #[tokio::test]
+    async fn ui_projection_tracks_real_pause_and_receipts_without_rebinding_or_false_completion() {
+        let pair = Pair::new().await;
+        let (id, bytes) = pair.select(4096).await;
+        let snapshot = pair.a.ui_snapshot().unwrap();
+        let row = snapshot.tasks.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(row.peer, pair.ib);
+        assert_eq!(row.state, TaskState::Queued);
+        assert_eq!(row.confirmed, 0);
+        assert!(row.can_pause());
+        pair.a.pause_task(id.clone()).await.unwrap();
+        let snapshot = pair.a.ui_snapshot().unwrap();
+        let row = snapshot.tasks.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(row.state, TaskState::Paused);
+        assert_eq!(row.peer, pair.ib);
+        assert_eq!(row.rate, 0.);
+        assert!(row.can_continue());
+        assert!(!row.can_pause());
+        pair.a
+            .enqueue_tasks(pair.ib, vec![id.clone()])
+            .await
+            .unwrap();
+        let scheduled = pair
+            .a
+            .dispatch_ready(&HashMap::from([(pair.ib, pair.ca.clone())]))
+            .pop()
+            .unwrap();
+        pair.a
+            .execute_queued(scheduled, pair.ca.clone())
+            .await
+            .unwrap();
+        for service in [&pair.a, &pair.b] {
+            let snapshot = service.ui_snapshot().unwrap();
+            let row = snapshot.tasks.iter().find(|r| r.id == id).unwrap();
+            assert_eq!(row.state, TaskState::Completed);
+            assert_eq!(row.confirmed, bytes.len() as u64);
+            assert_eq!(row.percent(), 100.);
+            assert_eq!(row.rate, 0.);
+            assert!(!row.can_pause());
+            assert!(!row.can_continue());
+        }
+        assert_eq!(
+            fs::read(pair.root.join("b-receive/文件.bin")).unwrap(),
+            bytes
+        );
         pair.shutdown().await;
     }
 }

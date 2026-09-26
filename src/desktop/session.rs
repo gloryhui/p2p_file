@@ -67,6 +67,13 @@ pub enum SessionEvent {
     },
     SignalIdentityRegistered(NodeId),
     Diagnostic(String),
+    SelectionQueued {
+        peer: NodeId,
+        count: usize,
+    },
+    SpeedRequestEnded {
+        peer: NodeId,
+    },
 }
 
 #[derive(Clone)]
@@ -417,6 +424,7 @@ async fn run_session(
                                 .send(SessionEvent::Diagnostic(error.to_string()))
                                 .await;
                         }
+                        let _ = events.send(SessionEvent::SpeedRequestEnded { peer }).await;
                     });
                 }
             }
@@ -488,14 +496,25 @@ async fn run_session(
                                     selection_workers.clone().acquire_owned().await.map_err(
                                         |_| super::transfer_files::failure("扫描任务已关闭"),
                                     )?;
-                                service.select_file(peer, source).await.map(|_| ())
+                                service.select_file(peer, source).await?;
+                                let _ = events
+                                    .send(SessionEvent::SelectionQueued { peer, count: 1 })
+                                    .await;
+                                Ok(())
                             }
                             SessionCommand::SendDirectory { source, .. } => {
                                 let _worker =
                                     selection_workers.clone().acquire_owned().await.map_err(
                                         |_| super::transfer_files::failure("扫描任务已关闭"),
                                     )?;
-                                service.select_directory(peer, source).await.map(|_| ())
+                                let ids = service.select_directory(peer, source).await?;
+                                let _ = events
+                                    .send(SessionEvent::SelectionQueued {
+                                        peer,
+                                        count: ids.len(),
+                                    })
+                                    .await;
+                                Ok(())
                             }
                             SessionCommand::ResumeTask { id, .. } => {
                                 let record = service.task(id.clone()).await?;
