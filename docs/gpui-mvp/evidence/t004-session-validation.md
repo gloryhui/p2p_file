@@ -42,3 +42,5 @@ CLI E2E 覆盖被动 serve、隧道回显及并发连接、内存测速不落盘
 - `proc-macro-error2 2.0.1` 有现存 future-incompatibility 提示；不是本项目 Clippy 错误，不改变通过标准。
 
 复核补强：重配置测试先等待旧连接发出 Hello，再取消卡住的注册，避免 TCP accept 与 Hello 发送之间的时序假设；第三 peer 测试明确断言原连接 stable_id 不变且两条连接均存活。仅测试断言补强后，全部本地必需检查重跑通过；CLI E2E 对应的生产代码未变。
+
+macOS CI 首次完整套件暴露既有 RFC 5780 harness 的环境前置条件：`127.0.0.2` 未分配，三项分类测试在 bind 时返回 `AddrNotAvailable`，其余 320 项通过。工作流显式配置 `lo0` 回环别名后重新运行原始完整套件；没有跳过测试、修改 NAT 算法或降低分类断言。该别名仅为同机测试 fixture，不是真实 NAT 证据。
