@@ -148,6 +148,31 @@ impl DesktopSessionHandle {
             .try_send(SessionCommand::SendDirectory { peer, source })
             .map_err(|_| "传输命令队列已满或会话已关闭".into())
     }
+    #[allow(dead_code)] // T010 controls.
+    pub fn start_speed(
+        &self,
+        peer: NodeId,
+        direction: super::protocol::SpeedDirection,
+        seconds: u16,
+    ) -> std::result::Result<(), String> {
+        self.commands
+            .try_send(SessionCommand::StartSpeed {
+                peer,
+                direction,
+                seconds,
+            })
+            .map_err(|_| "测速命令队列已满或会话已关闭".into())
+    }
+    #[allow(dead_code)] // T010 controls.
+    pub fn cancel_speed(
+        &self,
+        peer: NodeId,
+        id: super::task_model::TaskId,
+    ) -> std::result::Result<(), String> {
+        self.commands
+            .try_send(SessionCommand::CancelSpeed { peer, id })
+            .map_err(|_| "测速命令队列已满或会话已关闭".into())
+    }
     pub fn is_running(&self) -> bool {
         !self.commands.is_closed()
     }
@@ -158,6 +183,15 @@ impl DesktopSessionHandle {
 }
 
 enum SessionCommand {
+    StartSpeed {
+        peer: NodeId,
+        direction: super::protocol::SpeedDirection,
+        seconds: u16,
+    },
+    CancelSpeed {
+        peer: NodeId,
+        id: super::task_model::TaskId,
+    },
     #[allow(dead_code)] // T010 selection controls.
     SendDirectory {
         peer: NodeId,
@@ -369,6 +403,31 @@ async fn run_session(
             }
             Wake::Command(None) => {
                 session_shutdown = true;
+            }
+            Wake::Command(Some(SessionCommand::StartSpeed {
+                peer,
+                direction,
+                seconds,
+            })) => {
+                if let Some(service) = config.transfer.clone() {
+                    let events = events.clone();
+                    peer_tasks.spawn(async move {
+                        if let Err(error) = service.start_speed(peer, direction, seconds).await {
+                            let _ = events
+                                .send(SessionEvent::Diagnostic(error.to_string()))
+                                .await;
+                        }
+                    });
+                }
+            }
+            Wake::Command(Some(SessionCommand::CancelSpeed { peer, id })) => {
+                if let Some(service) = config.transfer.as_ref()
+                    && let Err(error) = service.cancel_speed(peer, &id)
+                {
+                    let _ = events
+                        .send(SessionEvent::Diagnostic(error.to_string()))
+                        .await;
+                }
             }
             Wake::Command(Some(SessionCommand::PauseTask(id))) => {
                 if let Some(service) = &config.transfer
@@ -728,7 +787,11 @@ async fn run_session(
                     let transfer_connection = connection.clone();
                     let transfer_events = events.clone();
                     peer_tasks.spawn(async move {
-                        if service.serve_peer(transfer_connection, peer).await.is_err() {
+                        if service
+                            .serve_peer_with_speed(transfer_connection, peer, local_node)
+                            .await
+                            .is_err()
+                        {
                             let _ = transfer_events
                                 .send(SessionEvent::Diagnostic(
                                     "文件会话已中断，任务可手动继续".into(),

@@ -22,7 +22,9 @@ pub const CAP_PAUSE_RESUME: u64 = 4;
 pub const CAP_SPEED_OWNERSHIP: u64 = 8;
 pub const CAP_FILE_TRANSFER: u64 = 16;
 pub const CAP_DIRECTORY_TRANSFER: u64 = 32;
-pub const REQUIRED_CAPABILITIES: u64 = 15 | CAP_FILE_TRANSFER | CAP_DIRECTORY_TRANSFER;
+pub const CAP_SPEED_EXECUTION: u64 = 64;
+pub const REQUIRED_CAPABILITIES: u64 =
+    15 | CAP_FILE_TRANSFER | CAP_DIRECTORY_TRANSFER | CAP_SPEED_EXECUTION;
 pub const MAX_FRAME_BYTES: u32 = 4 * 1024 * 1024;
 pub const MAX_CHUNKS: usize = 65_536;
 pub const MAX_TASKS_PER_PEER: usize = 128;
@@ -615,19 +617,33 @@ pub enum SpeedControl {
     },
     Cancel(SpeedLease),
     Finished(SpeedLease),
+    Ready(SpeedLease),
+    Result {
+        lease: SpeedLease,
+        bytes: u64,
+        elapsed_ms: u64,
+    },
 }
 
 impl SpeedControl {
     fn test_id(&self) -> &TaskId {
         match self {
             Self::Request { test_id, .. } | Self::Busy { test_id } => test_id,
-            Self::Granted(lease) | Self::Cancel(lease) | Self::Finished(lease) => &lease.test_id,
+            Self::Granted(lease)
+            | Self::Cancel(lease)
+            | Self::Finished(lease)
+            | Self::Ready(lease)
+            | Self::Result { lease, .. } => &lease.test_id,
         }
     }
     fn validate(&self) -> Result<()> {
         let seconds = match self {
             Self::Request { seconds, .. } => *seconds,
-            Self::Granted(lease) | Self::Cancel(lease) | Self::Finished(lease) => lease.seconds,
+            Self::Granted(lease)
+            | Self::Cancel(lease)
+            | Self::Finished(lease)
+            | Self::Ready(lease)
+            | Self::Result { lease, .. } => lease.seconds,
             Self::Busy { .. } => return Ok(()),
         };
         validate_speed_seconds(seconds)
@@ -803,7 +819,21 @@ mod tests {
                 capabilities: REQUIRED_CAPABILITIES,
             },
         };
-        assert_eq!(hello.encode().unwrap(), b"P2PD\x01\x00\x00\x01\x3f");
+        assert_eq!(hello.encode().unwrap(), b"P2PD\x01\x00\x00\x01\x7f");
+        // The old T007/T008 Hello bytes remain stable; execution negotiation
+        // explicitly requires the new speed bit rather than assuming schema is business.
+        assert_eq!(
+            Frame {
+                request_id: 0,
+                message: Message::Hello {
+                    version: 1,
+                    capabilities: 63
+                }
+            }
+            .encode()
+            .unwrap(),
+            b"P2PD\x01\x00\x00\x01\x3f"
+        );
         assert_eq!(
             Frame {
                 request_id: 0,
@@ -1386,5 +1416,37 @@ mod tests {
             .encode()
             .is_err()
         );
+    }
+    #[tokio::test]
+    async fn schema_only_speed_capability_cannot_negotiate_the_execution_business() {
+        for old in [15, 31, 63] {
+            let (new, mut old_io) = tokio::io::duplex(4096);
+            let (mut recv, mut send) = tokio::io::split(new);
+            let negotiate = exchange(&mut send, &mut recv);
+            let peer = async {
+                let hello = read(&mut old_io).await.unwrap();
+                assert_eq!(
+                    hello.message,
+                    Message::Hello {
+                        version: 1,
+                        capabilities: 127
+                    }
+                );
+                write(
+                    &mut old_io,
+                    &Frame {
+                        request_id: 0,
+                        message: Message::Hello {
+                            version: 1,
+                            capabilities: old,
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+            };
+            let (result, ()) = tokio::join!(negotiate, peer);
+            assert!(result.unwrap_err().to_string().contains("能力不兼容"));
+        }
     }
 }

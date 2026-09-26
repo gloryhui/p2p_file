@@ -4,7 +4,7 @@
 //! QUIC 单向流连续发送/读取。这里不触碰文件、manifest、分片、BLAKE3 或 bitmap。
 
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use clap::ValueEnum;
 use quinn::{Connection, RecvStream, SendStream};
@@ -16,7 +16,7 @@ use crate::transport::quic::{STREAM_FIRST_FRAME_TIMEOUT, TRANSFER_IDLE_TIMEOUT};
 
 pub const DEFAULT_DURATION_SECS: u64 = 10;
 pub const MIN_DURATION_SECS: u64 = 1;
-pub const MAX_DURATION_SECS: u64 = 300;
+pub const MAX_DURATION_SECS: u64 = 600;
 pub const DEFAULT_BLOCK_SIZE: u32 = 1024 * 1024;
 pub const MIN_BLOCK_SIZE: u32 = 16 * 1024;
 pub const MAX_BLOCK_SIZE: u32 = 16 * 1024 * 1024;
@@ -424,31 +424,20 @@ async fn send_payload<F>(
 where
     F: FnMut(SpeedTestProgress),
 {
-    let buffer = vec![SPEEDTEST_PATTERN; block_size];
-    let start = Instant::now();
-    let deadline = start + duration;
-    let mut bytes = 0u64;
     let mut next_progress = Duration::from_secs(1);
-
-    while Instant::now() < deadline {
-        tokio::time::timeout(
-            TRANSFER_IDLE_TIMEOUT,
-            tokio::io::AsyncWriteExt::write_all(send, &buffer),
-        )
-        .await
-        .map_err(|_| Error::Transport("测速数据流写入空闲超时".into()))??;
-        bytes = bytes.saturating_add(buffer.len() as u64);
+    send_memory(send, duration, block_size, |bytes, elapsed| {
+        let mut due = next_progress;
         emit_progress_if_due(
             progress,
             direction,
             bytes,
-            start.elapsed(),
-            &mut next_progress,
+            elapsed,
+            &mut due,
             connection.rtt(),
         );
-    }
-
-    Ok((bytes, start.elapsed()))
+        next_progress = due;
+    })
+    .await
 }
 
 async fn receive_payload<F>(
@@ -461,37 +450,86 @@ async fn receive_payload<F>(
 where
     F: FnMut(SpeedTestProgress),
 {
-    let mut buffer = vec![0u8; block_size];
-    let start = Instant::now();
-    let mut bytes = 0u64;
     let mut next_progress = Duration::from_secs(1);
-
-    loop {
-        let read = tokio::time::timeout(
-            TRANSFER_IDLE_TIMEOUT,
-            tokio::io::AsyncReadExt::read(&mut *recv, &mut buffer),
-        )
-        .await
-        .map_err(|_| Error::Transport("测速数据流读取空闲超时".into()))??;
-        if read == 0 {
-            break;
-        }
-        bytes = bytes.saturating_add(read as u64);
+    receive_memory(recv, block_size, |bytes, elapsed| {
         emit_progress_if_due(
             progress,
             direction,
             bytes,
-            start.elapsed(),
+            elapsed,
             &mut next_progress,
             connection.rtt(),
         );
-    }
+    })
+    .await
+}
 
-    let elapsed = start.elapsed();
+/// Shared memory-only kernels. A supplied stream is already authenticated and
+/// claimed by its caller; these functions never accept a stream or touch disk.
+/// Tokio's monotonic clock lets deadline tests advance 300/600s deterministically.
+pub(crate) async fn send_memory<W, F>(
+    writer: &mut W,
+    duration: Duration,
+    block_size: usize,
+    mut progress: F,
+) -> Result<(u64, Duration)>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    F: FnMut(u64, Duration),
+{
+    use tokio::io::AsyncWriteExt;
+    let buffer = vec![SPEEDTEST_PATTERN; block_size];
+    let start = tokio::time::Instant::now();
+    let deadline = start + duration;
+    let mut bytes = 0u64;
+    while tokio::time::Instant::now() < deadline {
+        let idle_deadline = (tokio::time::Instant::now() + TRANSFER_IDLE_TIMEOUT).min(deadline);
+        let n = match tokio::time::timeout_at(idle_deadline, writer.write(&buffer)).await {
+            Ok(result) => result?,
+            Err(_) if tokio::time::Instant::now() >= deadline => break,
+            Err(_) => return Err(Error::Transport("测速数据流写入空闲超时".into())),
+        };
+        if n == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
+        }
+        bytes = bytes
+            .checked_add(n as u64)
+            .ok_or_else(|| Error::Protocol("测速字节计数超限".into()))?;
+        progress(bytes, start.elapsed());
+        tokio::task::yield_now().await;
+    }
+    Ok((bytes, start.elapsed()))
+}
+
+pub(crate) async fn receive_memory<R, F>(
+    reader: &mut R,
+    block_size: usize,
+    mut progress: F,
+) -> Result<(u64, Duration)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    F: FnMut(u64, Duration),
+{
+    use tokio::io::AsyncReadExt;
+    let mut buffer = vec![0; block_size];
+    let start = tokio::time::Instant::now();
+    let mut bytes = 0u64;
+    loop {
+        let n = tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, reader.read(&mut buffer))
+            .await
+            .map_err(|_| Error::Transport("测速数据流读取空闲超时".into()))??;
+        if n == 0 {
+            break;
+        }
+        bytes = bytes
+            .checked_add(n as u64)
+            .ok_or_else(|| Error::Protocol("测速字节计数超限".into()))?;
+        progress(bytes, start.elapsed());
+    }
     if bytes == 0 {
         return Err(Error::Protocol("测速数据流没有收到 payload".into()));
     }
-    Ok((bytes, elapsed))
+    Ok((bytes, start.elapsed()))
 }
 
 fn emit_progress_if_due<F>(
@@ -621,6 +659,53 @@ mod tests {
         assert!(validate_options(Duration::from_millis(999), MIN_BLOCK_SIZE as usize).is_err());
         assert!(validate_options(Duration::from_secs(1), (MIN_BLOCK_SIZE - 1) as usize).is_err());
         assert!(validate_options(Duration::from_secs(1), (MAX_BLOCK_SIZE + 1) as usize).is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn memory_sender_keeps_running_past_300_until_600_and_counts_short_writes() {
+        use std::{
+            pin::Pin,
+            task::{Context, Poll},
+        };
+        struct Short;
+        impl tokio::io::AsyncWrite for Short {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                _: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Ready(Ok(137))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let task = tokio::spawn(async {
+            send_memory(&mut Short, Duration::from_secs(600), 65536, |_, _| {}).await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(300)).await;
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished(), "old300s boundary terminated600s test");
+        tokio::time::advance(Duration::from_secs(299)).await;
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let (bytes, elapsed) = task.await.unwrap().unwrap();
+        assert!(bytes >= 137);
+        assert_eq!(bytes % 137, 0);
+        assert_eq!(elapsed, Duration::from_secs(600));
+        for seconds in [30, 60, 300, 301, 599, 600] {
+            assert!(validate_wire_options(seconds * 1000, DEFAULT_BLOCK_SIZE).is_ok());
+        }
+        assert!(validate_wire_options(600001, DEFAULT_BLOCK_SIZE).is_err());
+        assert_eq!(DEFAULT_DURATION_SECS, 10);
     }
 
     #[test]
