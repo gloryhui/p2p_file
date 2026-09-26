@@ -152,9 +152,19 @@ ssh -p 2222 127.0.0.1
 $BIN push --signal $SIGNAL --peer $HOME_ID ./大文件.mkv
 ```
 
+### 原生桌面（GPUI）
+
+```bash
+cargo run --locked --features gui --bin p2p-desktop
+```
+
+首次打开设置，填写自己的信令主机/IP 和端口、选择本机接收目录并保存。接收端上线后可以等待；发送端粘贴接收端完整 ID，身份认证成功后选择文件或目录直接入队。并发数 1/2/3 保存后应用，任务可暂停并按原 TaskID 继续。测速支持发送/接收、30 秒或 1–10 分钟；有文件活动时先暂停，不会自动暂停用户任务。
+
+设置说明可信设备 MVP 的接收边界：知道 ID 的节点可发送文件。接收目录修改只影响新任务，对端输入框修改不改变旧任务绑定。Linux 系统文件选择器需要可用的 desktop portal。原生窗口操作与截图见 [T010 验证证据](docs/gpui-mvp/evidence/t010-ui-validation.md)；跨物理平台、Wayland、中文 IME、双 NAT 和安装包验收仍在后续流水线中记录。
+
 ### P2P / QUIC 纯网络测速
 
-测速 CLI 默认仍为 10 秒，`--duration` 支持 1–600 秒。桌面测速业务支持 30 秒或 1–10 分钟，产品按钮在 T010 接入。长时边界由可控时钟回归验证；真实 600 秒与双 NAT 证据以 [GPUI 总控 Issue #24](https://github.com/gloryhui/p2p_file/issues/24) 为准。
+测速 CLI 默认仍为 10 秒，`--duration` 支持 1–600 秒。桌面测速业务支持 30 秒或 1–10 分钟，原生界面已接入文件/目录、暂停/继续和测速按钮。长时边界由可控时钟回归验证；真实 600 秒与双 NAT 证据以 [GPUI 总控 Issue #24](https://github.com/gloryhui/p2p_file/issues/24) 为准。
 
 想把网络链路和文件传输本身区分开时，在外面那台机器上运行：
 

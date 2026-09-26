@@ -1,8 +1,6 @@
-//! Native GPUI desktop shell for T001.
-//!
-//! This module deliberately stops at platform-facing shell behaviour. It does
-//! not create a node identity, open a peer connection, or pretend that a
-//! transfer succeeded. Those responsibilities belong to later tasks.
+//! Native GPUI product interface backed by the authenticated desktop session.
+//! Domain snapshots are projected off the UI thread; displayed completion
+//! comes from persistent receiver receipts, never from command submission.
 //!
 //! TextField and TextFieldElement are adapted from
 //! gpui v0.2.2/examples/input.rs (Apache-2.0, Zed Industries, Inc.). The
@@ -33,8 +31,10 @@ mod task_recovery;
 mod task_store;
 mod transfer;
 mod transfer_files;
+mod ui_model;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 use std::{ops::Range, path::PathBuf};
 
 use crate::identity::{Identity, NodeId};
@@ -72,6 +72,22 @@ actions!(
         ChooseFolder,
         ChooseReceiveDirectory,
         Quit,
+        ConnectPeer,
+        SaveSettings,
+        StartSpeed,
+        CancelSpeed,
+        ToggleSettings,
+        PauseSelected,
+        ResumeSelected,
+        NextField,
+        PreviousField,
+        CopyIdentity,
+        NextTask,
+        PreviousTask,
+        ExpandGroups,
+        CycleDirection,
+        CycleDuration,
+        CycleConcurrency,
     ]
 );
 
@@ -826,6 +842,18 @@ struct DesktopShell {
     peer_status: SharedString,
     network_epoch: u64,
     peer_generations: HashMap<NodeId, u64>,
+    peer_states: HashMap<NodeId, network_state::PeerLifecycle>,
+    task_rows: Vec<ui_model::ListRow>,
+    expanded_groups: HashSet<task_model::TaskId>,
+    selected_task: Option<task_model::TaskId>,
+    queue_status: SharedString,
+    speed_views: ui_model::SpeedViews,
+    speed_peer: Option<NodeId>,
+    speed_request_until: Option<Instant>,
+    show_settings: bool,
+    pending_resumes: HashMap<NodeId, Vec<task_model::TaskId>>,
+    applied_receive_root: Option<PathBuf>,
+    task_scroll: gpui::UniformListScrollHandle,
     status: SharedString,
     focus_handle: FocusHandle,
 }
@@ -839,6 +867,442 @@ impl Drop for DesktopShell {
 }
 
 impl DesktopShell {
+    fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_settings = !self.show_settings;
+        let field = if self.show_settings {
+            &self.signal_host
+        } else {
+            &self.peer_id
+        };
+        window.focus(&field.focus_handle(cx));
+        cx.notify();
+    }
+    fn focus_field(&mut self, backwards: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let fields = if self.show_settings {
+            vec![
+                self.signal_host.clone(),
+                self.signal_port.clone(),
+                self.peer_id.clone(),
+            ]
+        } else {
+            vec![self.peer_id.clone()]
+        };
+        let current = fields
+            .iter()
+            .position(|field| field.focus_handle(cx).is_focused(window));
+        let next = match current {
+            Some(i) if backwards => (i + fields.len() - 1) % fields.len(),
+            Some(i) => (i + 1) % fields.len(),
+            None => 0,
+        };
+        window.focus(&fields[next].focus_handle(cx));
+    }
+    fn select_task(&mut self, backwards: bool, cx: &mut Context<Self>) {
+        let entries = self
+            .task_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| match r {
+                ui_model::ListRow::Task(t) => Some((i, t.id.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            self.set_status("暂无可选文件任务；Ctrl/⌘+E 展开目录", cx);
+            return;
+        }
+        let current = entries
+            .iter()
+            .position(|(_, id)| self.selected_task.as_ref() == Some(id));
+        let next = match current {
+            Some(i) if backwards => (i + entries.len() - 1) % entries.len(),
+            Some(i) => (i + 1) % entries.len(),
+            None => 0,
+        };
+        self.selected_task = Some(entries[next].1.clone());
+        self.task_scroll
+            .scroll_to_item(entries[next].0, gpui::ScrollStrategy::Center);
+        cx.notify();
+    }
+    fn expand_groups(&mut self, cx: &mut Context<Self>) {
+        let groups = self
+            .task_rows
+            .iter()
+            .filter_map(|r| match r {
+                ui_model::ListRow::Group(g) => Some(g.id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if groups.iter().all(|id| self.expanded_groups.contains(id)) {
+            self.expanded_groups.clear();
+        } else {
+            self.expanded_groups.extend(groups);
+        }
+        cx.notify();
+    }
+    fn observe_tasks(&mut self, cx: &mut Context<Self>) {
+        let Some(service) = self.transfer_service.clone() else {
+            self.queue_status = "任务存储不可用".into();
+            return;
+        };
+        let background = cx.background_executor().clone();
+        cx.spawn(async move |shell, cx| {
+            loop {
+                let service = service.clone();
+                let result = background.spawn(async move { service.ui_snapshot() }).await;
+                if shell
+                    .update(cx, |shell, cx| {
+                        match result {
+                            Ok(snapshot) => {
+                                shell.queue_status = format!(
+                                    "排队 {} · 活动文件 {}/{}{}",
+                                    snapshot.queue.pending,
+                                    snapshot.queue.active_files,
+                                    snapshot.queue.limit,
+                                    if snapshot.queue.converging {
+                                        " · 正在收敛到新并发数"
+                                    } else {
+                                        ""
+                                    }
+                                )
+                                .into();
+                                shell.task_rows = snapshot.list(&shell.expanded_groups);
+                                shell.speed_views.update(snapshot.speeds, Instant::now());
+                                if shell
+                                    .speed_request_until
+                                    .is_some_and(|until| Instant::now() >= until)
+                                    || shell
+                                        .speed_views
+                                        .0
+                                        .values()
+                                        .any(|v| v.snapshot.status == speed::SpeedStatus::Running)
+                                {
+                                    shell.speed_request_until = None;
+                                }
+                            }
+                            Err(e) => shell.queue_status = format!("无法读取任务：{e}").into(),
+                        }
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                background.timer(Duration::from_millis(250)).await;
+            }
+        })
+        .detach();
+    }
+    fn authenticated_peer(&mut self, cx: &mut Context<Self>) -> Option<NodeId> {
+        let result = NodeId::from_hex(self.peer_id.read(cx).content.trim());
+        let Ok(peer) = result else {
+            self.set_status("请先输入有效的完整对端 ID 并连接", cx);
+            return None;
+        };
+        if !matches!(
+            self.peer_states.get(&peer),
+            Some(network_state::PeerLifecycle::Connected)
+        ) {
+            self.set_status("请先连接并等待对端身份认证完成", cx);
+            return None;
+        }
+        if self.transfer_service.is_none() {
+            self.set_status("任务存储不可用", cx);
+            return None;
+        }
+        Some(peer)
+    }
+    fn current_peer_label(&self, cx: &Context<Self>) -> String {
+        let Ok(peer) = NodeId::from_hex(self.peer_id.read(cx).content.trim()) else {
+            let mut connected = self
+                .peer_states
+                .iter()
+                .filter_map(|(p, s)| {
+                    matches!(s, network_state::PeerLifecycle::Connected).then_some(p.to_hex())
+                })
+                .collect::<Vec<_>>();
+            connected.sort();
+            return if connected.is_empty() {
+                "等待输入对端 ID；接收端无需预先填写发送者 ID".into()
+            } else {
+                format!("已认证直连：{}；可被动接收", connected.join("、"))
+            };
+        };
+        let state = match self.peer_states.get(&peer) {
+            Some(network_state::PeerLifecycle::Connected) => "已认证直连".to_owned(),
+            Some(network_state::PeerLifecycle::PeerPending) => "等待对端上线".into(),
+            Some(network_state::PeerLifecycle::Punching) => "正在建立直连".into(),
+            Some(network_state::PeerLifecycle::Authenticating) => "正在核对身份".into(),
+            Some(network_state::PeerLifecycle::Negotiating) => "正在核对版本".into(),
+            Some(network_state::PeerLifecycle::Disconnected) => "连接已断开".into(),
+            Some(network_state::PeerLifecycle::Failed(e)) => format!("连接失败：{e}"),
+            None => "尚未连接".into(),
+        };
+        format!("对端 {}：{state}", peer.to_hex())
+    }
+    fn start_speed_ui(&mut self, cx: &mut Context<Self>) {
+        if self.speed_request_until.is_some()
+            || self
+                .speed_views
+                .0
+                .values()
+                .any(|v| v.snapshot.status == speed::SpeedStatus::Running)
+        {
+            self.set_status("测速正在进行，请先取消或等待完成", cx);
+            return;
+        }
+        let Some(peer) = self.authenticated_peer(cx) else {
+            return;
+        };
+        let direction = match self.settings.speedtest_direction {
+            SpeedtestDirection::Upload => protocol::SpeedDirection::Upload,
+            SpeedtestDirection::Download => protocol::SpeedDirection::Download,
+        };
+        let result = self
+            .network_session
+            .as_ref()
+            .ok_or("网络会话已关闭".to_owned())
+            .and_then(|s| s.start_speed(peer, direction, self.settings.speedtest_seconds));
+        match result {
+            Ok(()) => {
+                self.speed_peer = Some(peer);
+                self.speed_request_until = Some(Instant::now() + Duration::from_secs(6));
+                self.set_status("正在请求测速；有文件活动时需先暂停，不会自动暂停任务", cx);
+            }
+            Err(e) => self.set_status(e, cx),
+        }
+    }
+    fn displayed_speed(&self) -> Option<(NodeId, &ui_model::SpeedView)> {
+        self.speed_views
+            .0
+            .iter()
+            .filter(|(_, v)| v.snapshot.status == speed::SpeedStatus::Running)
+            .min_by_key(|(peer, _)| peer.to_hex())
+            .map(|(peer, v)| (*peer, v))
+            .or_else(|| {
+                self.speed_peer
+                    .and_then(|p| self.speed_views.0.get(&p).map(|v| (p, v)))
+            })
+            .or_else(|| {
+                self.speed_views
+                    .0
+                    .iter()
+                    .min_by_key(|(peer, _)| peer.to_hex())
+                    .map(|(p, v)| (*p, v))
+            })
+    }
+    fn cancel_speed_ui(&mut self, cx: &mut Context<Self>) {
+        let Some((peer, view)) = self
+            .displayed_speed()
+            .filter(|(_, v)| v.snapshot.status == speed::SpeedStatus::Running)
+        else {
+            self.set_status("当前没有已获得授权的测速", cx);
+            return;
+        };
+        let id = view.snapshot.test_id.clone();
+        let result = self
+            .network_session
+            .as_ref()
+            .ok_or("网络会话已关闭".to_owned())
+            .and_then(|s| s.cancel_speed(peer, id));
+        match result {
+            Ok(()) => self.set_status("正在取消测速，等待对端确认与清理", cx),
+            Err(e) => self.set_status(e, cx),
+        }
+    }
+    fn task_action(&mut self, id: task_model::TaskId, resume: bool, cx: &mut Context<Self>) {
+        let row = self.task_rows.iter().find_map(|r| match r {
+            ui_model::ListRow::Task(t) if t.id == id => Some(t.clone()),
+            _ => None,
+        });
+        let Some(row) = row else {
+            self.set_status("请展开目录并选择要操作的任务", cx);
+            return;
+        };
+        if (resume && !row.can_continue()) || (!resume && !row.can_pause()) {
+            self.set_status("该任务当前不能执行此操作", cx);
+            return;
+        }
+        let result = self
+            .network_session
+            .as_ref()
+            .ok_or("请先保存信令配置，启动网络会话".to_owned())
+            .and_then(|s| {
+                if resume {
+                    if !matches!(
+                        self.peer_states.get(&row.peer),
+                        Some(network_state::PeerLifecycle::Connected)
+                    ) {
+                        s.connect_peer(row.peer)?;
+                        let pending = self.pending_resumes.entry(row.peer).or_default();
+                        if !pending.contains(&row.id) {
+                            pending.push(row.id);
+                        }
+                        Ok(())
+                    } else {
+                        s.resume_task(row.peer, row.id)
+                    }
+                } else {
+                    s.pause_task(row.id)
+                }
+            });
+        match result {
+            Ok(()) => self.set_status(
+                if resume {
+                    "已请求继续；任务使用原先绑定的对端"
+                } else {
+                    "正在暂停，等待持久化和双方确认"
+                },
+                cx,
+            ),
+            Err(e) => self.set_status(e, cx),
+        }
+    }
+    fn selected_action(&mut self, resume: bool, cx: &mut Context<Self>) {
+        if let Some(id) = self.selected_task.clone() {
+            self.task_action(id, resume, cx);
+        } else {
+            self.set_status("先点击任务行选择任务", cx);
+        }
+    }
+    fn task_row(&mut self, index: usize, cx: &mut Context<Self>) -> gpui::Div {
+        let row = self.task_rows[index].clone();
+        match row {
+            ui_model::ListRow::Group(group) => {
+                let expanded = self.expanded_groups.contains(&group.id);
+                let id = group.id.clone();
+                div()
+                    .h(px(82.))
+                    .p_2()
+                    .border_b_1()
+                    .border_color(rgb(0xdde3ee))
+                    .bg(rgb(0xeaf1ff))
+                    .child(format!(
+                        "{} {}",
+                        if expanded { "▾" } else { "▸" },
+                        group.label()
+                    ))
+                    .cursor_pointer()
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |shell, _: &MouseUpEvent, _, cx| {
+                            if !shell.expanded_groups.remove(&id) {
+                                shell.expanded_groups.insert(id.clone());
+                            }
+                            cx.notify();
+                        }),
+                    )
+            }
+            ui_model::ListRow::Task(t) => {
+                let id = t.id.clone();
+                let select = id.clone();
+                let pause = id.clone();
+                let resume = id.clone();
+                let can_pause = t.can_pause();
+                let can_continue = t.can_continue();
+                let direction = if t.direction == task_model::TaskDirection::Send {
+                    "发送"
+                } else {
+                    "接收"
+                };
+                let diagnostic = t
+                    .diagnostic
+                    .unwrap_or("已校验进度；异常退出后可能回退到已持久化进度");
+                div()
+                    .h(px(82.))
+                    .p_2()
+                    .border_b_1()
+                    .border_color(rgb(0xdde3ee))
+                    .bg(if self.selected_task.as_ref() == Some(&id) {
+                        rgb(0xeaf1ff)
+                    } else {
+                        rgb(0xffffff)
+                    })
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |shell, _: &MouseUpEvent, _, cx| {
+                            shell.selected_task = Some(select.clone());
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(format!("{} · {direction}", t.name)),
+                            )
+                            .child(div().text_sm().child(format!(
+                                "{:.1}% · {:.2} MiB/s",
+                                t.percent(),
+                                t.rate / 1048576.
+                            )))
+                            .child(Self::control("暂停", can_pause).on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |shell, _: &MouseUpEvent, _, cx| {
+                                    shell.task_action(pause.clone(), false, cx);
+                                }),
+                            ))
+                            .child(Self::control("继续", can_continue).on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |shell, _: &MouseUpEvent, _, cx| {
+                                    shell.task_action(resume.clone(), true, cx);
+                                }),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x5f6b7a))
+                            .truncate()
+                            .child(format!(
+                                "{} · 对端 {} · {} / {} 字节",
+                                t.state_label(),
+                                t.peer.to_hex(),
+                                t.confirmed,
+                                t.total
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x8b5a00))
+                            .truncate()
+                            .child(diagnostic),
+                    )
+            }
+        }
+    }
+    fn control(label: impl Into<SharedString>, enabled: bool) -> gpui::Div {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0xdde3ee))
+            .text_sm()
+            .bg(if enabled {
+                rgb(0xeaf1ff)
+            } else {
+                rgb(0xf0f2f5)
+            })
+            .text_color(if enabled {
+                rgb(0x2456a6)
+            } else {
+                rgb(0x737e8d)
+            })
+            .cursor(if enabled {
+                CursorStyle::PointingHand
+            } else {
+                CursorStyle::Arrow
+            })
+            .child(label.into())
+    }
     fn set_status(&mut self, status: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.status = status.into();
         cx.notify();
@@ -860,6 +1324,8 @@ impl DesktopShell {
                 self.network_epoch = self.network_epoch.wrapping_add(1);
                 let network_epoch = self.network_epoch;
                 self.peer_generations.clear();
+                self.peer_states.clear();
+                self.pending_resumes.clear();
                 self.network_session = Some(handle);
                 self.network_status = "正在准备 UDP 并连接信令".into();
                 self.set_status(self.network_status.clone(), cx);
@@ -902,8 +1368,15 @@ impl DesktopShell {
                                                 .min_by_key(|(_, generation)| **generation).map(|(peer, _)| *peer)
                                         {
                                             shell.peer_generations.remove(&oldest);
+                                            shell.peer_states.remove(&oldest);
                                         }
                                         shell.peer_generations.insert(peer, generation);
+                                        shell.peer_states.insert(peer, state.clone());
+                                        if matches!(state,network_state::PeerLifecycle::Connected) {
+                                            if let Some(ids)=shell.pending_resumes.remove(&peer) {
+                                                for id in ids {if let Some(session)=&shell.network_session && let Err(e)=session.resume_task(peer,id){shell.set_status(e,cx);}}
+                                            }
+                                        }else if matches!(state,network_state::PeerLifecycle::Disconnected|network_state::PeerLifecycle::Failed(_)){shell.pending_resumes.remove(&peer);}
                                         let label = match state {
                                             network_state::PeerLifecycle::PeerPending => {
                                                 "等待对端候选地址".to_owned()
@@ -918,7 +1391,7 @@ impl DesktopShell {
                                                 "正在协商桌面版本与能力".to_owned()
                                             }
                                             network_state::PeerLifecycle::Connected => {
-                                                "桌面协议已就绪".to_owned()
+                                                "已认证直连".to_owned()
                                             }
                                             network_state::PeerLifecycle::Disconnected => {
                                                 "连接已断开".to_owned()
@@ -937,8 +1410,10 @@ impl DesktopShell {
                                         shell.network_status = label.clone().into();
                                         shell.set_status(label, cx);
                                     }
+                                    session::SessionEvent::SelectionQueued {peer,count}=>{shell.set_status(format!("扫描已完成，{count} 项已入队，绑定对端 {}",peer.to_hex()),cx);}
+                                    session::SessionEvent::SpeedRequestEnded {peer}=>{if shell.speed_peer==Some(peer){shell.speed_request_until=None;}cx.notify();}
                                     session::SessionEvent::Diagnostic(detail) => {
-                                        shell.set_status(detail, cx);
+                                        if detail != "信令心跳已确认" {shell.set_status(detail, cx);}
                                     }
                                 }
                             })
@@ -961,6 +1436,9 @@ impl DesktopShell {
     }
 
     fn connect_peer(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.connect_current_peer(cx);
+    }
+    fn connect_current_peer(&mut self, cx: &mut Context<Self>) {
         let peer_text = self.peer_id.read(cx).content.to_string();
         let peer = match NodeId::from_hex(peer_text.trim()) {
             Ok(peer) => peer,
@@ -995,6 +1473,12 @@ impl DesktopShell {
     }
 
     fn cycle_concurrency(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.change_concurrency(cx);
+    }
+    fn change_concurrency(&mut self, cx: &mut Context<Self>) {
+        if self.is_saving_settings {
+            return;
+        }
         self.settings.send_concurrency = self.settings.send_concurrency % 3 + 1;
         cx.notify();
     }
@@ -1005,6 +1489,12 @@ impl DesktopShell {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.change_duration(cx);
+    }
+    fn change_duration(&mut self, cx: &mut Context<Self>) {
+        if self.is_saving_settings {
+            return;
+        }
         self.settings.speedtest_seconds = if self.settings.speedtest_seconds == 30 {
             60
         } else if self.settings.speedtest_seconds >= 600 {
@@ -1021,6 +1511,12 @@ impl DesktopShell {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.change_direction(cx);
+    }
+    fn change_direction(&mut self, cx: &mut Context<Self>) {
+        if self.is_saving_settings {
+            return;
+        }
         self.settings.speedtest_direction = match self.settings.speedtest_direction {
             SpeedtestDirection::Upload => SpeedtestDirection::Download,
             SpeedtestDirection::Download => SpeedtestDirection::Upload,
@@ -1029,6 +1525,9 @@ impl DesktopShell {
     }
 
     fn save_settings(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.persist_settings(cx);
+    }
+    fn persist_settings(&mut self, cx: &mut Context<Self>) {
         if !self.can_save_settings || self.is_saving_settings {
             self.set_status("当前配置不可保存；请检查配置诊断信息", cx);
             return;
@@ -1041,6 +1540,9 @@ impl DesktopShell {
         let signal_server = signal_server_spec(&draft.signal_host, &draft.signal_port);
         let saved_receive_root = draft.receive_directory.clone();
         let saved_send_limit = draft.send_concurrency;
+        let signal_changed = draft.signal_host != self.settings.signal_host
+            || draft.signal_port != self.settings.signal_port;
+        let saved_draft = draft.clone();
         let background = cx.background_executor().clone();
         self.is_saving_settings = true;
         self.set_status("正在验证并保存设置…", cx);
@@ -1054,6 +1556,8 @@ impl DesktopShell {
                     shell.is_saving_settings = false;
                     match result {
                         Ok(()) => {
+                            shell.settings = saved_draft;
+                            shell.applied_receive_root = saved_receive_root.clone();
                             shell.config_note = "设置已保存；接收目录写能力检查通过。".into();
                             if let (Some(service), Some(root)) =
                                 (&shell.transfer_service, &saved_receive_root)
@@ -1072,6 +1576,10 @@ impl DesktopShell {
                                 .as_ref()
                                 .filter(|session| session.is_running())
                             {
+                                if !signal_changed {
+                                    shell.set_status("设置已保存；现有任务和连接继续运行", cx);
+                                    return;
+                                }
                                 match session.reconfigure_signal(signal_server.clone()) {
                                     Ok(()) => {
                                         shell.network_status = "正在使用新信令配置重连".into();
@@ -1104,6 +1612,22 @@ impl DesktopShell {
     }
 
     fn choose_files(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.pick_files(cx);
+    }
+    fn pick_files(&mut self, cx: &mut Context<Self>) {
+        if self
+            .speed_views
+            .0
+            .values()
+            .any(|v| v.snapshot.status == speed::SpeedStatus::Running)
+        {
+            self.set_status("测速正在进行，请先取消或等待完成后添加文件", cx);
+            return;
+        }
+        let Some(peer) = self.authenticated_peer(cx) else {
+            return;
+        };
+        let epoch = self.network_epoch;
         let task = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -1119,8 +1643,34 @@ impl DesktopShell {
                     }
                     Ok(Ok(Some(paths))) if !paths.is_empty() => {
                         let count = paths.len();
+                        if shell.network_epoch != epoch {
+                            shell.set_status("选择期间网络会话已重建，请重新选择", cx);
+                            return;
+                        }
+                        let result = shell
+                            .network_session
+                            .as_ref()
+                            .ok_or("网络会话已关闭".to_owned())
+                            .and_then(|session| {
+                                for path in &paths {
+                                    session.send_file(peer, path.clone())?;
+                                }
+                                Ok(())
+                            });
                         shell.selected_files = paths;
-                        shell.set_status(format!("已选择 {count} 个文件；网络传输仍待接入"), cx);
+                        match result {
+                            Ok(()) => shell.set_status(
+                                format!(
+                                    "正在后台扫描 {count} 个文件；发送对象 {} 已固定",
+                                    peer.to_hex()
+                                ),
+                                cx,
+                            ),
+                            Err(e) => shell.set_status(
+                                format!("文件提交未全部完成：{e}；已提交项将在任务列表中显示"),
+                                cx,
+                            ),
+                        }
                     }
                     Ok(Ok(None)) => shell.set_status("已取消文件选择", cx),
                     Ok(Ok(Some(_))) => shell.set_status("未选择文件", cx),
@@ -1133,6 +1683,22 @@ impl DesktopShell {
     }
 
     fn choose_folder(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.pick_folder(cx);
+    }
+    fn pick_folder(&mut self, cx: &mut Context<Self>) {
+        if self
+            .speed_views
+            .0
+            .values()
+            .any(|v| v.snapshot.status == speed::SpeedStatus::Running)
+        {
+            self.set_status("测速正在进行，请先取消或等待完成后添加文件", cx);
+            return;
+        }
+        let Some(peer) = self.authenticated_peer(cx) else {
+            return;
+        };
+        let epoch = self.network_epoch;
         let task = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -1146,11 +1712,26 @@ impl DesktopShell {
                     Ok(Ok(Some(mut paths))) => {
                         if let Some(path) = paths.pop() {
                             if let Some(path_text) = path.to_str() {
-                                shell.selected_folder = Some(path.to_path_buf());
-                                shell.set_status(
-                                    format!("已选择目录 {path_text}；网络传输仍待接入"),
-                                    cx,
-                                );
+                                if shell.network_epoch != epoch {
+                                    shell.set_status("选择期间网络会话已重建，请重新选择", cx);
+                                    return;
+                                }
+                                let result = shell
+                                    .network_session
+                                    .as_ref()
+                                    .ok_or("网络会话已关闭".to_owned())
+                                    .and_then(|session| session.send_directory(peer, path.clone()));
+                                shell.selected_folder = Some(path.clone());
+                                match result {
+                                    Ok(()) => shell.set_status(
+                                        format!(
+                                            "正在后台扫描目录 {path_text}；发送对象 {} 已固定",
+                                            peer.to_hex()
+                                        ),
+                                        cx,
+                                    ),
+                                    Err(e) => shell.set_status(e, cx),
+                                }
                             } else {
                                 shell
                                     .set_status("所选目录路径编码不受支持；未保存或转换该路径", cx);
@@ -1174,6 +1755,9 @@ impl DesktopShell {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.pick_receive_directory(cx);
+    }
+    fn pick_receive_directory(&mut self, cx: &mut Context<Self>) {
         let task = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -1189,8 +1773,7 @@ impl DesktopShell {
                             if let Some(path_text) = path.to_str() {
                                 shell.settings.receive_directory = Some(path.to_path_buf());
                                 shell.config_note =
-                                    "已选择新接收目录；保存时会重新验证写能力；网络功能待接入"
-                                        .into();
+                                    "已选择新接收目录；保存时重新验证写能力，仅影响新任务".into();
                                 shell.set_status(
                                     format!("接收目录已选择 {path_text}；保存后用于新任务"),
                                     cx,
@@ -1213,16 +1796,20 @@ impl DesktopShell {
     }
 
     fn choose_files_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .px_2()
-            .py_2()
-            .bg(rgb(0xeaf1ff))
-            .border_1()
-            .border_color(rgb(0xb8cdfa))
-            .rounded_md()
-            .text_color(rgb(0x2456a6))
-            .child("选择文件")
-            .hover(|style| style.bg(rgb(0xdce8ff)).cursor_pointer())
+        let enabled = NodeId::from_hex(self.peer_id.read(cx).content.trim())
+            .ok()
+            .is_some_and(|p| {
+                matches!(
+                    self.peer_states.get(&p),
+                    Some(network_state::PeerLifecycle::Connected)
+                )
+            })
+            && !self
+                .speed_views
+                .0
+                .values()
+                .any(|v| v.snapshot.status == speed::SpeedStatus::Running);
+        Self::control("选择文件", enabled)
             .on_mouse_up(MouseButton::Left, cx.listener(Self::choose_files))
     }
 
@@ -1333,362 +1920,191 @@ impl Focusable for DesktopShell {
 
 impl Render for DesktopShell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let files = if self.selected_files.is_empty() {
-            vec!["尚未选择文件".to_owned()]
-        } else {
-            self.selected_files
-                .iter()
-                .map(|path| {
-                    path.to_str()
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| "路径编码不受支持".to_owned())
-                })
-                .collect()
-        };
-        let identity_text = self
+        let identity = self
             .identity_id
             .clone()
-            .unwrap_or_else(|| "身份不可用".to_owned());
-
-        div()
+            .unwrap_or_else(|| "身份不可用".into());
+        let connected = NodeId::from_hex(self.peer_id.read(cx).content.trim())
+            .ok()
+            .is_some_and(|p| {
+                matches!(
+                    self.peer_states.get(&p),
+                    Some(network_state::PeerLifecycle::Connected)
+                )
+            });
+        let running = self
+            .speed_views
+            .0
+            .values()
+            .any(|v| v.snapshot.status == speed::SpeedStatus::Running);
+        let can_start = connected && !running && self.speed_request_until.is_none();
+        let speed_text=self.displayed_speed().map(|(peer,v)|{
+            let s=&v.snapshot;let sending=match s.direction {protocol::SpeedDirection::Upload=>self.identity.as_ref().is_some_and(|i|i.node_id()==s.owner),protocol::SpeedDirection::Download=>self.identity.as_ref().is_some_and(|i|i.node_id()!=s.owner)};
+            let status=match s.status{speed::SpeedStatus::Running=>"测速中",speed::SpeedStatus::Completed=>"已完成",speed::SpeedStatus::Cancelled=>"已取消",speed::SpeedStatus::Interrupted=>"已中断"};
+            let progress=(s.elapsed.as_secs_f64()/f64::from(s.seconds)*100.).min(100.);
+            format!("{} · {status} · 对端 {} · {progress:.1}%\n瞬时 {:.2} MiB/s · 平均 {:.2} Mbps · {} 字节 · 实际 {:.2} 秒 · RTT {:.1} ms",if sending{"本机 → 对端"}else{"对端 → 本机"},peer.to_hex(),v.instant/1048576.,s.bytes_per_second*8./1000000.,s.bytes,s.elapsed.as_secs_f64(),s.rtt.as_secs_f64()*1000.)
+        }).unwrap_or_else(||if self.speed_request_until.is_some(){"等待双方授权；文件活动会明确拒绝测速".into()}else{"尚未测速；使用已认证直连，不读取或生成文件".into()});
+        let speed_text = if self.speed_request_until.is_some() && !running {
+            format!("等待双方授权；文件活动会明确拒绝测速\n上次结果：{speed_text}")
+        } else {
+            speed_text
+        };
+        let root = div()
             .size_full()
             .id("desktop-shell")
+            .key_context("DesktopShell")
+            .track_focus(&self.focus_handle)
             .overflow_y_scroll()
             .bg(rgb(0xf4f7fb))
             .flex()
             .flex_col()
-            .gap_4()
-            .p(px(28.))
+            .gap_2()
+            .p_4()
             .text_color(rgb(0x1d2633))
+            .on_action(cx.listener(|s, _: &NextTask, _, cx| s.select_task(false, cx)))
+            .on_action(cx.listener(|s, _: &PreviousTask, _, cx| s.select_task(true, cx)))
+            .on_action(cx.listener(|s, _: &ExpandGroups, _, cx| s.expand_groups(cx)))
+            .on_action(
+                cx.listener(|s, _: &ChooseReceiveDirectory, _, cx| s.pick_receive_directory(cx)),
+            )
+            .on_action(cx.listener(|s, _: &CycleDirection, _, cx| s.change_direction(cx)))
+            .on_action(cx.listener(|s, _: &CycleDuration, _, cx| s.change_duration(cx)))
+            .on_action(cx.listener(|s, _: &CycleConcurrency, _, cx| s.change_concurrency(cx)))
+            .on_action(cx.listener(|s, _: &NextField, w, cx| s.focus_field(false, w, cx)))
+            .on_action(cx.listener(|s, _: &PreviousField, w, cx| s.focus_field(true, w, cx)))
+            .on_action(cx.listener(|s, _: &CopyIdentity, _, cx| {
+                if let Some(id) = &s.identity_id {
+                    cx.write_to_clipboard(ClipboardItem::new_string(id.clone()));
+                    s.set_status("已复制完整本机 ID", cx);
+                }
+            }))
+            .on_action(cx.listener(|s, _: &ConnectPeer, _, cx| s.connect_current_peer(cx)))
+            .on_action(cx.listener(|s, _: &ChooseFiles, _, cx| s.pick_files(cx)))
+            .on_action(cx.listener(|s, _: &ChooseFolder, _, cx| s.pick_folder(cx)))
+            .on_action(cx.listener(|s, _: &SaveSettings, _, cx| s.persist_settings(cx)))
+            .on_action(cx.listener(|s, _: &StartSpeed, _, cx| s.start_speed_ui(cx)))
+            .on_action(cx.listener(|s, _: &CancelSpeed, _, cx| s.cancel_speed_ui(cx)))
+            .on_action(cx.listener(|s, _: &ToggleSettings, w, cx| s.toggle_settings(w, cx)))
+            .on_action(cx.listener(|s, _: &PauseSelected, _, cx| s.selected_action(false, cx)))
+            .on_action(cx.listener(|s, _: &ResumeSelected, _, cx| s.selected_action(true, cx)))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(div().text_xl().child("P2P File"))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(0x5f6b7a))
-                                    .child("原生 GPUI 桌面壳 · T002 配置与身份"),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .bg(rgb(0xeaf1ff))
-                            .text_color(rgb(0x2456a6))
-                            .child(self.network_status.clone()),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .p(px(20.))
-                    .bg(white())
-                    .border_1()
-                    .border_color(rgb(0xdde3ee))
-                    .rounded_md()
-                    .shadow_sm()
-                    .child(div().text_size(px(18.)).child("启动设置"))
-                    .child(
-                        div()
-                            .flex()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(div().text_sm().child("信令主机或 IP"))
-                                    .child(self.signal_host.clone()),
-                            )
-                            .child(
-                                div()
-                                    .w(px(150.))
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(div().text_sm().child("端口"))
-                                    .child(self.signal_port.clone()),
-                            ),
-                    )
-                    .child(Self::path_line(
-                        "接收目录（仅本机可见）",
-                        self.settings.receive_directory.as_ref(),
-                    ))
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .items_center()
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_2()
-                                    .bg(rgb(0xf3f5f8))
-                                    .border_1()
-                                    .border_color(rgb(0xdde3ee))
-                                    .rounded_md()
-                                    .child("选择接收目录")
-                                    .hover(|style| style.bg(rgb(0xe9edf3)).cursor_pointer())
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(Self::choose_receive_directory),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_2()
-                                    .bg(rgb(0xf3f5f8))
-                                    .border_1()
-                                    .border_color(rgb(0xdde3ee))
-                                    .rounded_md()
-                                    .child(format!(
-                                        "发送并发：{}（点击切换）",
-                                        self.settings.send_concurrency
-                                    ))
-                                    .hover(|style| style.bg(rgb(0xe9edf3)).cursor_pointer())
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(Self::cycle_concurrency),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .items_center()
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_2()
-                                    .bg(rgb(0xf3f5f8))
-                                    .border_1()
-                                    .border_color(rgb(0xdde3ee))
-                                    .rounded_md()
-                                    .child(format!(
-                                        "测速时长：{} 秒（点击切换）",
-                                        self.settings.speedtest_seconds
-                                    ))
-                                    .hover(|style| style.bg(rgb(0xe9edf3)).cursor_pointer())
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(Self::cycle_speedtest_duration),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_2()
-                                    .bg(rgb(0xf3f5f8))
-                                    .border_1()
-                                    .border_color(rgb(0xdde3ee))
-                                    .rounded_md()
-                                    .child(format!(
-                                        "测速方向：{}（点击切换）",
-                                        self.settings.speedtest_direction.label()
-                                    ))
-                                    .hover(|style| style.bg(rgb(0xe9edf3)).cursor_pointer())
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(Self::toggle_speedtest_direction),
-                                    ),
-                            )
-                            .child(self.save_settings_button(cx)),
-                    )
+                    .child(div().text_xl().child("P2P File"))
                     .child(
                         div()
                             .text_sm()
-                            .text_color(rgb(0x5f6b7a))
-                            .child(self.config_note.clone()),
+                            .child(format!("信令：{}", self.network_status)),
                     )
                     .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(0x8b5a00))
-                            .child("保存后自动登记信令；只有通过身份认证的对端才显示为已连接。"),
+                        Self::control(
+                            if self.show_settings {
+                                "收起设置"
+                            } else {
+                                "设置"
+                            },
+                            true,
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|s, _: &MouseUpEvent, w, cx| s.toggle_settings(w, cx)),
+                        ),
                     ),
             )
             .child(
                 div()
                     .flex()
-                    .flex_col()
-                    .gap_3()
-                    .p(px(20.))
-                    .bg(white())
-                    .border_1()
-                    .border_color(rgb(0xdde3ee))
-                    .rounded_md()
-                    .shadow_sm()
-                    .child(div().text_size(px(18.)).child("建立连接"))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(0x5f6b7a))
-                                    .child("本机 Node ID"),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .h(px(40.))
-                                            .p(px(7.))
-                                            .bg(rgb(0xf3f5f8))
-                                            .border_1()
-                                            .border_color(rgb(0xdde3ee))
-                                            .rounded_md()
-                                            .text_color(rgb(0x7b8797))
-                                            .truncate()
-                                            .child(identity_text),
-                                    )
-                                    .child(self.copy_identity_button(cx)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(0x5f6b7a))
-                            .child(self.identity_status.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(0x5f6b7a))
-                                    .child("对端 Node ID"),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(self.peer_id.clone())
-                                    .child(self.connect_peer_button(cx)),
-                            )
-                            .child(div().text_sm().child(self.peer_status.clone())),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_4()
-                    .child(
-                        div()
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .gap_3()
-                            .p(px(20.))
-                            .bg(white())
-                            .border_1()
-                            .border_color(rgb(0xdde3ee))
-                            .rounded_md()
-                            .child(div().text_size(px(18.)).child("发送"))
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(self.choose_files_button(cx))
-                                    .child(
-                                        div()
-                                            .px_2()
-                                            .py_2()
-                                            .bg(rgb(0xeaf1ff))
-                                            .border_1()
-                                            .border_color(rgb(0xb8cdfa))
-                                            .rounded_md()
-                                            .text_color(rgb(0x2456a6))
-                                            .child("选择目录")
-                                            .hover(|style| style.bg(rgb(0xdce8ff)).cursor_pointer())
-                                            .on_mouse_up(
-                                                MouseButton::Left,
-                                                cx.listener(Self::choose_folder),
-                                            ),
-                                    ),
-                            )
-                            .child(Self::path_line("发送目录", self.selected_folder.as_ref()))
-                            .child(
-                                div()
-                                    .h(px(140.))
-                                    .w_full()
-                                    .id("selected-files")
-                                    .overflow_y_scroll()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .children(files.into_iter().map(|path| {
-                                        div()
-                                            .w_full()
-                                            .text_sm()
-                                            .truncate()
-                                            .text_color(rgb(0x5f6b7a))
-                                            .child(path)
-                                    })),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .gap_3()
-                            .p(px(20.))
-                            .bg(white())
-                            .border_1()
-                            .border_color(rgb(0xdde3ee))
-                            .rounded_md()
-                            .child(div().text_size(px(18.)).child("接收"))
-                            .child(Self::path_line(
-                                "接收目录",
-                                self.settings.receive_directory.as_ref(),
-                            ))
-                            .child(
-                                div().text_sm().text_color(rgb(0x5f6b7a)).child(
-                                    "收到的文件将在后续任务中落盘；当前不会写入任何传输数据。",
-                                ),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
                     .gap_2()
-                    .p(px(14.))
-                    .bg(rgb(0xeaf1ff))
-                    .border_1()
-                    .border_color(rgb(0xc6d8ff))
-                    .rounded_md()
-                    .child(div().text_color(rgb(0x2456a6)).child("状态"))
-                    .child(self.status.clone()),
+                    .items_center()
+                    .child(div().text_sm().child("本机 ID"))
+                    .child(div().flex_1().text_sm().child(identity))
+                    .child(self.copy_identity_button(cx)),
             )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().text_sm().child("对端 ID"))
+                    .child(div().flex_1().min_w_0().child(self.peer_id.clone()))
+                    .child(self.connect_peer_button(cx)),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x5f6b7a))
+                    .child(self.current_peer_label(cx)),
+            );
+        let root = if self.show_settings {
+            root.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .p_3()
+                        .bg(white())
+                        .border_1()
+                        .border_color(rgb(0xdde3ee))
+                        .rounded_md()
+                        .flex_shrink_0()
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(div().text_sm().child("信令主机/IP"))
+                                        .child(self.signal_host.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(110.))
+                                        .child(div().text_sm().child("端口"))
+                                        .child(self.signal_port.clone()),
+                                ),
+                        )
+                        .child(Self::path_line(
+                            "接收目录（仅本机可见）",
+                            self.settings.receive_directory.as_ref(),
+                        ))
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .items_center()
+                                .child(Self::control("选择接收目录", true).on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(Self::choose_receive_directory),
+                                ))
+                                .child(self.save_settings_button(cx)),
+                        )
+                        .child(div().text_xs().child(self.config_note.clone()))
+                        .child(div().text_xs().child(self.identity_status.clone())).child(div().text_xs().child("Ctrl/⌘：Shift+D 接收目录 · Shift+C 复制 ID · N 并发 · D 测速方向 · L 测速时长 · Tab 切换输入框"))
+                        .child(div().text_xs().text_color(rgb(0x8b5a00)).child(
+                            "可信设备 MVP：知道 ID 的节点可发送文件。保存新目录仅影响新任务。",
+                        )),
+                )
+        } else {
+            root
+        };
+        root.child(
+            div().flex().flex_col().gap_2().p_3().bg(white()).border_1().border_color(rgb(0xdde3ee)).rounded_md().flex_shrink_0()
+            .child(div().flex().justify_between().items_center().child(div().child("文件传输")).child(div().text_xs().child(self.queue_status.clone())))
+            .child(div().flex().gap_2().items_center().child(self.choose_files_button(cx)).child(Self::control("选择目录",connected&&!running).on_mouse_up(MouseButton::Left,cx.listener(Self::choose_folder))).child(Self::control(format!("同时发送：{}（保存后生效）",self.settings.send_concurrency),!self.is_saving_settings).on_mouse_up(MouseButton::Left,cx.listener(Self::cycle_concurrency))).child(self.save_settings_button(cx)))
+            .child(if self.task_rows.is_empty(){div().h(px(160.)).flex().items_center().justify_center().text_sm().text_color(rgb(0x5f6b7a)).child("暂无任务。选择文件或目录发送；收到的新任务会自动显示。").into_any_element()}else{gpui::uniform_list("transfer-tasks",self.task_rows.len(),cx.processor(|s,range: Range<usize>,_,cx|{let end=range.end.min(s.task_rows.len());(range.start.min(end)..end).map(|index|s.task_row(index,cx)).collect::<Vec<_>>()})).track_scroll(self.task_scroll.clone())
+                            .h(px(220.)).into_any_element()})
+        ).child(
+            div().flex().flex_col().gap_2().p_3().bg(white()).border_1().border_color(rgb(0xdde3ee)).rounded_md().flex_shrink_0()
+            .child(div().child("直连测速"))
+            .child(div().flex().gap_2().items_center().child(Self::control(format!("方向：{}",self.settings.speedtest_direction.label()),!self.is_saving_settings).on_mouse_up(MouseButton::Left,cx.listener(Self::toggle_speedtest_direction))).child(Self::control(format!("时长：{} 秒",self.settings.speedtest_seconds),!self.is_saving_settings).on_mouse_up(MouseButton::Left,cx.listener(Self::cycle_speedtest_duration))).child(Self::control(if self.speed_request_until.is_some(){"等待授权…"}else{"开始"},can_start).on_mouse_up(MouseButton::Left,cx.listener(|s,_:&MouseUpEvent,_,cx|s.start_speed_ui(cx)))).child(Self::control("取消",running).on_mouse_up(MouseButton::Left,cx.listener(|s,_:&MouseUpEvent,_,cx|s.cancel_speed_ui(cx)))))
+            .child(div().text_sm().child(speed_text))
+        ).child(Self::path_line("新任务接收目录",self.applied_receive_root.as_ref()))
+        .child(div().p_2().bg(rgb(0xeaf1ff)).text_sm().child(self.status.clone()))
+        .child(div().text_xs().text_color(rgb(0x5f6b7a)).child("快捷键 Ctrl/⌘：Enter 连接 · O 文件 · Shift+O 目录 · S 保存 · T 测速 · Shift+T 取消 · ↑/↓ 选择任务 · E 展开目录 · P 暂停 · R 继续 · , 设置"))
     }
 }
 
@@ -1718,6 +2134,29 @@ pub fn run() {
             KeyBinding::new("end", End, None),
             KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, None),
             KeyBinding::new("secondary-q", Quit, None),
+            KeyBinding::new("secondary-down", NextTask, Some("DesktopShell")),
+            KeyBinding::new("secondary-up", PreviousTask, Some("DesktopShell")),
+            KeyBinding::new("secondary-e", ExpandGroups, Some("DesktopShell")),
+            KeyBinding::new(
+                "secondary-shift-d",
+                ChooseReceiveDirectory,
+                Some("DesktopShell"),
+            ),
+            KeyBinding::new("secondary-d", CycleDirection, Some("DesktopShell")),
+            KeyBinding::new("secondary-l", CycleDuration, Some("DesktopShell")),
+            KeyBinding::new("secondary-n", CycleConcurrency, Some("DesktopShell")),
+            KeyBinding::new("tab", NextField, Some("DesktopShell")),
+            KeyBinding::new("shift-tab", PreviousField, Some("DesktopShell")),
+            KeyBinding::new("secondary-shift-c", CopyIdentity, Some("DesktopShell")),
+            KeyBinding::new("secondary-enter", ConnectPeer, Some("DesktopShell")),
+            KeyBinding::new("secondary-o", ChooseFiles, Some("DesktopShell")),
+            KeyBinding::new("secondary-shift-o", ChooseFolder, Some("DesktopShell")),
+            KeyBinding::new("secondary-s", SaveSettings, Some("DesktopShell")),
+            KeyBinding::new("secondary-,", ToggleSettings, Some("DesktopShell")),
+            KeyBinding::new("secondary-t", StartSpeed, Some("DesktopShell")),
+            KeyBinding::new("secondary-shift-t", CancelSpeed, Some("DesktopShell")),
+            KeyBinding::new("secondary-p", PauseSelected, Some("DesktopShell")),
+            KeyBinding::new("secondary-r", ResumeSelected, Some("DesktopShell")),
         ]);
 
         let bounds = Bounds::centered(None, size(px(960.), px(680.)), cx);
@@ -1756,6 +2195,7 @@ pub fn run() {
                 .expect("validated concurrency");
             service
         });
+        let initial_receive_root = settings.receive_directory.clone();
         let initial_host = settings.signal_host.clone();
         let initial_port = settings.signal_port.clone();
         let startup_session_config = if has_saved_network_config && identity.is_some() {
@@ -1776,7 +2216,7 @@ pub fn run() {
         let window = cx.open_window(
             WindowOptions {
                 titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("P2P File — GPUI".into()),
+                    title: Some("P2P File".into()),
                     ..Default::default()
                 }),
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -1784,7 +2224,7 @@ pub fn run() {
                 ..Default::default()
             },
             move |_, cx| {
-                let peer_id = cx.new(|cx| TextField::new(cx, "输入或粘贴对端 ID（仅壳层输入）"));
+                let peer_id = cx.new(|cx| TextField::new(cx, "输入或粘贴完整的 32 位对端 ID"));
                 let signal_host = cx.new(|cx| {
                     let mut field = TextField::new(cx, "输入 IPv4、IPv6 或主机名");
                     field.content = initial_host.into();
@@ -1816,6 +2256,18 @@ pub fn run() {
                     peer_status: "尚未连接对端".into(),
                     network_epoch: 0,
                     peer_generations: HashMap::new(),
+                    peer_states: HashMap::new(),
+                    task_rows: Vec::new(),
+                    expanded_groups: HashSet::new(),
+                    selected_task: None,
+                    queue_status: "正在载入任务…".into(),
+                    speed_views: Default::default(),
+                    speed_peer: None,
+                    speed_request_until: None,
+                    show_settings: !has_saved_network_config,
+                    pending_resumes: HashMap::new(),
+                    applied_receive_root: initial_receive_root,
+                    task_scroll: Default::default(),
                     status: initial_status.into(),
                     focus_handle: cx.focus_handle(),
                 })
@@ -1826,8 +2278,14 @@ pub fn run() {
             Ok(window) => {
                 window
                     .update(cx, move |shell, window, cx| {
-                        window.focus(&shell.signal_host.focus_handle(cx));
+                        let field = if shell.show_settings {
+                            &shell.signal_host
+                        } else {
+                            &shell.peer_id
+                        };
+                        window.focus(&field.focus_handle(cx));
                         cx.activate(true);
+                        shell.observe_tasks(cx);
                         if let Some(config) = startup_session_config {
                             shell.start_network_session(config, cx);
                         }
