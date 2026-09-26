@@ -9,6 +9,7 @@ import sys
 sys.dont_write_bytecode = True
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 def module(name):
@@ -85,6 +86,25 @@ class Boundaries(unittest.TestCase):
         self.assertEqual(pack.macos_minimum(legacy), ['13.0.0'])
         with self.assertRaisesRegex(ValueError, 'exceeds'):
             pack.macos_minimum(legacy.replace('13.0.0', '13.0.1'))
+
+    def test_signature_host_does_not_inherit_an_incompatible_module_path(self):
+        parent = {'PSModulePath': 'incompatible-Core-modules', 'OTHER_SETTING': 'preserved'}
+        with patch.object(pack.shutil, 'which', side_effect=lambda name: 'PowerShell7/pwsh.exe' if name == 'pwsh' else 'PowerShell5/powershell.exe'):
+            args, child = pack.signature_command(Path('目录/space name.exe'), parent)
+            self.assertEqual(args[0], 'PowerShell7/pwsh.exe')
+            self.assertNotIn('PSModulePath', child)
+            self.assertIn('PSModulePath', parent)
+            self.assertEqual(child['OTHER_SETTING'], 'preserved')
+            self.assertEqual(child['P2P_PACKAGE_EXECUTABLE'], str(Path('目录/space name.exe')))
+            self.assertNotIn('目录', args[-1])
+            self.assertIn('Get-AuthenticodeSignature', args[-1])
+        with patch.object(pack.shutil, 'which', side_effect=lambda name: None if name == 'pwsh' else 'PowerShell5/powershell.exe'):
+            args, child = pack.signature_command(Path('unsigned.exe'), parent)
+            self.assertEqual(args[0], 'PowerShell5/powershell.exe')
+            self.assertNotIn('PSModulePath', child)
+        with patch.object(pack.shutil, 'which', return_value=None):
+            with self.assertRaisesRegex(ValueError, 'actual Authenticode'):
+                pack.signature_command(Path('unsigned.exe'), parent)
 
     def test_paths_reject_traversal_and_windows_forms(self):
         for name in ['../identity.key', '/etc/passwd', 'C:/private', 'folder\\..\\secret']:

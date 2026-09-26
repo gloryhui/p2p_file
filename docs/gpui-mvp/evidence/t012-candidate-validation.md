@@ -15,7 +15,7 @@ python3 scripts/verify-desktop-package.py /tmp/p2p-candidate-new/candidate.json
 
 Windows 用 Python3.12，binary为 `target/x86_64-pc-windows-msvc/release/p2p-desktop.exe`，target相应改为MSVC；macOS用arm64 native Rust/Python，`MACOSX_DEPLOYMENT_TARGET=13.0`、binary `target/aarch64-apple-darwin/release/p2p-desktop`。不是交叉编译就能做 native smoke。预检参数 `--allow-dirty` / `--allow-preflight` 不允许正式验收使用。
 
-5项独立边界测试覆盖：实际格式架构不允许混平台/IntelMac；实际PE import RVA解析与越界拒绝；危险路径拒绝；dirty预检不能accepted及归档损坏被检测；Mach-O deployment只取minos/legacyOS version，忽略SDK/linker tool version并仍拒绝真实14.0/13.0.1。完整 verify 实际解包、逐文件和794份源码哈希检查。最终包SHA还需与CI artifact中的candidate.json对照。
+6项独立边界测试覆盖：实际格式架构不允许混平台/IntelMac；实际PE import RVA解析与越界拒绝；危险路径拒绝；dirty预检不能accepted及归档损坏被检测；Mach-O deployment只取minos/legacyOS version，忽略SDK/linker tool version并仍拒绝真实14.0/13.0.1。PowerShell host选择/子环境模块路径隔离/Unicode路径与missing-host拒绝。完整 verify 实际解包、逐文件和794份源码哈希检查。最终包SHA还需与CI artifact中的candidate.json对照。
 
 | 项目 | 当前证据边界 | 最终记录 |
 | --- | --- | --- |
@@ -38,3 +38,5 @@ Windows 用 Python3.12，binary为 `target/x86_64-pc-windows-msvc/release/p2p-de
 CI artifacts保留14天，下载后可长期离线保管；产物中的完整来源材料会增大包体积，不承诺几MB。解包候选不删除用户配置/密钥/TaskStore/staging/journal/旧备份；回滚保留这些数据并手动继续，见 [运行文档](../../../packaging/RUNNING.md)。
 
 首次候选 `da7228c65342094f9f12c1d550deb74acadee58e` 的macOS425回归与优化构建通过，但打包错误地混入LC_BUILD_VERSION中的链接器version而失败。原日志与该head的真实600秒成功证据保留；该CI不用于新head验收。修复只改变平台metadata解析，最低系统13.0仍严格检查；本地验证后新最终head完整四作业CI，不能rerun旧head冒充修复。
+
+第二候选 `6d9fc7f6aaa7b7a901152c6d109ebe2f2be1b28c` 的macOS/Linux完整GUI、包与校验通过；Windows416和优化编译/metadata通过，但签名检查的PowerShell5继承Core模块搜索路径导致Security模块加载失败。修复隔离PSModulePath、优先pwsh并保留PS5默认模块路径fallback；缺少host或非NotSigned仍拒绝，不伪造签名状态。新增该环境边界回归。旧head三平台集不合格，不用于新候选门禁；原生600与实际LinuxCI包30秒两方向证据各自保留原SHA。

@@ -156,6 +156,21 @@ def macos_minimum(load_commands):
     return minimum
 
 
+def signature_command(executable, parent_env):
+    # An outer pwsh process can export a PSModulePath containing Core-only
+    # modules. Passing it to Windows PowerShell5 breaks Security-module loading.
+    # Give the actual chosen host its own default built-in module search path.
+    host = shutil.which('pwsh') or shutil.which('powershell')
+    if not host:
+        raise ValueError('native PowerShell host required for actual Authenticode inspection')
+    environment = parent_env.copy()
+    environment.pop('PSModulePath', None)
+    environment['P2P_PACKAGE_EXECUTABLE'] = str(executable)
+    command = [host, '-NoProfile', '-NonInteractive', '-Command',
+               '(Get-AuthenticodeSignature -LiteralPath $env:P2P_PACKAGE_EXECUTABLE).Status.ToString()']
+    return command, environment
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
@@ -226,9 +241,8 @@ def main():
         # Read only the actual build/min-version load command, not framework versions.
         inspection['deployment_minimum_versions'] = macos_minimum(inspection['mach_o_load_commands'])
     else:
-        signature_env = os.environ.copy()
-        signature_env['P2P_PACKAGE_EXECUTABLE'] = str(executable)
-        inspection['authenticode'] = subprocess.check_output(['powershell', '-NoProfile', '-Command', '(Get-AuthenticodeSignature -LiteralPath $env:P2P_PACKAGE_EXECUTABLE).Status.ToString()'], env=signature_env, text=True).strip()
+        signature_args, signature_env = signature_command(executable, os.environ)
+        inspection['authenticode'] = subprocess.check_output(signature_args, env=signature_env, text=True).strip()
         if inspection['authenticode'] != 'NotSigned':
             raise ValueError('unexpected signature status; candidate signing metadata must be reviewed')
         inspection['dynamic_dependencies'] = pe_imports(executable)
