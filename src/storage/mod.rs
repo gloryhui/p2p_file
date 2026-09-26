@@ -298,6 +298,21 @@ impl PartialDownload {
         Ok(target)
     }
 
+    /// Desktop publication keeps the staged inode/bitmap until its durable receipt.
+    /// The caller owns its task-specific directory and the no-replace publication.
+    #[cfg(feature = "gui")]
+    pub(crate) fn prepare_desktop_publication(&mut self) -> Result<PathBuf> {
+        if !self.written_bitmap.is_complete() {
+            return Err(Error::Protocol("下载尚未完整，不能发布".into()));
+        }
+        self.checkpoint()?;
+        if let Some(file) = self.file.as_mut() {
+            file.sync_all()?;
+        }
+        self.file = None;
+        Ok(self.temp_path.clone())
+    }
+
     /// 放弃下载，删掉临时文件和位图。
     pub fn discard(mut self) -> Result<()> {
         self.file = None;

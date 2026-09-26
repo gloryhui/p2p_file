@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::identity::NodeId;
+use crate::protocol::manifest::FileManifest;
 
 pub const TASK_RECORD_SCHEMA_VERSION: u32 = 1;
 
@@ -297,7 +298,7 @@ impl TaskState {
                 | (Connecting, Negotiating | Pausing | Interrupted | Failed)
                 | (Negotiating, Transferring | Pausing | Interrupted | Failed)
                 | (Transferring, Pausing | Finalizing | Interrupted | Failed)
-                | (Pausing, Paused | Interrupted | Failed)
+                | (Pausing, Paused | Finalizing | Interrupted | Failed)
                 | (Paused, Queued | Interrupted | Failed)
                 | (Finalizing, Completed | Interrupted | Failed)
                 | (Interrupted, Queued | Failed)
@@ -391,6 +392,16 @@ impl ProgressHint {
     }
 }
 
+/// Local durable binding for one selected file. Never serialized as a wire frame.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileTaskDetails {
+    pub relative_path: String,
+    pub manifest: FileManifest,
+    pub publish_prepared: bool,
+    pub receipt_committed: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskRecord {
@@ -405,6 +416,8 @@ pub struct TaskRecord {
     updated_at_unix_ms: i64,
     diagnostic: Option<TaskDiagnostic>,
     progress_hint: Option<ProgressHint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_details: Option<FileTaskDetails>,
 }
 
 impl TaskRecord {
@@ -458,9 +471,72 @@ impl TaskRecord {
             updated_at_unix_ms: now,
             diagnostic: None,
             progress_hint: None,
+            file_details: None,
         };
         record.validate()?;
         Ok(record)
+    }
+
+    pub(crate) fn new_file(
+        task_id: TaskId,
+        peer_id: PeerId,
+        direction: TaskDirection,
+        local_path: PathBuf,
+        relative_path: String,
+        manifest: FileManifest,
+    ) -> Result<Self, TaskModelError> {
+        let identity = ManifestIdentity::blake3(
+            manifest.root_hash.0,
+            manifest.total_len,
+            manifest.chunk_size,
+        )?;
+        let path = match direction {
+            TaskDirection::Send => LocalTaskPath::source(local_path)?,
+            TaskDirection::Receive => LocalTaskPath::receive_root(local_path)?,
+        };
+        let mut record = Self::new(
+            task_id,
+            peer_id,
+            direction,
+            path,
+            identity,
+            system_time_unix_ms()?,
+        )?;
+        record.file_details = Some(FileTaskDetails {
+            relative_path,
+            manifest,
+            publish_prepared: false,
+            receipt_committed: false,
+        });
+        record.validate()?;
+        Ok(record)
+    }
+
+    pub fn file_details(&self) -> Option<&FileTaskDetails> {
+        self.file_details.as_ref()
+    }
+
+    pub(crate) fn prepare_publication(&mut self) -> Result<(), TaskModelError> {
+        if self.direction != TaskDirection::Receive || self.state != TaskState::Finalizing {
+            return Err(TaskModelError::NotRecoverable);
+        }
+        self.file_details
+            .as_mut()
+            .ok_or(TaskModelError::InvalidManifestIdentity)?
+            .publish_prepared = true;
+        Ok(())
+    }
+
+    pub(crate) fn commit_receipt(&mut self, now: i64) -> Result<(), TaskModelError> {
+        let details = self
+            .file_details
+            .as_mut()
+            .ok_or(TaskModelError::InvalidManifestIdentity)?;
+        if self.direction == TaskDirection::Receive && !details.publish_prepared {
+            return Err(TaskModelError::NotRecoverable);
+        }
+        details.receipt_committed = true;
+        self.transition_to(TaskState::Completed, None, now)
     }
 
     pub fn task_id(&self) -> &TaskId {
@@ -510,6 +586,31 @@ impl TaskRecord {
             ));
         }
         self.manifest_identity.validate()?;
+        if let Some(details) = &self.file_details {
+            details
+                .manifest
+                .validate()
+                .map_err(|_| TaskModelError::InvalidManifestIdentity)?;
+            super::protocol::validate_relative_path(&details.relative_path)
+                .map_err(|_| TaskModelError::InvalidManifestIdentity)?;
+            if details.relative_path.rsplit('/').next() != Some(details.manifest.file_name.as_str())
+                || self.manifest_identity
+                    != ManifestIdentity::blake3(
+                        details.manifest.root_hash.0,
+                        details.manifest.total_len,
+                        details.manifest.chunk_size,
+                    )?
+                || details.manifest.chunks.len() > super::protocol::MAX_CHUNKS
+                || (details.receipt_committed != (self.state == TaskState::Completed))
+                || (self.direction == TaskDirection::Send && details.publish_prepared)
+                || (self.direction == TaskDirection::Receive
+                    && details.receipt_committed
+                    && !details.publish_prepared)
+            {
+                return Err(TaskModelError::InvalidManifestIdentity);
+            }
+        }
+
         if !self.local_path.path().is_absolute() {
             return Err(TaskModelError::RelativeLocalPath);
         }
@@ -536,6 +637,14 @@ impl TaskRecord {
             || self.direction != current.direction
             || self.local_path != current.local_path
             || self.manifest_identity != current.manifest_identity
+            || self
+                .file_details
+                .as_ref()
+                .map(|d| (&d.relative_path, &d.manifest))
+                != current
+                    .file_details
+                    .as_ref()
+                    .map(|d| (&d.relative_path, &d.manifest))
         {
             return Err(TaskModelError::ImmutableBinding);
         }
