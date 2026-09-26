@@ -19,6 +19,7 @@ jobs:
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            executable: p2p-desktop
             packages: >-
               pkg-config libfontconfig1-dev libfreetype6-dev libwayland-dev
               libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev
@@ -26,9 +27,11 @@ jobs:
               libxkbcommon-dev libxkbcommon-x11-dev
           - os: windows-2022
             target: x86_64-pc-windows-msvc
+            executable: p2p-desktop.exe
             packages: ""
           - os: macos-14
             target: aarch64-apple-darwin
+            executable: p2p-desktop
             packages: ""
     steps:
       - uses: actions/checkout@v4
@@ -40,6 +43,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check packaging validation boundaries
+        run: python scripts/package-desktop-tests.py
       - name: Check native desktop shell
         run: cargo check --locked --features gui --bin p2p-desktop --target ${{ matrix.target }}
       - name: Build native desktop shell
@@ -52,3 +60,22 @@ jobs:
       - name: Run GUI Clippy
         if: runner.os == 'Linux'
         run: cargo clippy --locked --features gui --all-targets --target ${{ matrix.target }} -- -D warnings
+      - name: Build optimized native candidate
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '13.0'
+        run: cargo build --locked --release --features gui --bin p2p-desktop --target ${{ matrix.target }}
+      - name: Package and verify the literal-head native candidate
+        run: |
+          python scripts/package-desktop.py --binary target/${{ matrix.target }}/release/${{ matrix.executable }} --target ${{ matrix.target }} --output "${{ runner.temp }}/p2p-desktop-candidate"
+          python scripts/verify-desktop-package.py "${{ runner.temp }}/p2p-desktop-candidate/candidate.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: p2p-desktop-${{ matrix.target }}-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            ${{ runner.temp }}/p2p-desktop-candidate/*.tar.gz
+            ${{ runner.temp }}/p2p-desktop-candidate/*.zip
+            ${{ runner.temp }}/p2p-desktop-candidate/*.sha256
+            ${{ runner.temp }}/p2p-desktop-candidate/candidate.json
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0

@@ -1,4 +1,6 @@
-# T001 第三方归属与许可
+# GPUI 第三方归属与许可
+
+T012 原生候选同时提供 dependencies.json、上游 LICENSE/NOTICE/README 和完整 .crate 源码归档，哈希对照 Cargo.lock。macOS 位于 .app/Contents/Resources；其它平台位于包根。该清单覆盖全部 resolved 包，保守包含构建/可选/其它目标依赖；不把本文件中 GPUI 归属当作所有依赖的唯一许可证。系统动态库由系统包管理器提供。
 
 ## GPUI input example
 
