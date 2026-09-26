@@ -10,6 +10,8 @@
 
 mod activity;
 pub(in crate::desktop) mod config;
+#[cfg(test)]
+mod e2e;
 mod files;
 mod frame_budget;
 pub(in crate::desktop) mod instance_lock;
