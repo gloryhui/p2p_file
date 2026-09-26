@@ -1,6 +1,6 @@
 //! Blocking file operations for the desktop adapter. Invoke on a blocking worker.
 use std::{
-    fs::{self, File},
+    fs::File,
     io,
     path::{Path, PathBuf},
 };
@@ -13,7 +13,7 @@ use super::{
 use crate::{
     error::{Error, Result},
     identity::NodeId,
-    protocol::manifest::{DEFAULT_CHUNK_SIZE, FileManifest},
+    protocol::manifest::FileManifest,
     storage::PartialDownload,
     transfer::chunker::{manifest_from_reader, read_chunk},
 };
@@ -39,51 +39,23 @@ pub fn validate_single_file(manifest: &FileManifest, relative: &str) -> Result<(
     Ok(())
 }
 
-pub fn regular_file(path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    #[cfg(windows)]
-    let reparse = {
-        use std::os::windows::fs::MetadataExt;
-        metadata.file_attributes() & 0x400 != 0
-    };
-    #[cfg(not(windows))]
-    let reparse = false;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || reparse {
-        return Err(failure("源或目标必须是普通文件"));
-    }
-    Ok(())
-}
-
-fn bounded_manifest(path: &Path, chunk_size: u32, max_len: u64) -> Result<FileManifest> {
-    use std::io::Read;
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| failure("文件名必须为 UTF-8"))?;
-    let file = File::open(path)?;
-    if file.metadata()?.len() > max_len {
-        return Err(failure("源文件内容已变化或超过资源上限"));
-    }
-    let mut reader = std::io::BufReader::new(file.take(max_len.saturating_add(1)));
-    let manifest = manifest_from_reader(name, chunk_size, &mut reader)?;
-    if manifest.total_len > max_len {
-        return Err(failure("源文件内容已变化或超过资源上限"));
-    }
-    Ok(manifest)
-}
-
-pub fn select_file(store: &mut TaskStore, peer: NodeId, source: PathBuf) -> Result<TaskRecord> {
+pub fn scan_selected_file(
+    peer: NodeId,
+    source: PathBuf,
+    cancellation: &super::files::ScanCancellation,
+) -> Result<TaskRecord> {
     if !source.is_absolute() || source.to_str().is_none() {
         return Err(failure("源路径必须为绝对 UTF-8 路径"));
     }
-    regular_file(&source)?;
-    let metadata = fs::metadata(&source)?;
-    if metadata.len().div_ceil(DEFAULT_CHUNK_SIZE as u64) > protocol::MAX_CHUNKS as u64 {
-        return Err(failure("文件超过桌面清单资源上限"));
-    }
-    let manifest = bounded_manifest(&source, DEFAULT_CHUNK_SIZE, metadata.len())?;
-    validate_single_file(&manifest, &manifest.file_name)?;
-    let record = TaskRecord::new_file(
+    let parent = source.parent().ok_or_else(|| failure("源文件目录不可用"))?;
+    let name = source
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| failure("文件名必须为 UTF-8"))?;
+    let dir = super::secure_fs::root(parent)?;
+    let manifest = super::files::scan_file(&dir, name, cancellation)?;
+    validate_single_file(&manifest, name)?;
+    TaskRecord::new_file(
         TaskId::generate(),
         PeerId::from_node_id(peer),
         TaskDirection::Send,
@@ -91,7 +63,12 @@ pub fn select_file(store: &mut TaskStore, peer: NodeId, source: PathBuf) -> Resu
         manifest.file_name.clone(),
         manifest,
     )
-    .map_err(local_error)?;
+    .map_err(local_error)
+}
+
+#[cfg(test)]
+pub fn select_file(store: &mut TaskStore, peer: NodeId, source: PathBuf) -> Result<TaskRecord> {
+    let record = scan_selected_file(peer, source, &super::files::ScanCancellation::default())?;
     store.create(record.clone()).map_err(local_error)?;
     transition(store, record.task_id(), TaskState::Queued)?;
     store.task(record.task_id()).map_err(local_error)
@@ -406,6 +383,7 @@ mod tests {
     use crate::identity::Identity;
     use crate::protocol::manifest::MIN_CHUNK_SIZE;
     use crate::transfer::chunker::manifest_from_path;
+    use std::fs;
     fn fixture() -> (PathBuf, TaskStore, TaskRecord, Vec<u8>) {
         let root = std::env::temp_dir().join(format!(
             "p2p-desktop-transfer-files-{}",

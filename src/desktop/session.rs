@@ -297,7 +297,10 @@ async fn run_session(
 
     let semaphore = Arc::new(Semaphore::new(MAX_PENDING_PEERS));
     let mut peer_tasks = JoinSet::new();
-    let transfer_commands = Arc::new(Semaphore::new(3));
+    let selection_workers = Arc::new(Semaphore::new(3));
+    let selection_jobs = Arc::new(Semaphore::new(64));
+    let continuation_jobs = Arc::new(Semaphore::new(3));
+    let mut queue_changes = config.transfer.as_ref().map(|service| service.subscribe());
     let mut peers = PeerRegistry::default();
     let mut connections: HashMap<NodeId, (u64, quinn::Connection)> = HashMap::new();
     let mut pending_inbound: HashMap<(NodeId, u64), oneshot::Sender<quinn::Incoming>> =
@@ -329,12 +332,19 @@ async fn run_session(
             Input(Option<SessionInput>),
             Retry,
             Maintenance,
+            QueueChanged,
             Task(Option<std::result::Result<(), tokio::task::JoinError>>),
         }
 
         let wake = tokio::select! {
             command = commands.recv() => Wake::Command(command),
             _ = maintenance.tick() => Wake::Maintenance,
+            _ = async {
+                match queue_changes.as_mut() {
+                    Some(changes) => {let _ = changes.changed().await;},
+                    None => std::future::pending::<()>().await,
+                }
+            } => Wake::QueueChanged,
             message = async {
                 match signal.as_mut() {
                     Some(client) => client.next_event().await,
@@ -362,7 +372,7 @@ async fn run_session(
             }
             Wake::Command(Some(SessionCommand::PauseTask(id))) => {
                 if let Some(service) = &config.transfer
-                    && let Err(error) = service.pause(&id)
+                    && let Err(error) = service.pause_task(id).await
                 {
                     let _ = events
                         .send(SessionEvent::Diagnostic(error.to_string()))
@@ -386,36 +396,58 @@ async fn run_session(
                         .await;
                     continue;
                 };
-                let Some((_, connection)) = connections.get(&peer) else {
+                if peer == local_node {
                     let _ = events
-                        .send(SessionEvent::Diagnostic("请先连接任务绑定的对端".into()))
+                        .send(SessionEvent::Diagnostic("不能向本机发送任务".into()))
                         .await;
                     continue;
+                }
+                let connection = connections
+                    .get(&peer)
+                    .map(|(_, connection)| connection.clone());
+                let job_pool = if matches!(&command, SessionCommand::ResumeTask { .. }) {
+                    continuation_jobs.clone()
+                } else {
+                    selection_jobs.clone()
                 };
-                let connection = connection.clone();
-                let Ok(permit) = transfer_commands.clone().try_acquire_owned() else {
+                let Ok(permit) = job_pool.try_acquire_owned() else {
                     let _ = events
                         .send(SessionEvent::Diagnostic(
-                            "文件后台任务已达上限，请稍后重试".into(),
+                            "文件命令排队已达上限，请稍后重试".into(),
                         ))
                         .await;
                     continue;
                 };
+                let selection_workers = selection_workers.clone();
                 let events = events.clone();
                 peer_tasks.spawn(async move {
                     let _permit = permit;
                     let result = async {
                         match command {
                             SessionCommand::SendFile { source, .. } => {
-                                let id = service.select_file(peer, source).await?;
-                                service.send_file(&connection, peer, id).await
+                                let _worker =
+                                    selection_workers.clone().acquire_owned().await.map_err(
+                                        |_| super::transfer_files::failure("扫描任务已关闭"),
+                                    )?;
+                                service.select_file(peer, source).await.map(|_| ())
                             }
                             SessionCommand::SendDirectory { source, .. } => {
-                                let ids = service.select_directory(peer, source).await?;
-                                service.send_selection(&connection, peer, ids).await
+                                let _worker =
+                                    selection_workers.clone().acquire_owned().await.map_err(
+                                        |_| super::transfer_files::failure("扫描任务已关闭"),
+                                    )?;
+                                service.select_directory(peer, source).await.map(|_| ())
                             }
                             SessionCommand::ResumeTask { id, .. } => {
-                                service.resume(&connection, peer, id).await
+                                let record = service.task(id.clone()).await?;
+                                if record.direction() == super::task_model::TaskDirection::Send {
+                                    service.enqueue_tasks(peer, vec![id]).await
+                                } else {
+                                    let connection = connection.ok_or_else(|| {
+                                        super::transfer_files::failure("请先连接任务绑定的对端")
+                                    })?;
+                                    service.resume(&connection, peer, id).await
+                                }
                             }
                             _ => unreachable!(),
                         }
@@ -758,6 +790,7 @@ async fn run_session(
                     }
                 }
             }
+            Wake::QueueChanged => {}
             Wake::Maintenance => {
                 for (peer, generation) in peers.expired_lookups(time::Instant::now()) {
                     let state = PeerLifecycle::Failed("目标离线或候选等待超时，请重试连接".into());
@@ -792,6 +825,26 @@ async fn run_session(
                 warn!(%error, "desktop session 子任务异常退出");
             }
             Wake::Task(Some(Ok(()))) | Wake::Task(None) => {}
+        }
+        if !session_shutdown && let Some(service) = config.transfer.as_ref() {
+            let ready_connections = connections
+                .iter()
+                .map(|(peer, (_, connection))| (*peer, connection.clone()))
+                .collect();
+            for scheduled in service.dispatch_ready(&ready_connections) {
+                let connection = ready_connections[&scheduled.entry.peer].clone();
+                let service = service.clone();
+                let events = events.clone();
+                // Same structured owner as receive/RPC workers: shutdown aborts
+                // and drains every executor before persisted interruption recovery.
+                peer_tasks.spawn(async move {
+                    if let Err(error) = service.execute_queued(scheduled, connection).await {
+                        let _ = events
+                            .send(SessionEvent::Diagnostic(error.to_string()))
+                            .await;
+                    }
+                });
+            }
         }
     }
 
