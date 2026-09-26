@@ -780,4 +780,161 @@ mod tests {
         }));
         f.cleanup();
     }
+    /// Isolated libtest child only; no production environment hook.
+    #[test]
+    fn publication_process_entry() {
+        let Some(root) = std::env::var_os("P2P_PUBLICATION_KILL_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let point = std::env::var("P2P_PUBLICATION_KILL_POINT").unwrap();
+        let id = TaskId::parse(&ambient::read_to_string(root.join("task-id")).unwrap()).unwrap();
+        let (mut store, _) = TaskStore::open(&root.join("state/tasks.json")).unwrap();
+        let record = disk::begin_attempt(&mut store, &id).unwrap();
+        disk::transition(&mut store, &id, TaskState::Transferring).unwrap();
+        disk::transition(&mut store, &id, TaskState::Finalizing).unwrap();
+        let mut download = disk::open_download(&record).unwrap();
+        assert!(download.is_complete());
+        file_with_boundary(&mut store, &record, &mut download, |at| {
+            if at == point {
+                use std::io::Write;
+                let mut marker = ambient::File::create(root.join("kill-ready.tmp")).unwrap();
+                marker.write_all(at.as_bytes()).unwrap();
+                marker.sync_all().unwrap();
+                drop(marker);
+                ambient::rename(root.join("kill-ready.tmp"), root.join("kill-ready")).unwrap();
+                // The parent kills this real process here. Destructors never run.
+                loop {
+                    std::thread::park();
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        panic!("requested publication boundary was not reached");
+    }
+    #[test]
+    fn os_kill_at_every_publication_boundary_preserves_old_new_and_single_receipt() {
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        for point in [
+            "before-prepared",
+            "after-prepared",
+            "before-backup",
+            "after-backup-filesystem",
+            "after-backup-journal",
+            "before-publish",
+            "after-publish-filesystem",
+            "after-publish-journal",
+            "before-receipt",
+            "after-receipt",
+        ] {
+            let f = Fixture::new();
+            let mut download = f.download();
+            download.checkpoint().unwrap();
+            drop(download);
+            let id = f.record.task_id().clone();
+            ambient::write(f.root.join("task-id"), id.as_str()).unwrap();
+            let root = f.root.clone();
+            let bytes = f.bytes.clone();
+            drop(f.store);
+            let log = ambient::File::create(root.join("process.log")).unwrap();
+            let mut child = ChildGuard(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "desktop::publish::tests::publication_process_entry",
+                        "--nocapture",
+                    ])
+                    .env("P2P_PUBLICATION_KILL_ROOT", &root)
+                    .env("P2P_PUBLICATION_KILL_POINT", point)
+                    .stdout(log.try_clone().unwrap())
+                    .stderr(log)
+                    .spawn()
+                    .unwrap(),
+            );
+            let start = std::time::Instant::now();
+            loop {
+                if root.join("kill-ready").exists() {
+                    break;
+                }
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "child failed at {point}: {}",
+                    ambient::read_to_string(root.join("process.log")).unwrap()
+                );
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(60),
+                    "boundary {point} timed out; {}",
+                    root.display()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(
+                ambient::read_to_string(root.join("kill-ready")).unwrap(),
+                point
+            );
+            child.0.kill().unwrap();
+            let status = child.0.wait().unwrap();
+            assert!(!status.success());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(status.signal(), Some(9));
+            }
+            let (mut store, _) = TaskStore::open(&root.join("state/tasks.json")).unwrap();
+            let mut record = store.task(&id).unwrap();
+            let before = Fixture {
+                root: root.clone(),
+                store,
+                record: record.clone(),
+                bytes: bytes.clone(),
+            };
+            assert!(
+                ambient::read(root.join("receive/nested/report.txt"))
+                    .is_ok_and(|b| b == b"old user content")
+                    || before
+                        .backups()
+                        .iter()
+                        .any(|p| ambient::read(p).unwrap() == b"old user content"),
+                "old data lost at {point}"
+            );
+            store = before.store;
+            if record.state() != TaskState::Completed {
+                assert!(!record.receipt_committed());
+                let row = super::super::ui_model::TaskRow::from_record(&record, 1000.);
+                assert_eq!(row.state, TaskState::Interrupted);
+                assert_eq!(row.rate, 0.);
+                record = disk::begin_attempt(&mut store, &id).unwrap();
+                disk::transition(&mut store, &id, TaskState::Transferring).unwrap();
+                disk::transition(&mut store, &id, TaskState::Finalizing).unwrap();
+                let mut download = disk::open_download(&record).unwrap();
+                assert!(download.is_complete());
+                file(&mut store, &record, &mut download).unwrap();
+            } else {
+                disk::cleanup_staging(&record).unwrap();
+            }
+            let final_fixture = Fixture {
+                root,
+                store,
+                record,
+                bytes,
+            };
+            final_fixture.verify();
+            assert_eq!(
+                final_fixture.store.task(&id).unwrap().state(),
+                TaskState::Completed
+            );
+            println!(
+                "DESKTOP_E2E_PROOF {}",
+                serde_json::json!({"scenario":"publication-os-kill", "platform":std::env::consts::OS,"detail":{"boundary":point,"task_id":id.as_str(),"os_kill":if cfg!(unix){"SIGKILL"}else{"TerminateProcess"},"backup_count":1,"receipt":true,"hash":blake3::hash(&final_fixture.bytes).to_hex().to_string()}})
+            );
+            final_fixture.cleanup();
+        }
+    }
 }

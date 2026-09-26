@@ -344,6 +344,8 @@ async fn run_session(
     let mut queue_changes = config.transfer.as_ref().map(|service| service.subscribe());
     let mut peers = PeerRegistry::default();
     let mut connections: HashMap<NodeId, (u64, quinn::Connection)> = HashMap::new();
+    // Candidate sets are bound to the same peer generation as authenticated connections.
+    let mut peer_candidates: HashMap<NodeId, (u64, Vec<Candidate>)> = HashMap::new();
     let mut pending_inbound: HashMap<(NodeId, u64), oneshot::Sender<quinn::Incoming>> =
         HashMap::new();
     let mut queued_lookups: VecDeque<(NodeId, u64)> = VecDeque::new();
@@ -567,6 +569,19 @@ async fn run_session(
                         }
                     }
                     BeginPeerAttempt::AlreadyActive(_) => {
+                        // An explicit Connect can discover a restarted peer before Quinn's
+                        // old connection idle timeout. Unchanged candidates preserve it.
+                        if peers.state(peer) == Some(&PeerLifecycle::Connected)
+                            && let Some(client) = signal.as_ref()
+                        {
+                            let message = if client.request_lookup(peer).await.is_ok() {
+                                "已请求核对对端地址；现有连接在映射不变时继续使用"
+                            } else {
+                                "信令查询暂时不可用；现有直连仍保留，请稍后重试连接"
+                            };
+                            let _ = events.send(SessionEvent::Diagnostic(message.into())).await;
+                            continue;
+                        }
                         let _ = events
                             .send(SessionEvent::Diagnostic(format!(
                                 "已存在对端 {} 的连接请求，忽略重复点击",
@@ -583,6 +598,7 @@ async fn run_session(
             }
             Wake::Command(Some(SessionCommand::ReconfigureSignal(server))) => {
                 signal_server = server;
+                peer_candidates.clear();
                 signal_generation = signal_generation.wrapping_add(1);
                 // An explicit server change supersedes this generation's attempts
                 // and authenticated peers. An involuntary outage below preserves them.
@@ -643,7 +659,46 @@ async fn run_session(
                     candidates,
                     token,
                 } => {
-                    start_peer_attempt(
+                    let canonical = canonical_candidates(&candidates);
+                    if peers.state(node_id) == Some(&PeerLifecycle::Connected)
+                        && peer_candidates
+                            .get(&node_id)
+                            .is_some_and(|(generation, old)| {
+                                peers.is_current(node_id, *generation) && *old == canonical
+                            })
+                    {
+                        let _ = events
+                            .send(SessionEvent::Diagnostic(
+                                "地址核对完毕，现有认证连接继续使用".into(),
+                            ))
+                            .await;
+                    }
+                    if peers.state(node_id) == Some(&PeerLifecycle::Connected)
+                        && peer_candidates
+                            .get(&node_id)
+                            .is_some_and(|(generation, old)| {
+                                peers.is_current(node_id, *generation) && *old != canonical
+                            })
+                        && !network.reachable_candidates(&candidates).is_empty()
+                    {
+                        // Registered identity now advertises a different socket mapping.
+                        // Retire only this generation; new Punch/QUIC/identity/capability
+                        // checks remain mandatory. Old closure callbacks are fenced.
+                        if let Some((generation, connection)) = connections.remove(&node_id) {
+                            connection.close(0u32.into(), b"peer mapping changed");
+                            if peers.transition(node_id, generation, PeerLifecycle::Disconnected) {
+                                emit_peer_state(
+                                    &events,
+                                    node_id,
+                                    generation,
+                                    PeerLifecycle::Disconnected,
+                                )
+                                .await;
+                            }
+                        }
+                        peer_candidates.remove(&node_id);
+                    }
+                    if let Some(generation) = start_peer_attempt(
                         node_id,
                         candidates,
                         token,
@@ -657,7 +712,10 @@ async fn run_session(
                         &mut pending_inbound,
                         &mut peer_tasks,
                     )
-                    .await;
+                    .await
+                    {
+                        peer_candidates.insert(node_id, (generation, canonical));
+                    }
                 }
                 SignalMessage::Error { reason } => {
                     let detail = format!("信令查询失败：{reason}");
@@ -838,6 +896,7 @@ async fn run_session(
             })) => {
                 pending_inbound.remove(&(peer, generation));
                 if peers.transition(peer, generation, PeerLifecycle::Failed(detail.clone())) {
+                    peer_candidates.remove(&peer);
                     emit_peer_state(
                         &events,
                         peer,
@@ -858,6 +917,7 @@ async fn run_session(
                         .is_some_and(|(current, _)| *current == generation)
                 {
                     connections.remove(&peer);
+                    peer_candidates.remove(&peer);
                     if peers.transition(peer, generation, PeerLifecycle::Disconnected) {
                         emit_peer_state(&events, peer, generation, PeerLifecycle::Disconnected)
                             .await;
@@ -1031,6 +1091,17 @@ async fn accept_incoming_loop(endpoint: quinn::Endpoint, inputs: mpsc::Sender<Se
     }
 }
 
+fn canonical_candidates(candidates: &[Candidate]) -> Vec<Candidate> {
+    let mut result = candidates
+        .iter()
+        .copied()
+        .filter(|c| c.kind != CandidateKind::Relay)
+        .collect::<Vec<_>>();
+    result.sort_by_key(|c| (c.kind, c.addr));
+    result.dedup();
+    result
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn start_peer_attempt(
     peer: NodeId,
@@ -1045,9 +1116,9 @@ async fn start_peer_attempt(
     peers: &mut PeerRegistry,
     pending_inbound: &mut HashMap<(NodeId, u64), oneshot::Sender<quinn::Incoming>>,
     tasks: &mut JoinSet<()>,
-) {
+) -> Option<u64> {
     if peer == local_node {
-        return;
+        return None;
     }
     let generation = match peers.state(peer) {
         Some(PeerLifecycle::PeerPending) => peers.generation(peer),
@@ -1059,13 +1130,11 @@ async fn start_peer_attempt(
                 let _ = events
                     .send(SessionEvent::Diagnostic("对端连接数已达资源上限".into()))
                     .await;
-                return;
+                return None;
             }
         },
     };
-    let Some(generation) = generation else {
-        return;
-    };
+    let generation = generation?;
     let Ok(permit) = Arc::clone(semaphore).try_acquire_owned() else {
         let detail = "待认证连接已达资源上限".to_owned();
         peers.transition(peer, generation, PeerLifecycle::Failed(detail.clone()));
@@ -1077,7 +1146,7 @@ async fn start_peer_attempt(
         )
         .await;
         let _ = events.send(SessionEvent::Diagnostic(detail)).await;
-        return;
+        return None;
     };
 
     let filtered: Vec<Candidate> = candidates
@@ -1095,11 +1164,11 @@ async fn start_peer_attempt(
             PeerLifecycle::Failed(detail.clone()),
         )
         .await;
-        return;
+        return None;
     }
 
     if !peers.transition(peer, generation, PeerLifecycle::Punching) {
-        return;
+        return None;
     }
     emit_peer_state(events, peer, generation, PeerLifecycle::Punching).await;
     emit_lifecycle(events, NetworkLifecycle::Punching { peer }).await;
@@ -1133,6 +1202,7 @@ async fn start_peer_attempt(
                 .await;
         }
     });
+    Some(generation)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1832,5 +1902,58 @@ mod tests {
         let _ = server.await;
         drop((a, b));
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn explicit_mapping_refresh_preserves_unchanged_authenticated_connection() {
+        let (addr, server) = start_local_server().await;
+        let ia = Identity::generate();
+        let ib = Identity::generate();
+        let (a, mut ea) = spawn(ia.clone(), local_config(addr)).unwrap();
+        let (b, mut eb) = spawn(ib.clone(), local_config(addr)).unwrap();
+        wait_signal_online(&mut ea).await;
+        wait_signal_online(&mut eb).await;
+        a.connect_peer(ib.node_id()).unwrap();
+        wait_connected(&mut ea, &[ib.node_id()]).await;
+        wait_connected(&mut eb, &[ia.node_id()]).await;
+        let ca = inspect(&a).await[&ib.node_id()].1.clone();
+        let cb = inspect(&b).await[&ia.node_id()].1.clone();
+        while ea.try_recv().is_ok() {}
+        while eb.try_recv().is_ok() {}
+        a.connect_peer(ib.node_id()).unwrap();
+        for events in [&mut ea, &mut eb] {
+            time::timeout(Duration::from_secs(3),async {
+                loop { if matches!(events.recv().await.unwrap(),SessionEvent::Diagnostic(s) if s=="地址核对完毕，现有认证连接继续使用") { break; } }
+            }).await.expect("must observe processed unchanged candidate response, not just queued Connect");
+        }
+        assert_eq!(
+            inspect(&a).await[&ib.node_id()].1.stable_id(),
+            ca.stable_id()
+        );
+        assert_eq!(
+            inspect(&b).await[&ia.node_id()].1.stable_id(),
+            cb.stable_id()
+        );
+        let send = async {
+            let mut s = ca.open_uni().await.unwrap();
+            s.write_all(b"unchanged mapping live").await.unwrap();
+            s.finish().unwrap();
+            s.stopped().await.unwrap();
+        };
+        let receive = async {
+            let mut r = cb.accept_uni().await.unwrap();
+            assert_eq!(r.read_to_end(128).await.unwrap(), b"unchanged mapping live");
+        };
+        time::timeout(Duration::from_secs(3), async {
+            tokio::join!(send, receive);
+        })
+        .await
+        .unwrap();
+        assert!(ca.close_reason().is_none());
+        assert!(cb.close_reason().is_none());
+        a.shutdown();
+        b.shutdown();
+        drop((a, b));
+        server.abort();
+        let _ = server.await;
     }
 }

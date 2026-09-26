@@ -59,13 +59,15 @@ pub(crate) struct TransferService {
     #[cfg(test)]
     drop_completion: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
-    first_chunk_gate: TestGate,
+    pub(super) first_chunk_gate: TestGate,
     #[cfg(test)]
-    checkpoint_gate: TestGate,
+    pub(super) checkpoint_gate: TestGate,
     #[cfg(test)]
     admission_gate: TestGate,
     #[cfg(test)]
     source_cleanup_gate: TestGate,
+    #[cfg(test)]
+    pub(super) publication_error: Arc<Mutex<Option<std::io::ErrorKind>>>,
 }
 #[allow(dead_code)] // T010 consumes these safe domain fields in its task list.
 pub(crate) struct TransferPresentation {
@@ -157,6 +159,8 @@ impl TransferService {
             admission_gate: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             source_cleanup_gate: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            publication_error: Arc::new(Mutex::new(None)),
         }
     }
     async fn store<T: Send + 'static>(
@@ -1501,7 +1505,15 @@ impl TransferService {
                 self.state(id, TaskState::Finalizing).await?;
                 let record = record.clone();
                 let output = download.clone();
+                #[cfg(test)]
+                let publication_error = self.publication_error.clone();
                 self.store(move |store| {
+                    #[cfg(test)]
+                    if let Some(kind) = publication_error.lock().unwrap().take() {
+                        return Err(
+                            std::io::Error::new(kind, "test-only publication I/O failure").into(),
+                        );
+                    }
                     disk::publish(
                         store,
                         &record,

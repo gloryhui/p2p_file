@@ -162,6 +162,8 @@ cargo run --locked --features gui --bin p2p-desktop
 
 设置说明可信设备 MVP 的接收边界：知道 ID 的节点可发送文件。接收目录修改只影响新任务，对端输入框修改不改变旧任务绑定。Linux 系统文件选择器需要可用的 desktop portal。原生窗口操作与截图见 [T010 验证证据](docs/gpui-mvp/evidence/t010-ui-validation.md)；跨物理平台、Wayland、中文 IME、双 NAT 和安装包验收仍在后续流水线中记录。
 
+桌面进程恢复与故障验证：`python3 scripts/desktop-e2e.py --output /tmp/desktop-e2e-new-evidence`；支持 Linux/Windows/macOS 的测试二进制，输出可审计矩阵。它验证真实 Session/OS 进程与 loopback，不代表物理设备或双 NAT；细节见 [T011 矩阵](docs/gpui-mvp/evidence/t011-process-matrix.md)。端点重启后显式连接、再继续原任务，不自动恢复文件。
+
 ### P2P / QUIC 纯网络测速
 
 测速 CLI 默认仍为 10 秒，`--duration` 支持 1–600 秒。桌面测速业务支持 30 秒或 1–10 分钟，原生界面已接入文件/目录、暂停/继续和测速按钮。长时边界由可控时钟回归验证；真实 600 秒与双 NAT 证据以 [GPUI 总控 Issue #24](https://github.com/gloryhui/p2p_file/issues/24) 为准。
