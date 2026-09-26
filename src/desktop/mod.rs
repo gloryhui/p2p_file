@@ -13,6 +13,8 @@
 pub(in crate::desktop) mod config;
 pub(in crate::desktop) mod instance_lock;
 mod network_state;
+#[allow(dead_code)] // T005 wire guards are consumed by transfer/speed business in T006-T009.
+mod protocol;
 mod session;
 #[allow(dead_code)] // Task list consumers arrive in later GPUI task integrations.
 mod task_events;
@@ -902,8 +904,11 @@ impl DesktopShell {
                                             network_state::PeerLifecycle::Authenticating => {
                                                 "正在执行 QUIC 与身份认证".to_owned()
                                             }
+                                            network_state::PeerLifecycle::Negotiating => {
+                                                "正在协商桌面版本与能力".to_owned()
+                                            }
                                             network_state::PeerLifecycle::Connected => {
-                                                "已认证连接".to_owned()
+                                                "桌面协议已就绪".to_owned()
                                             }
                                             network_state::PeerLifecycle::Disconnected => {
                                                 "连接已断开".to_owned()
