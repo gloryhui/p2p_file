@@ -22,7 +22,7 @@
 | `cargo build --locked --offline` | PASS (exit 0) |
 | `./scripts/e2e.sh`（先构建本次 CLI） | PASS (exit 0) |
 
-最终源代码连续三轮完整 GUI library 并行测试均 323 passed / 0 failed / 0 ignored，测试运行耗时依次为 2.93s、2.90s、2.88s。默认核心套件 270 passed，另有独立集成测试 1 passed。
+最终源代码连续三轮完整 GUI library 并行测试均 323 passed / 0 failed / 0 ignored，测试运行耗时依次为 2.90s、2.90s、2.85s。默认核心套件 270 passed，另有独立集成测试 1 passed。
 
 CLI E2E 覆盖被动 serve、隧道回显及并发连接、内存测速不落盘、活跃连接跨越重新打洞宽限期、2,000,000 字节文件 SHA256 一致、候选回退、断开后第二次连接。仅用于已有 CLI 兼容回归；GUI 未暴露 tunnel。
 
@@ -40,3 +40,5 @@ CLI E2E 覆盖被动 serve、隧道回显及并发连接、内存测速不落盘
 - 尚无 Windows 10/11 真机、Apple Silicon 交互或本任务人工 UI 验收证据。
 - 三平台 CI 的最终运行链接以本 PR exact head 的 Issue #24 审计为准，不能用此本地记录代替。
 - `proc-macro-error2 2.0.1` 有现存 future-incompatibility 提示；不是本项目 Clippy 错误，不改变通过标准。
+
+复核补强：重配置测试先等待旧连接发出 Hello，再取消卡住的注册，避免 TCP accept 与 Hello 发送之间的时序假设；第三 peer 测试明确断言原连接 stable_id 不变且两条连接均存活。仅测试断言补强后，全部本地必需检查重跑通过；CLI E2E 对应的生产代码未变。

@@ -1138,11 +1138,25 @@ mod tests {
         wait_connected(&mut events_a, &[identity_b.node_id()]).await;
         wait_connected(&mut events_b, &[identity_a.node_id()]).await;
 
+        let before_b = inspect(&handle_b).await;
+        let original_connection = &before_b[&identity_a.node_id()].1;
+
         // Keep B<->A alive while C requests B. One registration per identity and
         // the shared endpoint must allow this third peer to progress independently.
         handle_c.connect_peer(identity_b.node_id()).unwrap();
         wait_connected(&mut events_b, &[identity_c.node_id()]).await;
         wait_connected(&mut events_c, &[identity_b.node_id()]).await;
+        let after_b = inspect(&handle_b).await;
+        assert_eq!(after_b.len(), 2);
+        assert_eq!(
+            after_b[&identity_a.node_id()].1.stable_id(),
+            original_connection.stable_id()
+        );
+        assert!(
+            after_b
+                .values()
+                .all(|(_, connection)| connection.close_reason().is_none())
+        );
 
         handle_a.shutdown();
         handle_b.shutdown();
@@ -1358,6 +1372,16 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        // TCP accept alone is not a registration barrier: wait for Hello before
+        // canceling, so this test really exercises a stalled registration.
+        let mut hello_prefix = [0u8; 1];
+        time::timeout(
+            Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read_exact(&mut old_stream, &mut hello_prefix),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         handle.reconfigure_signal(new_address.to_string()).unwrap();
         wait_signal_online(&mut events).await;
         // Drain the original Hello; canceled registration must then close TCP.
@@ -1369,7 +1393,10 @@ mod tests {
         .await
         .expect("superseded registration must release its socket")
         .unwrap();
-        assert!(!bytes.is_empty());
+        assert!(
+            !bytes.is_empty(),
+            "remaining Hello frame must be drained before EOF"
+        );
         handle.shutdown();
         drop(handle);
         server.abort();
