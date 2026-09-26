@@ -385,6 +385,7 @@ mod tests {
             b"untouched"
         );
         assert!(!outside.join("new.txt").exists());
+        drop(directory);
         ambient::remove_dir(link).unwrap();
         ambient::remove_dir_all(path).unwrap();
         ambient::remove_dir_all(outside).unwrap();

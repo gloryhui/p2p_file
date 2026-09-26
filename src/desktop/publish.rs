@@ -500,6 +500,7 @@ mod tests {
             ambient::read(f.root.join("receive/nested/report.txt")).unwrap(),
             f.bytes
         );
+        drop(download);
         f.cleanup();
     }
     #[test]
@@ -528,6 +529,7 @@ mod tests {
         let mut download = disk::open_download(&f.record).unwrap();
         file(&mut f.store, &f.record, &mut download).unwrap();
         f.verify();
+        drop(download);
         f.cleanup();
     }
     #[test]
@@ -561,6 +563,7 @@ mod tests {
         let mut download = disk::open_download(&f.record).unwrap();
         file(&mut f.store, &f.record, &mut download).unwrap();
         f.verify();
+        drop(download);
         f.cleanup();
     }
     #[test]
@@ -583,6 +586,7 @@ mod tests {
             ambient::read(f.root.join("receive/nested/report.txt")).unwrap(),
             b"old user content"
         );
+        drop(dir);
         f.cleanup();
     }
     #[cfg(windows)]
@@ -608,6 +612,7 @@ mod tests {
         let mut download = disk::open_download(&f.record).unwrap();
         file(&mut f.store, &f.record, &mut download).unwrap();
         f.verify();
+        drop(download);
         f.cleanup();
     }
     #[cfg(unix)]
@@ -660,6 +665,7 @@ mod tests {
         );
         assert_eq!(ambient::read(&target).unwrap(), b"external replacement");
         assert_eq!(f.backups().len(), 1);
+        drop(download);
         f.cleanup();
     }
     #[test]
@@ -693,6 +699,8 @@ mod tests {
             ambient::read(f.root.join("receive/nested/report.txt")).unwrap(),
             b"old user content"
         );
+        drop(download);
+        drop(stage);
         f.cleanup();
     }
     #[test]

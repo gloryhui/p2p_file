@@ -713,6 +713,13 @@ impl TransferService {
             })
             .await?;
         if record.file_details().unwrap().receipt_committed {
+            let completed = record.clone();
+            if blocking(move || disk::cleanup_staging(&completed))
+                .await
+                .is_err()
+            {
+                tracing::warn!("持久回执重发；暂存清理仍需重试");
+            }
             io.send(Message::Completed {
                 task_id,
                 root_hash: record.file_details().unwrap().manifest.root_hash,
@@ -1883,7 +1890,9 @@ mod tests {
         let pair = Pair::new().await;
         let source = pair.root.join("invalid");
         fs::create_dir(&source).unwrap();
-        fs::write(source.join("CON.txt"), []).unwrap();
+        // Windows treats CON.txt as a device rather than creating a file.
+        // This real directory entry is illegal to the portable protocol on all OSes.
+        fs::create_dir(source.join(".p2p-desktop")).unwrap();
         assert!(pair.a.select_directory(pair.ib, source).await.is_err());
         assert!(pair.a.snapshot().await.unwrap().is_empty());
         pair.shutdown().await;

@@ -182,14 +182,21 @@ pub fn rename_no_replace(dir: &Dir, from: &str, to: &str) -> Result<()> {
         len: u32,
         name: [u16; 1],
     }
-    #[link(name = "kernel32")]
+    #[repr(C)]
+    struct IoStatusBlock {
+        status_or_pointer: usize,
+        information: usize,
+    }
+    #[link(name = "ntdll")]
     unsafe extern "system" {
-        fn SetFileInformationByHandle(
+        fn NtSetInformationFile(
             handle: *mut std::ffi::c_void,
-            class: i32,
+            status: *mut IoStatusBlock,
             data: *const std::ffi::c_void,
             length: u32,
+            class: i32,
         ) -> i32;
+        fn RtlNtStatusToDosError(status: i32) -> u32;
     }
     let mut options = OpenOptions::new();
     options
@@ -213,8 +220,21 @@ pub fn rename_no_replace(dir: &Dir, from: &str, to: &str) -> Result<()> {
             std::ptr::addr_of_mut!((*data).name).cast::<u16>(),
             name.len(),
         );
-        if SetFileInformationByHandle(file.as_raw_handle(), 3, data.cast(), size as u32) == 0 {
-            return Err(io::Error::last_os_error().into());
+        let mut status = IoStatusBlock {
+            status_or_pointer: 0,
+            information: 0,
+        };
+        // Native FileRenameInformation supports a pinned relative RootDirectory;
+        // the Win32 wrapper rejects this parameter combination on tested Windows.
+        let result = NtSetInformationFile(
+            file.as_raw_handle(),
+            &mut status,
+            data.cast(),
+            size as u32,
+            10,
+        );
+        if result < 0 {
+            return Err(io::Error::from_raw_os_error(RtlNtStatusToDosError(result) as i32).into());
         }
     }
     Ok(())
@@ -298,6 +318,7 @@ mod tests {
         assert!(parent(&dir, "named/file", true).is_err());
         ambient::write(path.join("é.txt"), []).unwrap();
         assert!(parent(&dir, "e\u{301}.txt", true).is_err());
+        drop(dir);
         ambient::remove_dir_all(path).unwrap();
     }
 }

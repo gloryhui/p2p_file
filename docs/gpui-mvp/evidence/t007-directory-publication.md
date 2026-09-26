@@ -26,7 +26,7 @@
 - 同毫秒备份名已有占用时原子 no-replace + 固定 -1 后缀，占用文件不改变。
 - 外部进程在备份后抢占正式名、回执前替换正式文件：不覆盖抢占者、不提交假回执，旧备份和新 staging 保留；冲突清除后恢复不重复备份。
 - PermissionDenied 故障注入、损坏 journal 绑定、原子 no-replace 目标占用，均保留可恢复信息。
-- 根以下 symlink 和原路径替换链接不被跟随；staging .part/.bitmap 链接不触碰未选择文件；NFC/大小写别名明确拒绝。最大合法 basename 使用固定 staging 内部名成功发布。
+- 根以下 symlink 和原路径替换链接不被跟随；staging .part/.bitmap 链接不触碰未选择文件；NFC/大小写别名明确拒绝。最大合法 basename 使用固定 staging 内部名成功发布并清理 data.part；新增清理断言先复现失败，再修复通过。回执重发会重试此前清理。
 - 扫描取消、读取中取消、4096 条目上限、非法 ADS/设备名/UNC/穿越/内部命名空间、扫描失败不产生部分组。
 - 原 T006 双端/同时暂停、最后一片竞态、5 秒暂停超时、真实 sender/receiver OS 强杀后 70 MiB 续传、丢完成帧回执重放继续通过。
 

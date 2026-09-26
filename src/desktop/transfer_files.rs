@@ -378,6 +378,11 @@ pub fn cleanup_staging(record: &TaskRecord) -> Result<()> {
         PathBuf::from("data.part"),
         PathBuf::from("data.bitmap"),
     ] {
+        // A new task with a 255-byte basename never created the overlong
+        // legacy name. Do not let that nonexistent spelling block fixed-name cleanup.
+        if path.file_name().unwrap().to_str().unwrap().len() > 255 {
+            continue;
+        }
         match dir.remove_file(path) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -476,6 +481,7 @@ mod tests {
             TaskState::Completed
         );
         drop(store);
+        drop(download);
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -605,7 +611,12 @@ mod tests {
         assert_eq!(download.temp_path().file_name().unwrap(), "data.part");
         fill(&mut download, &bytes);
         transition(&mut store, record.task_id(), TaskState::Finalizing).unwrap();
+        let staging = download.temp_path().to_path_buf();
         publish(&mut store, &record, &mut download).unwrap();
+        assert!(
+            !staging.exists(),
+            "long portable basename left completed staging behind"
+        );
         assert_eq!(fs::read(root.join("receive").join(name)).unwrap(), bytes);
         drop(download);
         drop(store);
