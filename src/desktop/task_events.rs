@@ -42,14 +42,40 @@ impl TaskEvent {
 #[derive(Debug, Default)]
 pub(crate) struct TaskEventBuffer {
     events: VecDeque<TaskEvent>,
+    resync_required: bool,
 }
 
 impl TaskEventBuffer {
     pub(crate) fn push(&mut self, event: TaskEvent) {
+        if event.kind == TaskEventKind::ProgressHintChanged {
+            if let Some(existing) = self.events.iter_mut().find(|old| {
+                old.task_id == event.task_id && old.kind == TaskEventKind::ProgressHintChanged
+            }) {
+                *existing = event;
+                return;
+            }
+            if self.events.len() == MAX_PENDING_EVENTS {
+                return;
+            }
+        }
         if self.events.len() == MAX_PENDING_EVENTS {
-            self.events.pop_front();
+            if let Some(index) = self
+                .events
+                .iter()
+                .position(|old| old.kind == TaskEventKind::ProgressHintChanged)
+            {
+                self.events.remove(index);
+            } else {
+                // An arbitrary number of terminal transitions cannot fit in a
+                // bounded FIFO. Explicitly require authoritative resynchronization.
+                self.events.pop_front();
+                self.resync_required = true;
+            }
         }
         self.events.push_back(event);
+    }
+    pub(crate) fn take_resync_required(&mut self) -> bool {
+        std::mem::take(&mut self.resync_required)
     }
 
     pub(crate) fn drain(&mut self) -> Vec<TaskEvent> {
@@ -97,5 +123,52 @@ mod tests {
             }
         );
         assert!(buffer.drain().is_empty());
+    }
+    #[test]
+    fn progress_is_coalesced_and_cannot_evict_a_terminal_event() {
+        let mut buffer = TaskEventBuffer::default();
+        let id = TaskId::generate();
+        for time in 0..10000 {
+            buffer.record(id.clone(), time, TaskEventKind::ProgressHintChanged);
+        }
+        assert_eq!(buffer.events.len(), 1);
+        assert_eq!(buffer.events[0].at_unix_ms(), 9999);
+        let terminal = TaskId::generate();
+        buffer.record(
+            terminal.clone(),
+            10001,
+            TaskEventKind::StateChanged {
+                from: TaskState::Finalizing,
+                to: TaskState::Completed,
+            },
+        );
+        for time in 0..10000 {
+            buffer.record(TaskId::generate(), time, TaskEventKind::ProgressHintChanged);
+        }
+        assert_eq!(buffer.events.len(), MAX_PENDING_EVENTS);
+        assert!(
+            buffer
+                .drain()
+                .iter()
+                .any(|event| event.task_id() == &terminal)
+        );
+        assert!(!buffer.take_resync_required());
+    }
+    #[test]
+    fn lifecycle_overflow_requires_snapshot_even_after_events_are_drained() {
+        let mut buffer = TaskEventBuffer::default();
+        for time in 0..MAX_PENDING_EVENTS + 10 {
+            buffer.record(
+                TaskId::generate(),
+                time as i64,
+                TaskEventKind::StateChanged {
+                    from: TaskState::Finalizing,
+                    to: TaskState::Completed,
+                },
+            );
+        }
+        assert_eq!(buffer.drain().len(), MAX_PENDING_EVENTS);
+        assert!(buffer.take_resync_required());
+        assert!(!buffer.take_resync_required());
     }
 }

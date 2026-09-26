@@ -308,6 +308,10 @@ impl TaskStore {
         self.events.drain()
     }
 
+    pub(crate) fn take_event_resync_required(&mut self) -> bool {
+        self.events.take_resync_required()
+    }
+
     fn ensure_healthy(&self) -> Result<(), TaskStoreError> {
         if self.poisoned {
             Err(TaskStoreError::CommitUncertain)

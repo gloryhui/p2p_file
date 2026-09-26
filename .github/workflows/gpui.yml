@@ -32,6 +32,8 @@ jobs:
             packages: ""
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Install Linux GPUI development packages
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y ${{ matrix.packages }}
@@ -46,7 +48,7 @@ jobs:
         if: runner.os == 'macOS'
         run: sudo ifconfig lo0 alias 127.0.0.2 up
       - name: Run full GUI library regressions
-        run: "cargo test --locked --features gui --lib"
+        run: "cargo test --locked --features gui --lib --target ${{ matrix.target }}"
       - name: Run GUI Clippy
         if: runner.os == 'Linux'
-        run: cargo clippy --locked --features gui --all-targets -- -D warnings
+        run: cargo clippy --locked --features gui --all-targets --target ${{ matrix.target }} -- -D warnings
