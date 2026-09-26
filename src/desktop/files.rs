@@ -299,7 +299,12 @@ mod tests {
             .contains("链接")
         );
         ambient::remove_file(path.join("link")).unwrap();
-        for pair in [["name", "NAME"], ["é.txt", "e\u{301}.txt"]] {
+        for pair in [
+            ["name", "NAME"],
+            ["é.txt", "e\u{301}.txt"],
+            ["σ.txt", "ς.txt"],
+            ["I.txt", "ı.txt"],
+        ] {
             for name in pair {
                 ambient::write(path.join(name), []).unwrap();
             }
@@ -351,6 +356,9 @@ mod tests {
     fn collision_keys_detect_case_and_unicode_normalization_on_all_platforms() {
         assert_eq!(fs::name_key("name"), fs::name_key("NAME"));
         assert_eq!(fs::name_key("é.txt"), fs::name_key("e\u{301}.txt"));
+        assert_eq!(fs::name_key("σ.txt"), fs::name_key("ς.txt"));
+        assert_eq!(fs::name_key("I.txt"), fs::name_key("ı.txt"));
+        assert_eq!(fs::name_key("straße.txt"), fs::name_key("STRASSE.txt"));
     }
     #[cfg(windows)]
     #[test]

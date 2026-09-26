@@ -12,7 +12,14 @@ pub fn fail(message: &str) -> Error {
     Error::Protocol(message.into())
 }
 pub fn name_key(name: &str) -> String {
-    name.nfc().flat_map(char::to_lowercase).collect()
+    // Canonicalize both directions: lowercasing alone misses final sigma,
+    // dotless i and expanding uppercase aliases. Conservatively reject
+    // these portable collisions, then normalize any newly emitted marks.
+    name.nfc()
+        .flat_map(char::to_uppercase)
+        .flat_map(char::to_lowercase)
+        .nfc()
+        .collect()
 }
 
 /// The explicitly configured/selected root is the ambient authority boundary.
@@ -284,14 +291,15 @@ mod tests {
     #[test]
     fn existing_fifo_is_rejected_without_waiting_for_another_process() {
         let path = fixture();
-        let dir = root(&path).unwrap();
-        rustix::fs::mkfifoat(
-            &dir,
-            "pipe",
-            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-        )
-        .unwrap();
-        drop(dir);
+        // rustix::mkfifoat is unavailable on Apple targets. Both native
+        // Unix runners provide the POSIX fixture utility; failure is not skipped.
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(path.join("pipe"))
+                .status()
+                .unwrap()
+                .success()
+        );
         let worker_path = path.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
