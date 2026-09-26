@@ -8,6 +8,7 @@
 - `desktop::transfer`：已认证真实 loopback QUIC 的正向、反向与空文件；sender/receiver/同时暂停后 ID-only Continue；暂停撞最后一片；5 秒暂停确认超时保留下载；切断 Completed 后幂等重放；发布失败不完成且接收方可在冲突消除后继续。
 - `session_command_sends_to_passive_peer_using_owned_transfer_service`：长期信令会话建立并协商后，经有界 SendFile 命令到被动 peer 的实际落盘文件校验。
 - `queued_old_epoch_store_write_cannot_reactivate_an_interrupted_task`：单阻塞 worker 上确定性排队旧写入与中断，旧 epoch 不得重新激活任务。
+- 发送方已记录不可重试源变化后，接收方 Continue 仍收到具体 SourceChanged 并转 Failed，不能退化成可反复重试的笼统中断；新增测试先复现失败，再修复通过。
 - 追加协议帧的 golden tag、方向/索引/大小边界，保留原 CLI discriminant 与回归。
 
 ## 真实进程强杀
@@ -33,8 +34,8 @@ checkpoint 片数受真实 1 秒/64 MiB 阈值与运行速度影响，不是固�
 | `cargo fmt --all -- --check` | PASS |
 | `cargo test --locked --offline --all-targets` | 270 library + 1 integration PASS |
 | `cargo clippy --locked --offline --all-targets -- -D warnings` | PASS |
-| `cargo test --locked --offline --features gui --lib` | 351 passed，0 failed/ignored |
-| `cargo test --locked --offline --features gui --lib desktop::` | 81 passed，0 failed/ignored |
+| `cargo test --locked --offline --features gui --lib` | 352 passed，0 failed/ignored |
+| `cargo test --locked --offline --features gui --lib desktop::` | 82 passed，0 failed/ignored |
 | `cargo test --locked --offline --features gui --lib discovery::signal` | PASS |
 | `cargo test --locked --offline --features gui --lib net::` | PASS |
 | `cargo test --locked --offline --features gui --lib transport::` | PASS |

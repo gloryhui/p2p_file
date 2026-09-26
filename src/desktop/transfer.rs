@@ -486,8 +486,16 @@ impl TransferService {
                                 let id=task_id.clone();let lookup=id.clone();
                                 let checked=service.read_store(move|store|disk::bound_task(store,peer,&lookup)).await;
                                 if !matches!(checked, Ok(ref record) if record.direction()==TaskDirection::Send && can_continue(record)) {
-                                    protocol::write(&mut send,&Frame{request_id:1,message:Message::Error{task_id:id.clone(),code:ErrorCode::UnknownTask}}).await?;
-                                    let _=send.finish();return Err(disk::failure("未授权继续请求"));
+                                    let code = match &checked {
+                                        Ok(record) if record.direction()==TaskDirection::Send => match record.diagnostic().map(TaskDiagnostic::code) {
+                                            Some(TaskErrorCode::SourceChanged) => ErrorCode::SourceChanged,
+                                            Some(TaskErrorCode::SourceUnavailable) => ErrorCode::SourceMissing,
+                                            _ => ErrorCode::InvalidState,
+                                        },
+                                        _ => ErrorCode::UnknownTask,
+                                    };
+                                    protocol::write(&mut send,&Frame{request_id:1,message:Message::Error{task_id:id.clone(),code}}).await?;
+                                    let _=send.finish();return Err(remote_error(code));
                                 }
                                 service.wait_previous_attempt(&id).await?;
                                 let (_guard,pause)=match service.claim(peer,&id) {
@@ -1586,5 +1594,44 @@ mod tests {
         });
         drop(service);
         fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn receiver_continue_reports_previously_detected_source_change() {
+        let pair = Pair::new().await;
+        let (id, _) = pair.select(4 * 1024 * 1024).await;
+        let (reached, release) = pair.gate();
+        let sender = pair.sender(id.clone());
+        tokio::time::timeout(Duration::from_secs(10), reached)
+            .await
+            .unwrap()
+            .unwrap();
+        pair.a.pause(&id).unwrap();
+        release.send(()).unwrap();
+        sender.await.unwrap().unwrap();
+        wait_state(&pair.b, &id, TaskState::Paused).await;
+        fs::write(pair.root.join("文件.bin"), b"different source").unwrap();
+        let error = pair
+            .a
+            .resume(&pair.ca, pair.ib, id.clone())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("变化"));
+        wait_state(&pair.a, &id, TaskState::Failed).await;
+        let error = pair
+            .b
+            .resume(&pair.cb, pair.ia, id.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("源文件内容已变化"),
+            "unexpected receiver diagnostic: {error}"
+        );
+        let record = pair.b.task(id).await.unwrap();
+        assert_eq!(record.state(), TaskState::Failed);
+        assert_eq!(
+            record.diagnostic().unwrap().code(),
+            TaskErrorCode::SourceChanged
+        );
+        pair.shutdown().await;
     }
 }
