@@ -47,6 +47,20 @@ open "$P2P_PACKAGE_DIR/P2P File.app"
 
 没有 Developer ID/公证凭证；包只有实际验证的 ad-hoc 签名（没有开发者证书），未公证。不要把 ad-hoc 叫正式签名，也不删除系统 quarantine 以制造通过截图。允许打开候选的操作应由设备持有人按系统提示完成。
 
+## 应用图标
+
+macOS 应用包自带 ICNS 图标；Windows 构建会将 ICO 嵌入可执行文件和窗口。
+更新图标后需重新构建并打包，旧应用包不会自动变化。
+
+Linux 包内提供 `p2p-file.png` 和 `p2p-file.desktop`。如需加入桌面应用菜单，
+在解压后的包目录执行（需将 `~/.local/bin` 加入 PATH）：
+
+```sh
+install -Dm755 p2p-desktop "$HOME/.local/bin/p2p-desktop"
+install -Dm644 p2p-file.png "$HOME/.local/share/icons/hicolor/1024x1024/apps/p2p-file.png"
+install -Dm644 p2p-file.desktop "$HOME/.local/share/applications/p2p-file.desktop"
+```
+
 ## 配置、自建信令与可信设备边界
 
 第一次启动信令主机与端口为空；没有内置开发服务器。先在设置中填写你自己的信令地址/端口，选择本机接收目录，再保存。信令只交换地址/令牌，文件和测速经过认证的 QUIC 直连。既有 CLI 可自建服务：

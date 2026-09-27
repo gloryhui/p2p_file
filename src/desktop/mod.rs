@@ -2357,24 +2357,20 @@ impl DesktopShell {
     }
 
     fn brand_identity(title: &'static str, subtitle: &'static str) -> gpui::Div {
+        static ICON: std::sync::OnceLock<std::sync::Arc<gpui::Image>> = std::sync::OnceLock::new();
+        let icon = ICON
+            .get_or_init(|| {
+                std::sync::Arc::new(gpui::Image::from_bytes(
+                    gpui::ImageFormat::Png,
+                    include_bytes!("../../assets/icons/app-icon-ui.png").to_vec(),
+                ))
+            })
+            .clone();
         div()
             .flex()
             .items_center()
             .gap_3()
-            .child(
-                div()
-                    .w(px(40.))
-                    .h(px(40.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_lg()
-                    .bg(rgb(ui_theme::PRIMARY))
-                    .text_size(px(23.))
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(white())
-                    .child("↔"),
-            )
+            .child(gpui::img(icon).w(px(40.)).h(px(40.)).flex_shrink_0())
             .child(
                 div()
                     .flex()
@@ -3453,6 +3449,7 @@ pub fn run() {
                 }),
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(760.), px(560.))),
+                app_id: Some("p2p-file".into()),
                 ..Default::default()
             },
             move |_, cx| {

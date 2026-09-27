@@ -256,10 +256,12 @@ def main():
         contents = app / 'Contents'
         (contents / 'MacOS').mkdir(parents=True)
         (contents / 'Resources').mkdir()
+        shutil.copyfile(REPO / 'assets/icons/app-icon.icns', contents / 'Resources/AppIcon.icns')
         executable = contents / 'MacOS/p2p-desktop'
         with (contents / 'Info.plist').open('wb') as stream:
             plistlib.dump({'CFBundleExecutable': 'p2p-desktop', 'CFBundleIdentifier': 'io.github.gloryhui.p2p-file',
                            'CFBundleName': 'P2P File', 'CFBundleDisplayName': 'P2P File', 'CFBundlePackageType': 'APPL',
+                           'CFBundleIconFile': 'AppIcon.icns',
                            'CFBundleShortVersionString': version.split('-')[0].split('+')[0], 'CFBundleVersion': '1',
                            'LSMinimumSystemVersion': '13.0', 'NSHighResolutionCapable': True,
                            'NSHumanReadableCopyright': 'See bundled LICENSE and THIRD_PARTY_NOTICES.md',
@@ -268,6 +270,10 @@ def main():
     if platform.system() != 'Windows':
         executable.chmod(0o755)
     if platform.system() == 'Linux':
+        shutil.copyfile(REPO / 'assets/icons/app-icon.png', package / 'p2p-file.png')
+        (package / 'p2p-file.desktop').write_text(
+            '[Desktop Entry]\nType=Application\nName=P2P File\nExec=p2p-desktop\n'
+            'Icon=p2p-file\nTerminal=false\nCategories=Network;FileTransfer;\n', encoding='utf-8')
         inspection['dynamic_dependencies'] = run(['ldd', str(executable)])
         if 'not found' in inspection['dynamic_dependencies']:
             raise ValueError('unresolved native library')

@@ -9,6 +9,19 @@ fn git(args: &[&str]) -> Option<String> {
 }
 
 fn main() {
+    println!("cargo:rerun-if-changed=assets/icons/app-icon.ico");
+    println!("cargo:rerun-if-changed=assets/icons/app-icon.rc");
+    if env::var_os("CARGO_FEATURE_GUI").is_some()
+        && env::var("TARGET").is_ok_and(|target| target.contains("windows"))
+    {
+        embed_resource::compile_for(
+            "assets/icons/app-icon.rc",
+            ["p2p-desktop"],
+            embed_resource::NONE,
+        )
+        .manifest_required()
+        .expect("compile Windows application icon");
+    }
     println!("cargo:rerun-if-changed=build.rs");
     // Worktrees use a .git file. Watch the actual HEAD, index and branch ref so
     // freezing a candidate rebuilds metadata even when Rust source is unchanged.

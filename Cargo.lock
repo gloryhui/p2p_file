@@ -4198,6 +4198,7 @@ dependencies = [
  "clap",
  "dirs 5.0.1",
  "ed25519-dalek",
+ "embed-resource",
  "gpui",
  "hex",
  "if-addrs",

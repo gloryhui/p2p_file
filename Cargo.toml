@@ -46,6 +46,9 @@ cap-std = { version = "=3.4.6", optional = true }
 cap-fs-ext = { version = "=3.4.6", optional = true }
 unicode-normalization = { version = "=0.1.25", optional = true }
 
+[build-dependencies]
+embed-resource = "=3.0.11"
+
 [[bin]]
 name = "p2p-desktop"
 path = "src/bin/p2p-desktop.rs"
