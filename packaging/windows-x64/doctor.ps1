@@ -23,6 +23,53 @@ function Write-DoctorCheck {
     if ($State -eq 'WARN') { $script:WarningCount++ }
 }
 
+function ConvertTo-RustBaseVersion {
+    param([Parameter(Mandatory = $true)][string]$ToolName, [Parameter(Mandatory = $true)][string]$Output)
+    $escapedName = [Regex]::Escape($ToolName)
+    $pattern = '^\s*' + $escapedName + '\s+(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?(?:\s|$)'
+    $match = [Regex]::Match($Output.Trim(), $pattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if (-not $match.Success) { return $null }
+    try {
+        $triplet = '{0}.{1}.{2}' -f $match.Groups[1].Value, $match.Groups[2].Value, $match.Groups[3].Value
+        return [Version]::Parse($triplet)
+    }
+    catch {
+        return $null
+    }
+}
+
+function Test-RustToolVersion {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    $displayName = $Name -replace '\.exe$', ''
+    $required = '>= 1.85.0'
+    $remediation = 'Run: rustup update stable'
+    $tool = Get-Command -Name $Name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $tool) {
+        Write-DoctorCheck FAIL ($displayName + ' version') 'not found' $required $remediation
+        return $null
+    }
+
+    $versionOutput = @(& $tool.Source '--version' 2>&1)
+    $exitCode = $LASTEXITCODE
+    $versionLine = [string]($versionOutput | Select-Object -First 1)
+    if ($exitCode -ne 0 -or [string]::IsNullOrWhiteSpace($versionLine)) {
+        Write-DoctorCheck FAIL ($displayName + ' version') ($tool.Source + ' (version command failed)') $required $remediation
+        return $tool
+    }
+
+    $parsedVersion = ConvertTo-RustBaseVersion -ToolName $displayName -Output $versionLine
+    if ($null -eq $parsedVersion) {
+        Write-DoctorCheck FAIL ($displayName + ' version') ($tool.Source + ' (unrecognized version output: ' + $versionLine + ')') $required $remediation
+    }
+    elseif ($parsedVersion -ge [Version]'1.85.0') {
+        Write-DoctorCheck PASS ($displayName + ' version') ($tool.Source + ' (' + $parsedVersion.ToString() + ')') $required 'none'
+    }
+    else {
+        Write-DoctorCheck FAIL ($displayName + ' version') ($tool.Source + ' (' + $parsedVersion.ToString() + ')') $required $remediation
+    }
+    return $tool
+}
+
 function Test-VersionCommand {
     param([string]$Name, [string[]]$Arguments, [string]$Required, [string]$Remediation)
     $tool = Get-Command -Name $Name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -116,8 +163,8 @@ else {
 
 $git = Test-VersionCommand 'git.exe' @('--version') 'Git available on PATH with a readable version' 'Install Git for Windows from https://git-scm.com/download/win.'
 $rustup = Test-VersionCommand 'rustup.exe' @('--version') 'rustup available on PATH with a readable version' 'Install Rust using rustup from https://rustup.rs/.'
-$cargo = Test-VersionCommand 'cargo.exe' @('--version') 'Cargo available on PATH with a readable version' 'Install the stable Rust toolchain using rustup.'
-$rustc = Test-VersionCommand 'rustc.exe' @('--version') 'rustc available on PATH with a readable version' 'Install the stable Rust toolchain using rustup.'
+$cargo = Test-RustToolVersion 'cargo.exe'
+$rustc = Test-RustToolVersion 'rustc.exe'
 
 if ($null -ne $rustup) {
     $installedTargets = @(& $rustup.Source 'target' 'list' '--installed' 2>$null)
