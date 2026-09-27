@@ -33,6 +33,7 @@ mod task_recovery;
 mod task_store;
 mod transfer;
 mod transfer_files;
+mod ui;
 mod ui_model;
 
 use std::collections::{HashMap, HashSet};
@@ -43,6 +44,7 @@ use crate::identity::{Identity, NodeId};
 use config::{AppPaths, ConfigError, DesktopConfig, SettingsDraft, SpeedtestDirection};
 use instance_lock::InstanceLock;
 use task_store::TaskStore;
+use ui::{components as ui_components, theme as ui_theme};
 
 use gpui::{
     App, Application, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler,
@@ -231,6 +233,21 @@ fn signal_server_spec(host: &str, port: &str) -> String {
         format!("[{host}]:{port}")
     } else {
         format!("{host}:{port}")
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1_024. && unit + 1 < UNITS.len() {
+        value /= 1_024.;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.2} {}", UNITS[unit])
     }
 }
 
@@ -714,7 +731,7 @@ impl Element for TextFieldElement {
                         point(bounds.left() + cursor_pos, bounds.top()),
                         size(px(2.), bounds.bottom() - bounds.top()),
                     ),
-                    rgb(0x3468d4),
+                    rgb(ui_theme::PRIMARY),
                 )),
             )
         } else {
@@ -1016,18 +1033,15 @@ impl DesktopShell {
     }
     fn current_peer_label(&self, cx: &Context<Self>) -> String {
         let Ok(peer) = NodeId::from_hex(self.peer_id.read(cx).content.trim()) else {
-            let mut connected = self
+            let connected = self
                 .peer_states
-                .iter()
-                .filter_map(|(p, s)| {
-                    matches!(s, network_state::PeerLifecycle::Connected).then_some(p.to_hex())
-                })
-                .collect::<Vec<_>>();
-            connected.sort();
-            return if connected.is_empty() {
-                "等待输入对端 ID；接收端无需预先填写发送者 ID".into()
+                .values()
+                .filter(|state| matches!(state, network_state::PeerLifecycle::Connected))
+                .count();
+            return if connected == 0 {
+                "输入对端 ID 后连接；也可以被动接收对端文件".into()
             } else {
-                format!("已认证直连：{}；可被动接收", connected.join("、"))
+                format!("已有 {connected} 个对端完成身份认证；本机可被动接收")
             };
         };
         let state = match self.peer_states.get(&peer) {
@@ -1037,10 +1051,10 @@ impl DesktopShell {
             Some(network_state::PeerLifecycle::Authenticating) => "正在核对身份".into(),
             Some(network_state::PeerLifecycle::Negotiating) => "正在核对版本".into(),
             Some(network_state::PeerLifecycle::Disconnected) => "连接已断开".into(),
-            Some(network_state::PeerLifecycle::Failed(e)) => format!("连接失败：{e}"),
+            Some(network_state::PeerLifecycle::Failed(error)) => format!("连接失败：{error}"),
             None => "尚未连接".into(),
         };
-        format!("对端 {}：{state}", peer.to_hex())
+        format!("对端 {}：{state}", peer.short())
     }
     fn start_speed_ui(&mut self, cx: &mut Context<Self>) {
         if self.speed_request_until.is_some()
@@ -1174,17 +1188,49 @@ impl DesktopShell {
                 let expanded = self.expanded_groups.contains(&group.id);
                 let id = group.id.clone();
                 div()
-                    .h(px(82.))
-                    .p_2()
+                    .h(px(72.))
+                    .px(px(12.))
+                    .flex()
+                    .items_center()
+                    .gap_3()
                     .border_b_1()
-                    .border_color(rgb(0xdde3ee))
-                    .bg(rgb(0xeaf1ff))
-                    .child(format!(
-                        "{} {}",
-                        if expanded { "▾" } else { "▸" },
-                        group.label()
-                    ))
-                    .cursor_pointer()
+                    .border_color(rgb(ui_theme::BORDER))
+                    .bg(rgb(ui_theme::PRIMARY_SOFT))
+                    .cursor(CursorStyle::PointingHand)
+                    .child(
+                        div()
+                            .w(px(32.))
+                            .h(px(32.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .bg(white())
+                            .text_color(rgb(ui_theme::PRIMARY))
+                            .child(if expanded { "▾" } else { "▸" }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .truncate()
+                                    .child(group.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                                    .truncate()
+                                    .child(group.label()),
+                            ),
+                    )
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(move |shell, _: &MouseUpEvent, _, cx| {
@@ -1195,30 +1241,78 @@ impl DesktopShell {
                         }),
                     )
             }
-            ui_model::ListRow::Task(t) => {
-                let id = t.id.clone();
+            ui_model::ListRow::Task(task) => {
+                let id = task.id.clone();
                 let select = id.clone();
                 let pause = id.clone();
                 let resume = id.clone();
-                let can_pause = t.can_pause();
-                let can_continue = t.can_continue();
-                let direction = if t.direction == task_model::TaskDirection::Send {
-                    "发送"
-                } else {
-                    "接收"
+                let can_pause = task.can_pause();
+                let can_continue = task.can_continue();
+                let is_send = task.direction == task_model::TaskDirection::Send;
+                let direction = if is_send { "发送" } else { "接收" };
+                let (status_color, status_background) = match task.state {
+                    task_model::TaskState::Scanning | task_model::TaskState::Queued => {
+                        (ui_theme::TEXT_SECONDARY, ui_theme::SURFACE_SUBTLE)
+                    }
+                    task_model::TaskState::Connecting
+                    | task_model::TaskState::Negotiating
+                    | task_model::TaskState::Transferring
+                    | task_model::TaskState::Finalizing => {
+                        (ui_theme::PRIMARY, ui_theme::PRIMARY_SOFT)
+                    }
+                    task_model::TaskState::Pausing | task_model::TaskState::Paused => {
+                        (ui_theme::WARNING, ui_theme::WARNING_SOFT)
+                    }
+                    task_model::TaskState::Interrupted | task_model::TaskState::Failed => {
+                        (ui_theme::DANGER, ui_theme::DANGER_SOFT)
+                    }
+                    task_model::TaskState::Completed => (ui_theme::SUCCESS, ui_theme::SUCCESS_SOFT),
                 };
-                let diagnostic = t
-                    .diagnostic
-                    .unwrap_or("已校验进度；异常退出后可能回退到已持久化进度");
+                let progress = task.percent();
+                let confirmed = format_bytes(task.confirmed);
+                let total = format_bytes(task.total);
+                let rate = if task.rate > 0. {
+                    format!("{:.2} MiB/s", task.rate / 1_048_576.)
+                } else {
+                    "—".to_owned()
+                };
+                let diagnostic = task.diagnostic.map(|detail| format!(" · {detail}"));
+                let metadata = format!(
+                    "{} · {confirmed} / {total} · {rate}{}",
+                    task.state_label(),
+                    diagnostic.unwrap_or_default()
+                );
+                let icon = if is_send { "↑" } else { "↓" };
+                let action = if can_pause {
+                    ui_components::secondary_button("暂停", true).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |shell, _: &MouseUpEvent, _, cx| {
+                            shell.task_action(pause.clone(), false, cx);
+                        }),
+                    )
+                } else if can_continue {
+                    ui_components::secondary_button("继续", true).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |shell, _: &MouseUpEvent, _, cx| {
+                            shell.task_action(resume.clone(), true, cx);
+                        }),
+                    )
+                } else {
+                    div().w(px(64.))
+                };
+
                 div()
-                    .h(px(82.))
-                    .p_2()
+                    .h(px(72.))
+                    .px(px(12.))
+                    .flex()
+                    .items_center()
+                    .gap_3()
                     .border_b_1()
-                    .border_color(rgb(0xdde3ee))
+                    .border_color(rgb(ui_theme::BORDER))
                     .bg(if self.selected_task.as_ref() == Some(&id) {
-                        rgb(0xeaf1ff)
+                        rgb(ui_theme::PRIMARY_SOFT)
                     } else {
-                        rgb(0xffffff)
+                        rgb(ui_theme::SURFACE)
                     })
                     .on_mouse_up(
                         MouseButton::Left,
@@ -1229,81 +1323,81 @@ impl DesktopShell {
                     )
                     .child(
                         div()
+                            .w(px(36.))
+                            .h(px(36.))
                             .flex()
-                            .gap_2()
                             .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .bg(rgb(status_background))
+                            .text_color(rgb(status_color))
+                            .text_size(px(18.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child(icon),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
                             .child(
                                 div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .child(format!("{} · {direction}", t.name)),
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_sm()
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .child(task.name.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                                            .child(direction),
+                                    )
+                                    .child(
+                                        div()
+                                            .px(px(6.))
+                                            .py(px(2.))
+                                            .rounded_md()
+                                            .bg(rgb(status_background))
+                                            .text_xs()
+                                            .text_color(rgb(status_color))
+                                            .child(task.state_label()),
+                                    ),
                             )
-                            .child(div().text_sm().child(format!(
-                                "{:.1}% · {:.2} MiB/s",
-                                t.percent(),
-                                t.rate / 1048576.
-                            )))
-                            .child(Self::control("暂停", can_pause).on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |shell, _: &MouseUpEvent, _, cx| {
-                                    shell.task_action(pause.clone(), false, cx);
-                                }),
-                            ))
-                            .child(Self::control("继续", can_continue).on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |shell, _: &MouseUpEvent, _, cx| {
-                                    shell.task_action(resume.clone(), true, cx);
-                                }),
-                            )),
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(ui_components::progress_bar(progress))
+                                    .child(
+                                        div()
+                                            .w(px(48.))
+                                            .text_xs()
+                                            .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                                            .child(format!("{progress:.1}%")),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                                    .truncate()
+                                    .child(metadata),
+                            ),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x5f6b7a))
-                            .truncate()
-                            .child(format!(
-                                "{} · 对端 {} · {} / {} 字节",
-                                t.state_label(),
-                                t.peer.to_hex(),
-                                t.confirmed,
-                                t.total
-                            )),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x8b5a00))
-                            .truncate()
-                            .child(diagnostic),
-                    )
+                    .child(action)
             }
         }
-    }
-    fn control(label: impl Into<SharedString>, enabled: bool) -> gpui::Div {
-        div()
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(0xdde3ee))
-            .text_sm()
-            .bg(if enabled {
-                rgb(0xeaf1ff)
-            } else {
-                rgb(0xf0f2f5)
-            })
-            .text_color(if enabled {
-                rgb(0x2456a6)
-            } else {
-                rgb(0x737e8d)
-            })
-            .cursor(if enabled {
-                CursorStyle::PointingHand
-            } else {
-                CursorStyle::Arrow
-            })
-            .child(label.into())
     }
     fn set_status(&mut self, status: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.status = status.into();
@@ -1507,14 +1601,6 @@ impl DesktopShell {
         cx.notify();
     }
 
-    fn toggle_speedtest_direction(
-        &mut self,
-        _: &MouseUpEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.change_direction(cx);
-    }
     fn change_direction(&mut self, cx: &mut Context<Self>) {
         if self.is_saving_settings {
             return;
@@ -1523,6 +1609,14 @@ impl DesktopShell {
             SpeedtestDirection::Upload => SpeedtestDirection::Download,
             SpeedtestDirection::Download => SpeedtestDirection::Upload,
         };
+        cx.notify();
+    }
+
+    fn set_speed_direction(&mut self, direction: SpeedtestDirection, cx: &mut Context<Self>) {
+        if self.is_saving_settings {
+            return;
+        }
+        self.settings.speedtest_direction = direction;
         cx.notify();
     }
 
@@ -1751,6 +1845,71 @@ impl DesktopShell {
         .detach();
     }
 
+    fn enqueue_dropped_paths(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            self.set_status("没有可传输的拖入路径", cx);
+            return;
+        }
+        if self
+            .speed_views
+            .0
+            .values()
+            .any(|view| view.snapshot.status == speed::SpeedStatus::Running)
+        {
+            self.set_status("测速正在进行；请先取消或等待测速结束后再添加文件", cx);
+            return;
+        }
+        if paths.iter().any(|path| path.to_str().is_none()) {
+            self.set_status("拖入路径编码不受支持；没有提交任何路径", cx);
+            return;
+        }
+        let Some(peer) = self.authenticated_peer(cx) else {
+            return;
+        };
+        let Some(session) = self.network_session.clone() else {
+            self.set_status("网络会话已关闭；没有提交拖入路径", cx);
+            return;
+        };
+
+        let mut submitted = 0usize;
+        for path in paths {
+            let result = if path.is_dir() {
+                session.send_directory(peer, path.clone())
+            } else if path.is_file() {
+                session.send_file(peer, path.clone())
+            } else {
+                Err(format!("路径不是可读取的文件或目录：{}", path.display()))
+            };
+            match result {
+                Ok(()) => submitted += 1,
+                Err(error) => {
+                    self.set_status(
+                        if submitted == 0 {
+                            format!("拖入路径未能提交：{error}")
+                        } else {
+                            format!("已提交 {submitted} 个路径，后续提交失败：{error}")
+                        },
+                        cx,
+                    );
+                    return;
+                }
+            }
+        }
+        self.selected_files = paths
+            .iter()
+            .filter(|path| path.is_file())
+            .cloned()
+            .collect();
+        self.selected_folder = paths.iter().find(|path| path.is_dir()).cloned();
+        self.set_status(
+            format!(
+                "已提交 {submitted} 个拖入路径；传输对象绑定到已认证对端 {}",
+                peer.short()
+            ),
+            cx,
+        );
+    }
+
     fn choose_receive_directory(
         &mut self,
         _: &MouseUpEvent,
@@ -1797,120 +1956,951 @@ impl DesktopShell {
         .detach();
     }
 
-    fn choose_files_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let enabled = NodeId::from_hex(self.peer_id.read(cx).content.trim())
-            .ok()
-            .is_some_and(|p| {
-                matches!(
-                    self.peer_states.get(&p),
-                    Some(network_state::PeerLifecycle::Connected)
-                )
-            })
-            && !self
-                .speed_views
-                .0
-                .values()
-                .any(|v| v.snapshot.status == speed::SpeedStatus::Running);
-        Self::control("选择文件", enabled)
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::choose_files))
-    }
-
-    fn path_line(label: &str, path: Option<&PathBuf>) -> impl IntoElement {
+    fn path_line(label: &str, path: Option<&PathBuf>) -> gpui::Div {
         let value = path
-            .map(|path| {
-                path.to_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| "路径编码不受支持".to_owned())
-            })
-            .unwrap_or_else(|| "尚未选择".to_owned());
+            .and_then(|path| path.to_str())
+            .unwrap_or("尚未选择")
+            .to_owned();
         div()
             .flex()
             .gap_2()
-            .text_sm()
+            .text_xs()
+            .text_color(rgb(ui_theme::TEXT_SECONDARY))
             .child(format!("{label}："))
-            .child(
-                div()
-                    .flex_1()
-                    .truncate()
-                    .text_color(rgb(0x5f6b7a))
-                    .child(value),
-            )
+            .child(div().flex_1().min_w_0().truncate().child(value))
+    }
+
+    fn text_field_frame(
+        field: &Entity<TextField>,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> gpui::Div {
+        let focused = field.focus_handle(cx).is_focused(window);
+        let frame = div()
+            .w_full()
+            .h(px(44.))
+            .flex()
+            .items_center()
+            .px(px(10.))
+            .bg(white())
+            .border_1()
+            .rounded_md()
+            .child(field.clone());
+        if focused {
+            frame.border_color(rgb(ui_theme::PRIMARY))
+        } else {
+            frame.border_color(rgb(ui_theme::BORDER))
+        }
     }
 
     fn copy_identity_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let button = div().px_2().py_2().border_1().rounded_md();
-        if self.identity_id.is_some() {
-            button
-                .bg(rgb(0xeaf1ff))
-                .border_color(rgb(0xb8cdfa))
-                .text_color(rgb(0x2456a6))
-                .child("复制完整 ID")
-                .hover(|style| style.bg(rgb(0xdce8ff)).cursor_pointer())
-                .on_mouse_up(MouseButton::Left, cx.listener(Self::copy_node_id))
-        } else {
-            button
-                .bg(rgb(0xf0f2f5))
-                .border_color(rgb(0xd9dee7))
-                .text_color(rgb(0x737e8d))
-                .cursor(CursorStyle::Arrow)
-                .child("复制（身份不可用）")
-        }
+        ui_components::icon_button("复制", self.identity_id.is_some())
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::copy_node_id))
     }
 
     fn save_settings_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let label = if self.is_saving_settings {
             "正在保存…"
         } else {
-            "保存设置"
+            "保存并应用"
         };
-        let button = div().px_3().py_2().border_1().rounded_md();
-        if self.can_save_settings && !self.is_saving_settings {
-            button
-                .bg(rgb(0x2456a6))
-                .border_color(rgb(0x2456a6))
-                .text_color(white())
-                .child(label)
-                .hover(|style| style.bg(rgb(0x1d478c)).cursor_pointer())
-                .on_mouse_up(MouseButton::Left, cx.listener(Self::save_settings))
-        } else {
-            button
-                .bg(rgb(0xf0f2f5))
-                .border_color(rgb(0xd9dee7))
-                .text_color(rgb(0x737e8d))
-                .cursor(CursorStyle::Arrow)
-                .child(if self.can_save_settings {
-                    label
-                } else {
-                    "保存已禁用"
-                })
-        }
+        ui_components::primary_button(label, self.can_save_settings && !self.is_saving_settings)
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::save_settings))
     }
 
     fn connect_peer_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.identity.is_some() && self.network_session.is_some() {
-            div()
-                .px_3()
-                .py_2()
-                .bg(rgb(0x2456a6))
-                .border_1()
-                .border_color(rgb(0x2456a6))
-                .rounded_md()
-                .text_color(white())
-                .child("连接")
-                .hover(|style| style.bg(rgb(0x1d478c)).cursor_pointer())
-                .on_mouse_up(MouseButton::Left, cx.listener(Self::connect_peer))
-        } else {
-            div()
-                .px_2()
-                .py_2()
-                .bg(rgb(0xf0f2f5))
-                .border_1()
-                .border_color(rgb(0xd9dee7))
-                .rounded_md()
-                .text_color(rgb(0x737e8d))
-                .cursor(CursorStyle::Arrow)
-                .child("先保存信令配置")
+        let peer_is_valid = NodeId::from_hex(self.peer_id.read(cx).content.trim())
+            .ok()
+            .is_some_and(|peer| {
+                self.identity
+                    .as_ref()
+                    .is_none_or(|identity| identity.node_id() != peer)
+            });
+        let peer_is_active = NodeId::from_hex(self.peer_id.read(cx).content.trim())
+            .ok()
+            .and_then(|peer| self.peer_states.get(&peer))
+            .is_some_and(network_state::PeerLifecycle::is_active);
+        let enabled = self.identity.is_some()
+            && self.network_session.is_some()
+            && peer_is_valid
+            && !peer_is_active;
+        ui_components::primary_button("连接设备", enabled)
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::connect_peer))
+    }
+
+    fn header_status(&self, cx: &Context<Self>) -> (String, ui_components::StatusTone) {
+        if let Ok(peer) = NodeId::from_hex(self.peer_id.read(cx).content.trim()) {
+            match self.peer_states.get(&peer) {
+                Some(network_state::PeerLifecycle::Connected) => {
+                    return ("已连接".into(), ui_components::StatusTone::Success);
+                }
+                Some(network_state::PeerLifecycle::PeerPending) => {
+                    return ("等待对端".into(), ui_components::StatusTone::Info);
+                }
+                Some(network_state::PeerLifecycle::Punching) => {
+                    return ("正在直连".into(), ui_components::StatusTone::Info);
+                }
+                Some(network_state::PeerLifecycle::Authenticating) => {
+                    return ("正在认证".into(), ui_components::StatusTone::Info);
+                }
+                Some(network_state::PeerLifecycle::Negotiating) => {
+                    return ("正在协商".into(), ui_components::StatusTone::Info);
+                }
+                Some(network_state::PeerLifecycle::Disconnected) => {
+                    return ("连接已断开".into(), ui_components::StatusTone::Warning);
+                }
+                Some(network_state::PeerLifecycle::Failed(_)) => {
+                    return ("连接失败".into(), ui_components::StatusTone::Danger);
+                }
+                None => {}
+            }
         }
+
+        if self
+            .peer_states
+            .values()
+            .any(|state| matches!(state, network_state::PeerLifecycle::Connected))
+        {
+            ("设备已连接".into(), ui_components::StatusTone::Success)
+        } else if self.network_status.starts_with("信令在线") {
+            ("信令在线".into(), ui_components::StatusTone::Success)
+        } else if self.network_status.contains("失败") || self.network_status.contains("不可用")
+        {
+            ("网络异常".into(), ui_components::StatusTone::Danger)
+        } else if self.network_status.contains("正在") || self.network_status.contains("重连") {
+            ("连接中".into(), ui_components::StatusTone::Info)
+        } else if self.network_session.is_none() {
+            ("未配置".into(), ui_components::StatusTone::Neutral)
+        } else {
+            ("等待对端".into(), ui_components::StatusTone::Neutral)
+        }
+    }
+
+    fn app_header(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let (status, tone) = self.header_status(cx);
+        div()
+            .h(px(56.))
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .w(px(40.))
+                            .h(px(40.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_lg()
+                            .bg(rgb(ui_theme::PRIMARY))
+                            .text_size(px(23.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(white())
+                            .child("↔"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(24.))
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgb(ui_theme::TEXT))
+                                    .child("P2P File"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                                    .child("设备之间，直接传文件"),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(ui_components::status_badge(status, tone))
+                    .child(ui_components::secondary_button("设置", true).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|shell, _: &MouseUpEvent, window, cx| {
+                            shell.toggle_settings(window, cx)
+                        }),
+                    )),
+            )
+    }
+
+    fn connection_card(&self, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
+        let identity = self
+            .identity_id
+            .clone()
+            .unwrap_or_else(|| "身份不可用".to_owned());
+        let (peer_label, peer_tone) = self.header_status(cx);
+        let width = window.viewport_size().width / px(window.scale_factor());
+        let horizontal = width >= 900.;
+
+        let local = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(ui_components::field_label("本机 ID"))
+            .child(
+                div()
+                    .w_full()
+                    .h(px(44.))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px(px(8.))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(ui_theme::BORDER))
+                    .bg(rgb(ui_theme::SURFACE_SUBTLE))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .text_color(rgb(ui_theme::TEXT))
+                            .child(identity),
+                    )
+                    .child(self.copy_identity_button(cx)),
+            );
+
+        let peer = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(ui_components::field_label("对端设备 ID"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Self::text_field_frame(&self.peer_id, window, cx))
+                    .child(self.connect_peer_button(cx)),
+            );
+
+        let fields = if horizontal {
+            div()
+                .flex()
+                .items_start()
+                .gap_4()
+                .child(local)
+                .child(div().w(px(1.)).h(px(64.)).bg(rgb(ui_theme::BORDER)))
+                .child(peer)
+        } else {
+            div().flex().flex_col().gap_3().child(local).child(peer)
+        };
+
+        ui_components::card()
+            .child(ui_components::section_header(
+                "↔",
+                "连接设备",
+                "输入完整设备 ID，等待身份认证后开始传输",
+            ))
+            .child(fields)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(ui_components::status_badge(peer_label, peer_tone))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                            .truncate()
+                            .child(self.current_peer_label(cx)),
+                    ),
+            )
+    }
+
+    fn transfer_card(&mut self, cx: &mut Context<Self>) -> gpui::Div {
+        let connected = NodeId::from_hex(self.peer_id.read(cx).content.trim())
+            .ok()
+            .is_some_and(|peer| {
+                matches!(
+                    self.peer_states.get(&peer),
+                    Some(network_state::PeerLifecycle::Connected)
+                )
+            });
+        let speed_running = self
+            .speed_views
+            .0
+            .values()
+            .any(|view| view.snapshot.status == speed::SpeedStatus::Running);
+        let enabled = connected && !speed_running && self.transfer_service.is_some();
+        let task_count = self.task_rows.len();
+        let list_height = task_count.clamp(1, 4) as f32 * 72.;
+
+        let actions = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                ui_components::secondary_button("选择文件", enabled)
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::choose_files)),
+            )
+            .child(
+                ui_components::secondary_button("选择文件夹", enabled)
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::choose_folder)),
+            )
+            .child(
+                ui_components::secondary_button(
+                    format!("并发 {}", self.settings.send_concurrency),
+                    !self.is_saving_settings,
+                )
+                .on_mouse_up(MouseButton::Left, cx.listener(Self::cycle_concurrency)),
+            );
+
+        let drop_zone = div()
+            .w_full()
+            .h(px(104.))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .rounded_lg()
+            .border_1()
+            .border_dashed()
+            .border_color(rgb(if enabled {
+                ui_theme::DROP_BORDER
+            } else {
+                ui_theme::BORDER
+            }))
+            .bg(rgb(if enabled {
+                ui_theme::SURFACE_SUBTLE
+            } else {
+                ui_theme::DISABLED_BG
+            }))
+            .child(
+                div()
+                    .w(px(34.))
+                    .h(px(34.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .bg(rgb(ui_theme::PRIMARY_SOFT))
+                    .text_size(px(22.))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgb(ui_theme::PRIMARY))
+                    .child("↑"),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(rgb(ui_theme::TEXT))
+                    .child(if enabled {
+                        "将文件或文件夹拖到此处"
+                    } else if connected {
+                        "测速完成或取消后再添加待发送文件"
+                    } else {
+                        "连接设备后可添加待发送文件"
+                    }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                    .child(if enabled {
+                        "也可以使用右上角按钮打开系统选择器"
+                    } else {
+                        "本机仍可被动接收对端发送的文件"
+                    }),
+            )
+            .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| {
+                if enabled {
+                    style
+                        .bg(rgb(ui_theme::PRIMARY_SOFT))
+                        .border_color(rgb(ui_theme::PRIMARY))
+                } else {
+                    style
+                }
+            })
+            .can_drop(move |_, _, _| enabled)
+            .on_drop(cx.listener(|shell, paths: &gpui::ExternalPaths, _, cx| {
+                shell.enqueue_dropped_paths(paths.paths(), cx)
+            }));
+
+        let task_list = if self.task_rows.is_empty() {
+            div()
+                .h(px(132.))
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                .child(
+                    div()
+                        .text_size(px(24.))
+                        .text_color(rgb(ui_theme::TEXT_MUTED))
+                        .child("▤"),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(rgb(ui_theme::TEXT))
+                        .child("暂无传输任务"),
+                )
+                .child(div().text_xs().child("连接设备后选择文件或文件夹开始传输"))
+                .into_any_element()
+        } else {
+            gpui::uniform_list(
+                "transfer-tasks",
+                self.task_rows.len(),
+                cx.processor(|shell, range: Range<usize>, _, cx| {
+                    let end = range.end.min(shell.task_rows.len());
+                    (range.start.min(end)..end)
+                        .map(|index| shell.task_row(index, cx))
+                        .collect::<Vec<_>>()
+                }),
+            )
+            .track_scroll(self.task_scroll.clone())
+            .h(px(list_height))
+            .into_any_element()
+        };
+
+        ui_components::card()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(ui_components::section_header(
+                        "▤",
+                        "文件传输",
+                        "选择文件或目录，在已认证设备之间传输",
+                    ))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                            .child(self.queue_status.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(rgb(ui_theme::TEXT))
+                            .child("传输任务"),
+                    )
+                    .child(actions),
+            )
+            .child(drop_zone)
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(rgb(ui_theme::TEXT))
+                    .child(format!("传输列表（{} 个任务）", self.task_rows.len())),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .overflow_hidden()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(ui_theme::BORDER))
+                    .child(task_list),
+            )
+    }
+
+    fn receive_connection_bar(&self, wide: bool, cx: &Context<Self>) -> gpui::Div {
+        let directory = self
+            .settings
+            .receive_directory
+            .as_ref()
+            .and_then(|path| path.to_str())
+            .unwrap_or("尚未选择接收目录");
+        let applied_differs = self.settings.receive_directory != self.applied_receive_root;
+        let receive = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(ui_components::field_label("接收目录（仅本机可见）"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h(px(36.))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px(px(10.))
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(ui_theme::BORDER))
+                            .bg(rgb(ui_theme::SURFACE_SUBTLE))
+                            .child(div().text_color(rgb(ui_theme::PRIMARY)).child("▱"))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_sm()
+                                    .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                                    .child(directory.to_owned()),
+                            ),
+                    )
+                    .child(ui_components::secondary_button("更改", true).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(Self::choose_receive_directory),
+                    )),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(if applied_differs {
+                        ui_theme::WARNING
+                    } else {
+                        ui_theme::TEXT_SECONDARY
+                    }))
+                    .child(if applied_differs {
+                        "目录草稿待保存；保存后仅用于新任务"
+                    } else {
+                        "保存接收目录的更改后，仅新任务使用新路径"
+                    }),
+            );
+        let receive = if applied_differs {
+            receive.child(Self::path_line(
+                "当前任务仍使用",
+                self.applied_receive_root.as_ref(),
+            ))
+        } else {
+            receive
+        };
+
+        let (peer_label, peer_tone) = self.header_status(cx);
+        let mut connection = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(ui_components::field_label("连接状态"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(ui_components::status_badge(peer_label, peer_tone))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                            .child(self.network_status.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                    .truncate()
+                    .child(self.current_peer_label(cx)),
+            );
+        if let Ok(peer) = NodeId::from_hex(self.peer_id.read(cx).content.trim())
+            && let Some(speed) = self.speed_views.0.get(&peer)
+            && !speed.snapshot.rtt.is_zero()
+        {
+            connection = connection.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                    .child(format!(
+                        "当前对端最近测速 RTT {:.1} ms",
+                        speed.snapshot.rtt.as_secs_f64() * 1_000.
+                    )),
+            );
+        }
+
+        let content = div().gap_4();
+        let content = if wide {
+            content
+                .flex()
+                .items_start()
+                .child(receive)
+                .child(div().w(px(1.)).h(px(54.)).bg(rgb(ui_theme::BORDER)))
+                .child(connection)
+        } else {
+            content.flex_col().child(receive).child(connection)
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p(px(12.))
+            .bg(rgb(ui_theme::SURFACE))
+            .border_1()
+            .border_color(rgb(ui_theme::BORDER))
+            .rounded_xl()
+            .flex_shrink_0()
+            .child(content)
+    }
+
+    fn speed_test_card(&mut self, cx: &mut Context<Self>) -> gpui::Div {
+        let running_view = self
+            .displayed_speed()
+            .filter(|(_, view)| view.snapshot.status == speed::SpeedStatus::Running);
+        let running = running_view.is_some();
+        let waiting = self.speed_request_until.is_some() && !running;
+        let can_start = NodeId::from_hex(self.peer_id.read(cx).content.trim())
+            .ok()
+            .is_some_and(|peer| {
+                matches!(
+                    self.peer_states.get(&peer),
+                    Some(network_state::PeerLifecycle::Connected)
+                )
+            })
+            && self.transfer_service.is_some()
+            && !running
+            && !waiting;
+        let editing_enabled = !self.is_saving_settings;
+
+        let upload_selected = self.settings.speedtest_direction == SpeedtestDirection::Upload;
+        let download_selected = !upload_selected;
+        let upload_button = ui_components::secondary_button("发送", editing_enabled);
+        let upload_button = if upload_selected {
+            upload_button
+                .bg(rgb(ui_theme::PRIMARY_SOFT))
+                .border_color(rgb(ui_theme::PRIMARY))
+                .text_color(rgb(ui_theme::PRIMARY))
+        } else {
+            upload_button
+        }
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|shell, _: &MouseUpEvent, _, cx| {
+                shell.set_speed_direction(SpeedtestDirection::Upload, cx)
+            }),
+        );
+        let download_button = ui_components::secondary_button("接收", editing_enabled);
+        let download_button = if download_selected {
+            download_button
+                .bg(rgb(ui_theme::PRIMARY_SOFT))
+                .border_color(rgb(ui_theme::PRIMARY))
+                .text_color(rgb(ui_theme::PRIMARY))
+        } else {
+            download_button
+        }
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|shell, _: &MouseUpEvent, _, cx| {
+                shell.set_speed_direction(SpeedtestDirection::Download, cx)
+            }),
+        );
+
+        let controls = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(upload_button)
+            .child(download_button)
+            .child(
+                ui_components::secondary_button(
+                    format!("时长 {} 秒", self.settings.speedtest_seconds),
+                    editing_enabled,
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(Self::cycle_speedtest_duration),
+                ),
+            )
+            .child(
+                ui_components::primary_button(
+                    if running {
+                        "测速中…"
+                    } else if waiting {
+                        "等待授权…"
+                    } else {
+                        "开始测速"
+                    },
+                    can_start,
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|shell, _: &MouseUpEvent, _, cx| shell.start_speed_ui(cx)),
+                ),
+            )
+            .child(
+                ui_components::secondary_button("取消", running).on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|shell, _: &MouseUpEvent, _, cx| shell.cancel_speed_ui(cx)),
+                ),
+            );
+
+        let mut result = ui_components::card()
+            .child(ui_components::section_header(
+                "◉",
+                "直连测速",
+                "测试当前已认证对端的真实直连性能",
+            ))
+            .child(controls);
+
+        if let Some((peer, view)) = self.displayed_speed() {
+            let snapshot = &view.snapshot;
+            let sending = match snapshot.direction {
+                protocol::SpeedDirection::Upload => self
+                    .identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.node_id() == snapshot.owner),
+                protocol::SpeedDirection::Download => self
+                    .identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.node_id() != snapshot.owner),
+            };
+            let direction = if sending {
+                "本机 → 对端"
+            } else {
+                "对端 → 本机"
+            };
+            let status = match snapshot.status {
+                speed::SpeedStatus::Running => "测速中",
+                speed::SpeedStatus::Completed => "已完成",
+                speed::SpeedStatus::Cancelled => "已取消",
+                speed::SpeedStatus::Interrupted => "已中断",
+            };
+            let status_tone = match snapshot.status {
+                speed::SpeedStatus::Running => ui_components::StatusTone::Info,
+                speed::SpeedStatus::Completed => ui_components::StatusTone::Success,
+                speed::SpeedStatus::Cancelled => ui_components::StatusTone::Warning,
+                speed::SpeedStatus::Interrupted => ui_components::StatusTone::Danger,
+            };
+            let progress = (snapshot.elapsed.as_secs_f64() / f64::from(snapshot.seconds.max(1))
+                * 100.)
+                .min(100.);
+            let rtt = if snapshot.rtt.is_zero() {
+                "无可用样本".to_owned()
+            } else {
+                format!("{:.1} ms", snapshot.rtt.as_secs_f64() * 1_000.)
+            };
+            result = result
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(ui_components::status_badge(status, status_tone))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                                .child(format!("对端 {} · {direction}", peer.short())),
+                        )
+                        .child(ui_components::progress_bar(progress))
+                        .child(
+                            div()
+                                .w(px(52.))
+                                .text_xs()
+                                .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                                .child(format!("{progress:.0}%")),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(ui_components::metric_tile(
+                            "瞬时速度",
+                            format!("{:.2} MiB/s", view.instant / 1_048_576.),
+                            "当前采样",
+                            ui_theme::PRIMARY_SOFT,
+                        ))
+                        .child(ui_components::metric_tile(
+                            "平均速度",
+                            format!("{:.2} Mbps", snapshot.bytes_per_second * 8. / 1_000_000.),
+                            "按真实字节和耗时计算",
+                            ui_theme::SURFACE_SUBTLE,
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .text_xs()
+                        .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                        .child(format!(
+                            "实际传输 {} · 耗时 {:.2} 秒 · RTT {rtt}",
+                            format_bytes(snapshot.bytes),
+                            snapshot.elapsed.as_secs_f64()
+                        )),
+                );
+        } else if waiting {
+            result = result.child(
+                div()
+                    .p(px(12.))
+                    .rounded_md()
+                    .bg(rgb(ui_theme::WARNING_SOFT))
+                    .text_sm()
+                    .text_color(rgb(ui_theme::WARNING))
+                    .child("等待双方授权；有文件活动时测速会明确拒绝，不会自动暂停任务"),
+            );
+        } else {
+            result = result.child(
+                div()
+                    .p(px(12.))
+                    .rounded_md()
+                    .bg(rgb(ui_theme::SURFACE_SUBTLE))
+                    .text_sm()
+                    .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                    .child("尚未测速；测速使用已认证直连，不读取或生成文件")
+                    .child(format!(
+                        "当前方向：{}",
+                        self.settings.speedtest_direction.label()
+                    )),
+            );
+        }
+        result
+    }
+
+    fn advanced_network_card(&self, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
+        let host = self.signal_host.read(cx).content.to_string();
+        let port = self.signal_port.read(cx).content.to_string();
+        let summary = if host.trim().is_empty() || port.trim().is_empty() {
+            "尚未配置完整信令地址".to_owned()
+        } else {
+            format!("{}:{}", host.trim(), port.trim())
+        };
+        let toggle = ui_components::secondary_button(
+            if self.show_settings {
+                "收起"
+            } else {
+                "编辑"
+            },
+            true,
+        )
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|shell, _: &MouseUpEvent, window, cx| shell.toggle_settings(window, cx)),
+        );
+        let mut card = ui_components::card().child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(ui_components::section_header(
+                    "⋯",
+                    "高级网络设置",
+                    "信令连接参数与当前状态",
+                ))
+                .child(toggle),
+        );
+
+        if self.show_settings {
+            card = card
+                .child(
+                    div()
+                        .flex()
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(ui_components::field_label("信令主机/IP"))
+                                .child(Self::text_field_frame(&self.signal_host, window, cx)),
+                        )
+                        .child(
+                            div()
+                                .w(px(128.))
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(ui_components::field_label("端口"))
+                                .child(Self::text_field_frame(&self.signal_port, window, cx)),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .text_xs()
+                                .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                                .child(self.config_note.clone())
+                                .child(self.identity_status.clone()),
+                        )
+                        .child(self.save_settings_button(cx)),
+                );
+        } else {
+            card = card.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .text_color(rgb(ui_theme::TEXT))
+                            .child(summary),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                            .child(self.network_status.clone()),
+                    ),
+            );
+        }
+        card.child(
+            div()
+                .text_xs()
+                .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                .child("接收目录保存后仅供新任务使用；已运行任务保留原接收目录"),
+        )
     }
 }
 
@@ -1921,192 +2911,106 @@ impl Focusable for DesktopShell {
 }
 
 impl Render for DesktopShell {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let identity = self
-            .identity_id
-            .clone()
-            .unwrap_or_else(|| "身份不可用".into());
-        let connected = NodeId::from_hex(self.peer_id.read(cx).content.trim())
-            .ok()
-            .is_some_and(|p| {
-                matches!(
-                    self.peer_states.get(&p),
-                    Some(network_state::PeerLifecycle::Connected)
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let logical_width = window.viewport_size().width / px(window.scale_factor());
+        let wide_layout = logical_width >= 1040.;
+        let speed_card = self.speed_test_card(cx);
+        let advanced_card = self.advanced_network_card(window, cx);
+        let bottom_cards = if wide_layout {
+            div()
+                .flex()
+                .gap_3()
+                .child(
+                    div()
+                        .flex_basis(relative(0.55))
+                        .flex_grow()
+                        .min_w_0()
+                        .child(speed_card),
                 )
-            });
-        let running = self
-            .speed_views
-            .0
-            .values()
-            .any(|v| v.snapshot.status == speed::SpeedStatus::Running);
-        let can_start = connected && !running && self.speed_request_until.is_none();
-        let speed_text=self.displayed_speed().map(|(peer,v)|{
-            let s=&v.snapshot;let sending=match s.direction {protocol::SpeedDirection::Upload=>self.identity.as_ref().is_some_and(|i|i.node_id()==s.owner),protocol::SpeedDirection::Download=>self.identity.as_ref().is_some_and(|i|i.node_id()!=s.owner)};
-            let status=match s.status{speed::SpeedStatus::Running=>"测速中",speed::SpeedStatus::Completed=>"已完成",speed::SpeedStatus::Cancelled=>"已取消",speed::SpeedStatus::Interrupted=>"已中断"};
-            let progress=(s.elapsed.as_secs_f64()/f64::from(s.seconds)*100.).min(100.);
-            format!("{} · {status} · 对端 {} · {progress:.1}%\n瞬时 {:.2} MiB/s · 平均 {:.2} Mbps · {} 字节 · 实际 {:.2} 秒 · RTT {:.1} ms",if sending{"本机 → 对端"}else{"对端 → 本机"},peer.to_hex(),v.instant/1048576.,s.bytes_per_second*8./1000000.,s.bytes,s.elapsed.as_secs_f64(),s.rtt.as_secs_f64()*1000.)
-        }).unwrap_or_else(||if self.speed_request_until.is_some(){"等待双方授权；文件活动会明确拒绝测速".into()}else{"尚未测速；使用已认证直连，不读取或生成文件".into()});
-        let speed_text = if self.speed_request_until.is_some() && !running {
-            format!("等待双方授权；文件活动会明确拒绝测速\n上次结果：{speed_text}")
+                .child(
+                    div()
+                        .flex_basis(relative(0.45))
+                        .flex_grow()
+                        .min_w_0()
+                        .child(advanced_card),
+                )
         } else {
-            speed_text
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(speed_card)
+                .child(advanced_card)
         };
-        let root = div()
+
+        div()
             .size_full()
             .id("desktop-shell")
             .key_context("DesktopShell")
             .track_focus(&self.focus_handle)
             .overflow_y_scroll()
-            .bg(rgb(0xf4f7fb))
+            .overflow_x_hidden()
+            .bg(rgb(ui_theme::PAGE_BG))
             .flex()
             .flex_col()
-            .gap_2()
-            .p_4()
-            .text_color(rgb(0x1d2633))
-            .on_action(cx.listener(|s, _: &NextTask, _, cx| s.select_task(false, cx)))
-            .on_action(cx.listener(|s, _: &PreviousTask, _, cx| s.select_task(true, cx)))
-            .on_action(cx.listener(|s, _: &ExpandGroups, _, cx| s.expand_groups(cx)))
+            .gap_3()
+            .p(px(20.))
+            .text_color(rgb(ui_theme::TEXT))
+            .on_action(cx.listener(|shell, _: &NextTask, _, cx| shell.select_task(false, cx)))
+            .on_action(cx.listener(|shell, _: &PreviousTask, _, cx| shell.select_task(true, cx)))
+            .on_action(cx.listener(|shell, _: &ExpandGroups, _, cx| shell.expand_groups(cx)))
+            .on_action(cx.listener(|shell, _: &ChooseReceiveDirectory, _, cx| {
+                shell.pick_receive_directory(cx)
+            }))
+            .on_action(cx.listener(|shell, _: &CycleDirection, _, cx| shell.change_direction(cx)))
+            .on_action(cx.listener(|shell, _: &CycleDuration, _, cx| shell.change_duration(cx)))
             .on_action(
-                cx.listener(|s, _: &ChooseReceiveDirectory, _, cx| s.pick_receive_directory(cx)),
+                cx.listener(|shell, _: &CycleConcurrency, _, cx| shell.change_concurrency(cx)),
             )
-            .on_action(cx.listener(|s, _: &CycleDirection, _, cx| s.change_direction(cx)))
-            .on_action(cx.listener(|s, _: &CycleDuration, _, cx| s.change_duration(cx)))
-            .on_action(cx.listener(|s, _: &CycleConcurrency, _, cx| s.change_concurrency(cx)))
-            .on_action(cx.listener(|s, _: &NextField, w, cx| s.focus_field(false, w, cx)))
-            .on_action(cx.listener(|s, _: &PreviousField, w, cx| s.focus_field(true, w, cx)))
-            .on_action(cx.listener(|s, _: &CopyIdentity, _, cx| {
-                if let Some(id) = &s.identity_id {
-                    cx.write_to_clipboard(ClipboardItem::new_string(id.clone()));
-                    s.set_status("已复制完整本机 ID", cx);
+            .on_action(
+                cx.listener(|shell, _: &NextField, window, cx| {
+                    shell.focus_field(false, window, cx)
+                }),
+            )
+            .on_action(cx.listener(|shell, _: &PreviousField, window, cx| {
+                shell.focus_field(true, window, cx)
+            }))
+            .on_action(cx.listener(|shell, _: &CopyIdentity, _, cx| {
+                if let Some(identity) = &shell.identity_id {
+                    cx.write_to_clipboard(ClipboardItem::new_string(identity.clone()));
+                    shell.set_status("已复制完整本机 ID", cx);
                 }
             }))
-            .on_action(cx.listener(|s, _: &ConnectPeer, _, cx| s.connect_current_peer(cx)))
-            .on_action(cx.listener(|s, _: &ChooseFiles, _, cx| s.pick_files(cx)))
-            .on_action(cx.listener(|s, _: &ChooseFolder, _, cx| s.pick_folder(cx)))
-            .on_action(cx.listener(|s, _: &SaveSettings, _, cx| s.persist_settings(cx)))
-            .on_action(cx.listener(|s, _: &StartSpeed, _, cx| s.start_speed_ui(cx)))
-            .on_action(cx.listener(|s, _: &CancelSpeed, _, cx| s.cancel_speed_ui(cx)))
-            .on_action(cx.listener(|s, _: &ToggleSettings, w, cx| s.toggle_settings(w, cx)))
-            .on_action(cx.listener(|s, _: &PauseSelected, _, cx| s.selected_action(false, cx)))
-            .on_action(cx.listener(|s, _: &ResumeSelected, _, cx| s.selected_action(true, cx)))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(div().text_xl().child("P2P File"))
-                    .child(
-                        div()
-                            .text_sm()
-                            .child(format!("信令：{}", self.network_status)),
-                    )
-                    .child(
-                        Self::control(
-                            if self.show_settings {
-                                "收起设置"
-                            } else {
-                                "设置"
-                            },
-                            true,
-                        )
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(|s, _: &MouseUpEvent, w, cx| s.toggle_settings(w, cx)),
-                        ),
-                    ),
+            .on_action(cx.listener(|shell, _: &ConnectPeer, _, cx| shell.connect_current_peer(cx)))
+            .on_action(cx.listener(|shell, _: &ChooseFiles, _, cx| shell.pick_files(cx)))
+            .on_action(cx.listener(|shell, _: &ChooseFolder, _, cx| shell.pick_folder(cx)))
+            .on_action(cx.listener(|shell, _: &SaveSettings, _, cx| shell.persist_settings(cx)))
+            .on_action(cx.listener(|shell, _: &StartSpeed, _, cx| shell.start_speed_ui(cx)))
+            .on_action(cx.listener(|shell, _: &CancelSpeed, _, cx| shell.cancel_speed_ui(cx)))
+            .on_action(cx.listener(|shell, _: &ToggleSettings, window, cx| {
+                shell.toggle_settings(window, cx)
+            }))
+            .on_action(
+                cx.listener(|shell, _: &PauseSelected, _, cx| shell.selected_action(false, cx)),
             )
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .items_center()
-                    .child(div().text_sm().child("本机 ID"))
-                    .child(div().flex_1().text_sm().child(identity))
-                    .child(self.copy_identity_button(cx)),
+            .on_action(
+                cx.listener(|shell, _: &ResumeSelected, _, cx| shell.selected_action(true, cx)),
             )
+            .child(self.app_header(cx))
+            .child(self.connection_card(window, cx))
+            .child(self.transfer_card(cx))
+            .child(self.receive_connection_bar(wide_layout, cx))
+            .child(bottom_cards)
             .child(
                 div()
-                    .flex()
-                    .gap_2()
-                    .items_center()
-                    .child(div().text_sm().child("对端 ID"))
-                    .child(div().flex_1().min_w_0().child(self.peer_id.clone()))
-                    .child(self.connect_peer_button(cx)),
-            )
-            .child(
-                div()
+                    .w_full()
+                    .p(px(10.))
+                    .rounded_md()
+                    .bg(rgb(ui_theme::PRIMARY_SOFT))
                     .text_xs()
-                    .text_color(rgb(0x5f6b7a))
-                    .child(self.current_peer_label(cx)),
-            );
-        let root = if self.show_settings {
-            root.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .p_3()
-                        .bg(white())
-                        .border_1()
-                        .border_color(rgb(0xdde3ee))
-                        .rounded_md()
-                        .flex_shrink_0()
-                        .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .child(div().text_sm().child("信令主机/IP"))
-                                        .child(self.signal_host.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .w(px(110.))
-                                        .child(div().text_sm().child("端口"))
-                                        .child(self.signal_port.clone()),
-                                ),
-                        )
-                        .child(Self::path_line(
-                            "接收目录（仅本机可见）",
-                            self.settings.receive_directory.as_ref(),
-                        ))
-                        .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .items_center()
-                                .child(Self::control("选择接收目录", true).on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(Self::choose_receive_directory),
-                                ))
-                                .child(self.save_settings_button(cx)),
-                        )
-                        .child(div().text_xs().child(self.config_note.clone()))
-                        .child(div().text_xs().child(self.identity_status.clone())).child(div().text_xs().child("Ctrl/⌘：Shift+D 接收目录 · Shift+C 复制 ID · N 并发 · D 测速方向 · L 测速时长 · Tab 切换输入框"))
-                        .child(div().text_xs().text_color(rgb(0x8b5a00)).child(
-                            "可信设备 MVP：知道 ID 的节点可发送文件。保存新目录仅影响新任务。",
-                        )),
-                )
-        } else {
-            root
-        };
-        root.child(
-            div().flex().flex_col().gap_2().p_3().bg(white()).border_1().border_color(rgb(0xdde3ee)).rounded_md().flex_shrink_0()
-            .child(div().flex().justify_between().items_center().child(div().child("文件传输")).child(div().text_xs().child(self.queue_status.clone())))
-            .child(div().flex().gap_2().items_center().child(self.choose_files_button(cx)).child(Self::control("选择目录",connected&&!running).on_mouse_up(MouseButton::Left,cx.listener(Self::choose_folder))).child(Self::control(format!("同时发送：{}（保存后生效）",self.settings.send_concurrency),!self.is_saving_settings).on_mouse_up(MouseButton::Left,cx.listener(Self::cycle_concurrency))).child(self.save_settings_button(cx)))
-            .child(if self.task_rows.is_empty(){div().h(px(160.)).flex().items_center().justify_center().text_sm().text_color(rgb(0x5f6b7a)).child("暂无任务。选择文件或目录发送；收到的新任务会自动显示。").into_any_element()}else{gpui::uniform_list("transfer-tasks",self.task_rows.len(),cx.processor(|s,range: Range<usize>,_,cx|{let end=range.end.min(s.task_rows.len());(range.start.min(end)..end).map(|index|s.task_row(index,cx)).collect::<Vec<_>>()})).track_scroll(self.task_scroll.clone())
-                            .h(px(220.)).into_any_element()})
-        ).child(
-            div().flex().flex_col().gap_2().p_3().bg(white()).border_1().border_color(rgb(0xdde3ee)).rounded_md().flex_shrink_0()
-            .child(div().child("直连测速"))
-            .child(div().flex().gap_2().items_center().child(Self::control(format!("方向：{}",self.settings.speedtest_direction.label()),!self.is_saving_settings).on_mouse_up(MouseButton::Left,cx.listener(Self::toggle_speedtest_direction))).child(Self::control(format!("时长：{} 秒",self.settings.speedtest_seconds),!self.is_saving_settings).on_mouse_up(MouseButton::Left,cx.listener(Self::cycle_speedtest_duration))).child(Self::control(if self.speed_request_until.is_some(){"等待授权…"}else{"开始"},can_start).on_mouse_up(MouseButton::Left,cx.listener(|s,_:&MouseUpEvent,_,cx|s.start_speed_ui(cx)))).child(Self::control("取消",running).on_mouse_up(MouseButton::Left,cx.listener(|s,_:&MouseUpEvent,_,cx|s.cancel_speed_ui(cx)))))
-            .child(div().text_sm().child(speed_text))
-        ).child(Self::path_line("新任务接收目录",self.applied_receive_root.as_ref()))
-        .child(div().p_2().bg(rgb(0xeaf1ff)).text_sm().child(self.status.clone()))
-        .child(div().text_xs().text_color(rgb(0x5f6b7a)).child("快捷键 Ctrl/⌘：Enter 连接 · O 文件 · Shift+O 目录 · S 保存 · T 测速 · Shift+T 取消 · ↑/↓ 选择任务 · E 展开目录 · P 暂停 · R 继续 · , 设置"))
+                    .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                    .child(self.status.clone()),
+            )
     }
 }
 
@@ -2161,7 +3065,7 @@ pub fn run() {
             KeyBinding::new("secondary-r", ResumeSelected, Some("DesktopShell")),
         ]);
 
-        let bounds = Bounds::centered(None, size(px(960.), px(680.)), cx);
+        let bounds = Bounds::centered(None, size(px(1180.), px(780.)), cx);
         let DesktopStartup {
             instance_lock,
             task_store,
