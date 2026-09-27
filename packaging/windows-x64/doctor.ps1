@@ -23,6 +23,30 @@ function Write-DoctorCheck {
     if ($State -eq 'WARN') { $script:WarningCount++ }
 }
 
+function Invoke-P2PNativeCapture {
+    param(
+        [Parameter(Mandatory = $true)][string]$Executable,
+        [string[]]$Arguments
+    )
+
+    # Windows PowerShell 5.1 promotes native stderr records to terminating
+    # errors when ErrorActionPreference is Stop. rustup writes informational
+    # version details to stderr, so capture native output with a local,
+    # non-terminating preference and preserve the process exit code.
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = @(& $Executable @Arguments 2>&1)
+        return [PSCustomObject]@{
+            Output = $output
+            ExitCode = $LASTEXITCODE
+        }
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+}
+
 function ConvertTo-RustBaseVersion {
     param([Parameter(Mandatory = $true)][string]$ToolName, [Parameter(Mandatory = $true)][string]$Output)
     $escapedName = [Regex]::Escape($ToolName)
@@ -49,8 +73,9 @@ function Test-RustToolVersion {
         return $null
     }
 
-    $versionOutput = @(& $tool.Source '--version' 2>&1)
-    $exitCode = $LASTEXITCODE
+    $capture = Invoke-P2PNativeCapture -Executable $tool.Source -Arguments @('--version')
+    $versionOutput = @($capture.Output)
+    $exitCode = $capture.ExitCode
     $versionLine = [string]($versionOutput | Select-Object -First 1)
     if ($exitCode -ne 0 -or [string]::IsNullOrWhiteSpace($versionLine)) {
         Write-DoctorCheck FAIL ($displayName + ' version') ($tool.Source + ' (version command failed)') $required $remediation
@@ -77,8 +102,9 @@ function Test-VersionCommand {
         Write-DoctorCheck FAIL $Name 'not found' $Required $Remediation
         return $null
     }
-    $versionOutput = @(& $tool.Source @Arguments 2>&1)
-    $exitCode = $LASTEXITCODE
+    $capture = Invoke-P2PNativeCapture -Executable $tool.Source -Arguments $Arguments
+    $versionOutput = @($capture.Output)
+    $exitCode = $capture.ExitCode
     $version = [string]($versionOutput | Select-Object -First 1)
     if ($exitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($version)) {
         Write-DoctorCheck PASS $Name ($tool.Source + ' (' + $version + ')') $Required 'none'
@@ -167,8 +193,9 @@ $cargo = Test-RustToolVersion 'cargo.exe'
 $rustc = Test-RustToolVersion 'rustc.exe'
 
 if ($null -ne $rustup) {
-    $installedTargets = @(& $rustup.Source 'target' 'list' '--installed' 2>$null)
-    if ($LASTEXITCODE -eq 0 -and $installedTargets -contains $Target) {
+    $targetCapture = Invoke-P2PNativeCapture -Executable $rustup.Source -Arguments @('target', 'list', '--installed')
+    $installedTargets = @($targetCapture.Output | ForEach-Object { [string]$_ })
+    if ($targetCapture.ExitCode -eq 0 -and $installedTargets -contains $Target) {
         Write-DoctorCheck PASS 'Rust target' ($Target + ' installed') $Target 'none'
     }
     else {
@@ -245,7 +272,7 @@ if ($vsEnvironmentInitialized) {
     $sdkHeader = $null
     $sdkLibrary = $null
     if (-not [string]::IsNullOrWhiteSpace($env:WindowsSdkDir) -and -not [string]::IsNullOrWhiteSpace($env:WindowsSDKVersion)) {
-        $sdkVersionPath = ([string]$env:WindowsSDKVersion).TrimEnd([char[]]@('\\', '/'))
+        $sdkVersionPath = ([string]$env:WindowsSDKVersion).TrimEnd([char[]]@('\', '/'))
         $sdkHeader = [IO.Path]::Combine($env:WindowsSdkDir, 'Include', $sdkVersionPath, 'um', 'Windows.h')
         $sdkLibrary = [IO.Path]::Combine($env:WindowsSdkDir, 'Lib', $sdkVersionPath, 'um', 'x64', 'kernel32.lib')
     }
@@ -291,8 +318,10 @@ if ($null -ne $signatureCmdlet -and $null -ne $preferredSignatureHost) {
         [Environment]::SetEnvironmentVariable('P2P_PACKAGE_EXECUTABLE', $PSCommandPath, 'Process')
         [Environment]::SetEnvironmentVariable('PSModulePath', $null, 'Process')
         $signatureProbe = '$signature = Get-AuthenticodeSignature -LiteralPath $env:P2P_PACKAGE_EXECUTABLE; if ($null -eq $signature) { exit 8 }; $signature.Status.ToString()'
-        $signatureOutput = @(& $preferredSignatureHost.Source -NoLogo -NoProfile -NonInteractive -Command $signatureProbe 2>&1)
-        $signatureExit = $LASTEXITCODE
+        $signatureArguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', $signatureProbe)
+        $signatureCapture = Invoke-P2PNativeCapture -Executable $preferredSignatureHost.Source -Arguments $signatureArguments
+        $signatureOutput = @($signatureCapture.Output)
+        $signatureExit = $signatureCapture.ExitCode
         $signatureStatus = [string]($signatureOutput | Select-Object -Last 1)
     }
     finally {

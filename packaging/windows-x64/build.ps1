@@ -70,7 +70,7 @@ function Resolve-BuildOutput {
         $resolved = [IO.Path]::GetFullPath($canonicalProbe)
     }
 
-    $repository = $RepoRoot.TrimEnd([char[]]@('\\', '/'))
+    $repository = $RepoRoot.TrimEnd([char[]]@('\', '/'))
     $repositoryPrefix = $repository + [IO.Path]::DirectorySeparatorChar
     if ([string]::Equals($resolved, $repository, [StringComparison]::OrdinalIgnoreCase) -or
         $resolved.StartsWith($repositoryPrefix, [StringComparison]::OrdinalIgnoreCase)) {

@@ -2,6 +2,29 @@
 # Dot-source this file; all environment changes are limited to the current PowerShell process.
 #requires -Version 5.1
 
+function Invoke-P2PDesktopNativeCapture {
+    param(
+        [Parameter(Mandatory = $true)][string]$Executable,
+        [string[]]$Arguments
+    )
+
+    # Windows PowerShell 5.1 promotes native stderr records to terminating
+    # errors when ErrorActionPreference is Stop. Keep probes non-terminating
+    # while preserving their output and process exit code.
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = @(& $Executable @Arguments 2>&1)
+        return [PSCustomObject]@{
+            Output = $output
+            ExitCode = $LASTEXITCODE
+        }
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+}
+
 function Find-P2PVsWhere {
     $fromPath = Get-Command -Name 'vswhere.exe' -CommandType Application -ErrorAction SilentlyContinue |
         Select-Object -First 1
@@ -29,8 +52,9 @@ function Get-P2PVisualStudioInstance {
 
     $common = @('-latest', '-products', '*', '-version', '[17.0,18.0)', '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64')
     $installationArguments = $common + @('-property', 'installationPath')
-    $installation = @(& $VsWherePath @installationArguments 2>$null)
-    $resultCode = $LASTEXITCODE
+    $installationCapture = Invoke-P2PDesktopNativeCapture -Executable $VsWherePath -Arguments $installationArguments
+    $installation = @($installationCapture.Output)
+    $resultCode = $installationCapture.ExitCode
     if ($resultCode -ne 0 -or $installation.Count -eq 0 -or [string]::IsNullOrWhiteSpace([string]$installation[0])) {
         throw 'vswhere found no Visual Studio 2022 instance with the MSVC x86/x64 C++ toolset. Install the Desktop development with C++ workload, MSVC v143 x64/x86 tools, and a Windows SDK.'
     }
@@ -42,8 +66,9 @@ function Get-P2PVisualStudioInstance {
     }
 
     $versionArguments = $common + @('-property', 'installationVersion')
-    $version = @(& $VsWherePath @versionArguments 2>$null)
-    if ($LASTEXITCODE -ne 0 -or $version.Count -eq 0) {
+    $versionCapture = Invoke-P2PDesktopNativeCapture -Executable $VsWherePath -Arguments $versionArguments
+    $version = @($versionCapture.Output)
+    if ($versionCapture.ExitCode -ne 0 -or $version.Count -eq 0) {
         $versionText = 'version unavailable'
     }
     else {
@@ -135,7 +160,7 @@ function Test-P2PVisualStudioEnvironment {
     if ([string]::IsNullOrWhiteSpace($env:WindowsSdkDir) -or [string]::IsNullOrWhiteSpace($env:WindowsSDKVersion)) {
         throw 'VsDevCmd did not select a Windows SDK. Install a Windows 10/11 SDK through Visual Studio Installer.'
     }
-    $sdkVersionPath = ([string]$env:WindowsSDKVersion).TrimEnd([char[]]@('\\', '/'))
+    $sdkVersionPath = ([string]$env:WindowsSDKVersion).TrimEnd([char[]]@('\', '/'))
     $sdkInclude = [IO.Path]::Combine($env:WindowsSdkDir, 'Include', $sdkVersionPath, 'um', 'Windows.h')
     if (-not (Test-Path -LiteralPath $sdkInclude -PathType Leaf)) {
         throw "Windows SDK headers were not found under $($env:WindowsSdkDir) (version $($env:WindowsSDKVersion))."
@@ -147,7 +172,7 @@ function Test-P2PVisualStudioEnvironment {
     if ([string]::IsNullOrWhiteSpace($env:VCToolsInstallDir) -or -not (Test-Path -LiteralPath $env:VCToolsInstallDir -PathType Container)) {
         throw "MSVC x64 toolset directory is unavailable: $env:VCToolsInstallDir"
     }
-    $toolsPrefix = $env:VCToolsInstallDir.TrimEnd([char[]]@('\\', '/')) + [IO.Path]::DirectorySeparatorChar
+    $toolsPrefix = $env:VCToolsInstallDir.TrimEnd([char[]]@('\', '/')) + [IO.Path]::DirectorySeparatorChar
     if (-not $cl.Source.StartsWith($toolsPrefix, [StringComparison]::OrdinalIgnoreCase) -or
         -not $link.Source.StartsWith($toolsPrefix, [StringComparison]::OrdinalIgnoreCase)) {
         throw "cl.exe and link.exe must come from the selected Visual Studio MSVC toolset at $($env:VCToolsInstallDir)."
@@ -159,8 +184,10 @@ function Test-P2PVisualStudioEnvironment {
         $sourcePath = Join-Path $temporaryRoot 'sdk_probe.cpp'
         $executablePath = Join-Path $temporaryRoot 'sdk_probe.exe'
         [IO.File]::WriteAllText($sourcePath, "#include <windows.h>`r`nint main(void) { return GetCurrentProcessId() == 0; }`r`n", [Text.Encoding]::ASCII)
-        $compilerOutput = @(& $cl.Source '/nologo' '/EHsc' ('/Fe:' + $executablePath) $sourcePath 2>&1)
-        $compileCode = $LASTEXITCODE
+        $compilerArguments = @('/nologo', '/EHsc', ('/Fe:' + $executablePath), $sourcePath)
+        $compilerCapture = Invoke-P2PDesktopNativeCapture -Executable $cl.Source -Arguments $compilerArguments
+        $compilerOutput = @($compilerCapture.Output)
+        $compileCode = $compilerCapture.ExitCode
         if ($compileCode -ne 0 -or -not (Test-Path -LiteralPath $executablePath -PathType Leaf)) {
             throw "MSVC/Windows SDK compile-and-link probe failed (exit $compileCode): $($compilerOutput -join ' ')"
         }
@@ -185,7 +212,9 @@ function Test-P2PVisualStudioEnvironment {
 }
 
 function Find-P2PPython {
-    $probeCode = 'import json,sys,tomllib; assert sys.version_info >= (3,11); print(json.dumps({"version":".".join(map(str,sys.version_info[:3])),"path":sys.executable}))'
+    # Avoid quotes in the Python -c payload. Windows PowerShell 5.1 strips
+    # embedded quotes from native command arguments before launching Python.
+    $probeCode = 'import sys,tomllib; assert sys.version_info >= (3,11); print(sys.version_info[0],sys.version_info[1],sys.version_info[2],sys.executable,sep=chr(124))'
     $candidates = @()
     $launcher = Get-Command -Name 'py.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -ne $launcher) {
@@ -202,17 +231,32 @@ function Find-P2PPython {
 
     foreach ($candidate in $candidates) {
         $arguments = @($candidate.Prefix) + @('-c', $probeCode)
-        $output = @(& $candidate.Path @arguments 2>$null)
-        $exitCode = $LASTEXITCODE
+        $previousErrorActionPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $output = @(& $candidate.Path @arguments 2>$null)
+            $exitCode = $LASTEXITCODE
+        }
+        finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
         if ($exitCode -ne 0 -or $output.Count -eq 0) {
             continue
         }
         try {
-        $details = ([string]($output -join "`n")) | ConvertFrom-Json -ErrorAction Stop
-            if (-not [string]::IsNullOrWhiteSpace([string]$details.path) -and $details.path -notmatch '\\Microsoft\\WindowsApps\\') {
+            $parts = ([string]($output -join [Environment]::NewLine)).Trim() -split '\|'
+            if ($parts.Count -ge 4) {
+                $pythonPath = [string]$parts[3]
+                $pythonVersion = '{0}.{1}.{2}' -f $parts[0], $parts[1], $parts[2]
+                [Version]$null = [Version]::Parse($pythonVersion)
+            }
+            else {
+                continue
+            }
+            if (-not [string]::IsNullOrWhiteSpace($pythonPath) -and $pythonPath -notmatch '\\Microsoft\\WindowsApps\\') {
                 return [PSCustomObject]@{
-                    Path = [string]$details.path
-                    Version = [string]$details.version
+                    Path = $pythonPath
+                    Version = $pythonVersion
                     Launcher = [string]$candidate.Path
                 }
             }
