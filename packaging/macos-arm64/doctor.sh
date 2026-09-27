@@ -33,6 +33,60 @@ check_versioned_command() {
     fi
 }
 
+extract_rust_version() {
+    local tool=$1 output=$2
+    local pattern="^${tool}[[:space:]]+([0-9]+)\\.([0-9]+)\\.([0-9]+)([-+][[:alnum:].-]+)?([[:space:]]|$)"
+    if [[ "$output" =~ $pattern ]]; then
+        printf '%s.%s.%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+    else
+        return 1
+    fi
+}
+
+rust_version_at_least_minimum() {
+    local version=$1 major minor patch
+    [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || return 2
+    major=${BASH_REMATCH[1]}
+    minor=${BASH_REMATCH[2]}
+    patch=${BASH_REMATCH[3]}
+
+    if (( 10#$major > 1 )); then
+        return 0
+    elif (( 10#$major < 1 )); then
+        return 1
+    elif (( 10#$minor > 85 )); then
+        return 0
+    elif (( 10#$minor < 85 )); then
+        return 1
+    fi
+    (( 10#$patch >= 0 ))
+}
+
+check_rust_version() {
+    local name=$1 path output version remediation
+    remediation="Run: rustup update stable"
+    if ! path=$(command -v "$name" 2>/dev/null); then
+        report FAIL "$name version" "not found" ">= 1.85.0" "Install Rust with rustup, then run: $remediation"
+        return
+    fi
+
+    if ! output=$("$path" --version 2>&1); then
+        report FAIL "$name version" "$path (version command failed: ${output%%$'\n'*})" ">= 1.85.0" "$remediation"
+        return
+    fi
+    output=${output%%$'\n'*}
+    if ! version=$(extract_rust_version "$name" "$output"); then
+        report FAIL "$name version" "$path (unrecognized version output: $output)" ">= 1.85.0" "$remediation"
+        return
+    fi
+
+    if rust_version_at_least_minimum "$version"; then
+        report PASS "$name version" "$path ($version)" ">= 1.85.0" "none"
+    else
+        report FAIL "$name version" "$path ($version)" ">= 1.85.0" "$remediation"
+    fi
+}
+
 echo "P2P File macOS packaging doctor"
 echo "repo: $REPO_ROOT"
 echo "target: $TARGET"
@@ -100,8 +154,8 @@ fi
 check_versioned_command clang --version "Apple clang from Xcode Command Line Tools" "Install Xcode Command Line Tools with: xcode-select --install"
 check_versioned_command git --version "Git available on PATH" "Install Git from https://git-scm.com/download/mac or install Xcode Command Line Tools."
 check_versioned_command rustup --version "rustup available on PATH" "Install Rust using rustup: https://rustup.rs/"
-check_versioned_command cargo --version "Cargo available on PATH" "Install the stable Rust toolchain using rustup: https://rustup.rs/"
-check_versioned_command rustc --version "Rust compiler available on PATH" "Install the stable Rust toolchain using rustup: https://rustup.rs/"
+check_rust_version rustc
+check_rust_version cargo
 
 for tool in codesign otool; do
     if path=$(command -v "$tool" 2>/dev/null); then

@@ -19,7 +19,7 @@ Rosetta 下的 `x86_64` 进程不能作为正式候选构建环境，即使主�
 ./packaging/macos-arm64/doctor.sh
 ```
 
-完整候选需要 Xcode Command Line Tools、Git、rustup 管理的稳定 Rust 工具链、`aarch64-apple-darwin` target，以及 Python 3.11 或更新版本（推荐 3.12，且需包含 `tomllib`）。
+完整候选需要 Xcode Command Line Tools、Git、rustup 管理的稳定 Rust 工具链（rustc 与 Cargo 最低版本均为 **1.85.0**）、`aarch64-apple-darwin` target，以及 Python 3.11 或更新版本（推荐 3.12，且需包含 `tomllib`）。建议使用 rustup stable；已有 Rust 工具链可运行 `rustup update stable` 升级，然后重新运行 doctor。
 
 - 缺少 Apple 工具时，doctor 会提示 `xcode-select --install`。请自行确认并启动安装。
 - Rust 使用 [rustup](https://rustup.rs/) 安装；安装工具链后运行 `rustup target add aarch64-apple-darwin`。
