@@ -34,6 +34,17 @@ macOS：只支持 Apple Silicon arm64，产品目标 macOS 13+，不提供 Intel
 codesign -dv --verbose=4 "P2P File.app"
 ```
 
+只需本机可运行的轻量 `.app` 时，打包命令加 `--app-only`。该模式只输出 `P2P File.app`，保留依赖许可证/声明文本，不复制完整 `.crate` 源码归档，也不生成候选 ZIP、`candidate.json` 或 SHA256 旁置文件；因此它不是完整审计候选包：
+
+```sh
+python3.12 scripts/package-desktop.py \
+  --binary target/aarch64-apple-darwin/release/p2p-desktop \
+  --target aarch64-apple-darwin \
+  --output "$P2P_PACKAGE_DIR" \
+  --app-only
+open "$P2P_PACKAGE_DIR/P2P File.app"
+```
+
 没有 Developer ID/公证凭证；包只有实际验证的 ad-hoc 签名（没有开发者证书），未公证。不要把 ad-hoc 叫正式签名，也不删除系统 quarantine 以制造通过截图。允许打开候选的操作应由设备持有人按系统提示完成。
 
 ## 配置、自建信令与可信设备边界
@@ -60,6 +71,6 @@ cargo build --locked --release --bin p2p_file
 
 ## 来源、许可证和证据
 
-`LICENSE` 是本仓库 MIT；GPUI 适配代码及 Apache 条款在 `THIRD_PARTY_NOTICES.md`。`dependencies.json` 原样保存 Cargo 依赖声明、作者、上游地址和已锁定源码 SHA256。macOS 材料存放于 .app 的 `Contents/Resources`，随应用一起安装。`licenses/` 保留上游提供的 LICENSE/NOTICE/COPYING/README；`third-party-sources/` 提供每个原始 .crate 完整源码归档（SHA256 对照 Cargo.lock），含嵌套版权/许可材料。清单保守包含构建、可选和其它目标依赖，不声称每个包都链接进当前二进制，也不重写上游 SPDX 选择表达式。系统动态库没有复制进包，由系统包管理器提供其许可材料。
+`LICENSE` 是本仓库 MIT；GPUI 适配代码及 Apache 条款在 `THIRD_PARTY_NOTICES.md`。完整审计候选的 `dependencies.json` 原样保存 Cargo 依赖声明、作者、上游地址和已锁定源码 SHA256。macOS 材料存放于 .app 的 `Contents/Resources`，随应用一起安装。完整审计候选的 `licenses/` 保留上游提供的 LICENSE/NOTICE/COPYING/README；`third-party-sources/` 提供每个原始 `.crate` 完整源码归档（SHA256 对照 Cargo.lock），含嵌套版权/许可材料。轻量 `--app-only` 模式仅保留许可证/声明文本，不含这些源码归档，也不作为完整审计候选。清单保守包含构建、可选和其它目标依赖，不声称每个包都链接进当前二进制，也不重写上游 SPDX 选择表达式。系统动态库没有复制进包，由系统包管理器提供其许可材料。
 
 包体积包含这些来源材料，启动耗时需由实际 GUI 窗口测量；metadata 子进程耗时只称 metadata probe。真实 600 秒、进程强杀/恢复、目录重名、中文/DPI 的证据和未执行项见仓库 T010/T011/T012 文档与 Issue #24。缺少物理 Win10/Win11、macOS13 Apple Silicon、真实中文 IME/Wayland、Windows↔Linux 双 NAT 两方向文件/测速及 Apple Silicon 互传时，最终状态保持 `FINAL_BLOCKED_EXTERNAL_VALIDATION`。

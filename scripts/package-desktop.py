@@ -100,6 +100,39 @@ def dependency_bundle(destination):
     return len(records)
 
 
+def dependency_licenses(destination):
+    """Bundle dependency license/notice text without copying full crate sources."""
+    metadata = json.loads(run(['cargo', 'metadata', '--locked', '--features', 'gui', '--format-version', '1']))
+    count = 0
+    notices = destination / 'licenses'
+    notices.mkdir()
+    for package in sorted(metadata['packages'], key=lambda p: (p['name'], p['version'])):
+        if package['source'] is None:
+            continue
+        if not package['source'].startswith('registry+'):
+            raise ValueError('unsupported dependency source; a verified license directory is required')
+        root = Path(package['manifest_path']).parent
+        license_dir = notices / f"{package['name']}-{package['version']}"
+        provided = []
+        for item in sorted(root.iterdir()):
+            if item.is_file() and item.name.upper().startswith(('LICENSE', 'LICENCE', 'COPYING', 'NOTICE', 'COPYRIGHT')):
+                license_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(item, license_dir / item.name)
+                provided.append(item.name)
+        if package['license_file']:
+            item = (root / package['license_file']).resolve()
+            if root.resolve() not in item.parents or not item.is_file():
+                raise ValueError(f'invalid declared license_file: {root.name}')
+            license_dir.mkdir(parents=True, exist_ok=True)
+            filename = 'declared-' + item.name
+            shutil.copyfile(item, license_dir / filename)
+            provided.append(filename)
+        if not package['license'] and not package['license_file']:
+            raise ValueError(f'missing dependency license declaration: {root.name}')
+        count += 1
+    return count
+
+
 def pe_imports(path):
     data = path.read_bytes()
     pe = struct.unpack_from('<I', data, 60)[0]
@@ -176,6 +209,7 @@ def main():
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--target', choices=TARGETS, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--app-only', action='store_true', help='macOS only: output a runnable .app without full dependency source archives')
     parser.add_argument('--allow-dirty', action='store_true', help='local preflight only, explicitly marks non-candidate metadata')
     args = parser.parse_args()
     output = args.output.resolve()
@@ -186,6 +220,8 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     if platform.system() != TARGETS[args.target][0]:
         parser.error('packaging must execute on the actual native platform')
+    if args.app_only and args.target != 'aarch64-apple-darwin':
+        parser.error('--app-only is supported only for native Apple Silicon macOS packages')
     head = run(['git', 'rev-parse', 'HEAD'])
     dirty = bool(run(['git', 'status', '--porcelain']))
     if dirty and not args.allow_dirty:
@@ -209,8 +245,9 @@ def main():
     if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?', version):
         parser.error('invalid package version')
     stem = f'p2p-desktop-{version}-{args.target}-{head[:12]}'
-    package = output / stem
-    package.mkdir()
+    package = output if args.app_only else output / stem
+    if not args.app_only:
+        package.mkdir()
     executable = package / ('p2p-desktop.exe' if platform.system() == 'Windows' else 'p2p-desktop')
     signing = {'status': 'unsigned', 'notarization': 'not applicable', 'certificate': None}
     inspection = {}
@@ -247,10 +284,19 @@ def main():
             raise ValueError('unexpected signature status; candidate signing metadata must be reviewed')
         inspection['dynamic_dependencies'] = pe_imports(executable)
     resources = contents / 'Resources' if platform.system() == 'Darwin' else package
-    for source, name in [('LICENSE', 'LICENSE'), ('docs/gpui-mvp/THIRD_PARTY_NOTICES.md', 'THIRD_PARTY_NOTICES.md'), ('packaging/RUNNING.md', 'RUNNING.md')]:
+    legal_files = [
+        ('LICENSE', 'LICENSE'),
+        ('docs/gpui-mvp/THIRD_PARTY_NOTICES.md', 'THIRD_PARTY_NOTICES.md'),
+    ]
+    if not args.app_only:
+        legal_files.append(('packaging/RUNNING.md', 'RUNNING.md'))
+    for source, name in legal_files:
         shutil.copyfile(REPO / source, resources / name)
-    shutil.copyfile(REPO / 'packaging/RUNNING.md', package / 'RUNNING.md')
-    dependencies = dependency_bundle(resources)
+    if args.app_only:
+        dependencies = dependency_licenses(resources)
+    else:
+        shutil.copyfile(REPO / 'packaging/RUNNING.md', package / 'RUNNING.md')
+        dependencies = dependency_bundle(resources)
     if platform.system() == 'Darwin':
         subprocess.run(['codesign', '--force', '--sign', '-', str(app)], check=True)
         subprocess.run(['codesign', '--verify', '--strict', str(app)], check=True)
@@ -259,6 +305,13 @@ def main():
         if result.returncode or 'Signature=adhoc' not in inspection['codesign']:
             raise ValueError('expected verified ad-hoc signature without a certificate')
         signing = {'status': 'ad-hoc (no developer certificate)', 'notarization': 'not notarized', 'certificate': None}
+    if args.app_only:
+        app_bytes = sum(item.stat().st_size for item in app.rglob('*') if item.is_file())
+        print(json.dumps({'result': 'APP_ONLY', 'app': str(app), 'build_sha': head,
+                          'target': args.target, 'app_bytes': app_bytes,
+                          'dependency_packages_with_license_declarations': dependencies,
+                          'signing': signing}, ensure_ascii=False))
+        return
     (package / 'native-inspection.json').write_text(json.dumps(inspection, indent=2) + '\n', encoding='utf-8')
     data = dict(schema='p2p-desktop-package/v1', **info, minimum_os=TARGETS[args.target][1],
                 candidate=not dirty, signing=signing, license_material=resources.relative_to(package).as_posix(), created_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),

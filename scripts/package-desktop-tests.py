@@ -112,6 +112,24 @@ class Boundaries(unittest.TestCase):
                 verify.relative(name)
         self.assertEqual(str(verify.relative('目录/内容.txt')), '目录/内容.txt')
 
+    def test_macos_app_only_keeps_license_text_without_crate_sources_or_readmes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            crate = root / 'cargo' / 'registry' / 'src' / 'index' / 'sample-1.0.0'
+            crate.mkdir(parents=True)
+            (crate / 'LICENSE-MIT').write_text('MIT terms', encoding='utf-8')
+            (crate / 'README.md').write_text('large upstream readme', encoding='utf-8')
+            package = {'name': 'sample', 'version': '1.0.0', 'source': 'registry+https://example.invalid',
+                       'manifest_path': str(crate / 'Cargo.toml'), 'license': 'MIT', 'license_file': None}
+            output = root / 'Resources'
+            output.mkdir()
+            with patch.object(pack, 'run', return_value=json.dumps({'packages': [package]})):
+                count = pack.dependency_licenses(output)
+            self.assertEqual(count, 1)
+            self.assertEqual((output / 'licenses' / 'sample-1.0.0' / 'LICENSE-MIT').read_text(encoding='utf-8'), 'MIT terms')
+            self.assertFalse((output / 'licenses' / 'sample-1.0.0' / 'README.md').exists())
+            self.assertFalse((output / 'third-party-sources').exists())
+
     def test_preflight_cannot_be_accepted_and_archive_corruption_is_detected(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
