@@ -50,9 +50,9 @@ use gpui::{
     App, Application, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, PathPromptOptions,
-    Pixels, Point, ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle,
-    Window, WindowBounds, WindowOptions, actions, div, fill, hsla, point, prelude::*, px, relative,
-    rgb, rgba, size, white,
+    Pixels, Point, PromptButton, PromptLevel, ShapedLine, SharedString, Style, TextRun,
+    UTF16Selection, UnderlineStyle, Window, WindowBounds, WindowOptions, actions, div, fill, hsla,
+    point, prelude::*, px, relative, rgb, rgba, size, white,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -228,6 +228,25 @@ fn marked_selection_to_utf8(
         ..insertion_offset + utf8_offset_from_utf16(new_text, selection_utf16.end)
 }
 
+fn concurrency_value_replacement(
+    current: &str,
+    range: Range<usize>,
+    new_text: &str,
+) -> Option<(Range<usize>, String)> {
+    if new_text.is_empty() {
+        let remaining_len = current.len().saturating_sub(range.end - range.start);
+        if remaining_len == 0 {
+            return Some((0..current.len(), current.to_owned()));
+        }
+        return Some((range, String::new()));
+    }
+
+    new_text
+        .chars()
+        .find(|character| matches!(character, '1'..='3'))
+        .map(|character| (0..current.len(), character.to_string()))
+}
+
 fn signal_server_spec(host: &str, port: &str) -> String {
     if host.parse::<std::net::Ipv6Addr>().is_ok() {
         format!("[{host}]:{port}")
@@ -275,6 +294,7 @@ struct TextField {
     focus_handle: FocusHandle,
     content: SharedString,
     placeholder: SharedString,
+    concurrency_value_input: bool,
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
@@ -289,12 +309,33 @@ impl TextField {
             focus_handle: cx.focus_handle(),
             content: "".into(),
             placeholder: placeholder.into(),
+            concurrency_value_input: false,
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
+        }
+    }
+
+    fn new_concurrency_value(cx: &mut Context<Self>, value: u8) -> Self {
+        let mut field = Self::new(cx, "1–3");
+        field.content = value.to_string().into();
+        field.selected_range = field.content.len()..field.content.len();
+        field.concurrency_value_input = true;
+        field
+    }
+
+    fn replacement_for_range(
+        &self,
+        range: Range<usize>,
+        new_text: &str,
+    ) -> Option<(Range<usize>, String)> {
+        if self.concurrency_value_input {
+            concurrency_value_replacement(&self.content, range, new_text)
+        } else {
+            Some((range, new_text.to_owned()))
         }
     }
 
@@ -543,9 +584,12 @@ impl EntityInputHandler for TextField {
             .map(|range_utf16| self.range_from_utf16(range_utf16))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
+        let Some((range, new_text)) = self.replacement_for_range(range, new_text) else {
+            return;
+        };
 
         self.content =
-            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
+            (self.content[0..range.start].to_owned() + &new_text + &self.content[range.end..])
                 .into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.marked_range.take();
@@ -565,19 +609,26 @@ impl EntityInputHandler for TextField {
             .map(|range_utf16| self.range_from_utf16(range_utf16))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
+        let Some((range, new_text)) = self.replacement_for_range(range, new_text) else {
+            return;
+        };
 
         self.content =
-            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
+            (self.content[0..range.start].to_owned() + &new_text + &self.content[range.end..])
                 .into();
-        if !new_text.is_empty() {
+        if !self.concurrency_value_input && !new_text.is_empty() {
             self.marked_range = Some(range.start..range.start + new_text.len());
         } else {
             self.marked_range = None;
         }
-        self.selected_range = new_selected_range_utf16
-            .as_ref()
-            .map(|range_utf16| marked_selection_to_utf8(range.start, new_text, range_utf16))
-            .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+        self.selected_range = if self.concurrency_value_input {
+            range.start + new_text.len()..range.start + new_text.len()
+        } else {
+            new_selected_range_utf16
+                .as_ref()
+                .map(|range_utf16| marked_selection_to_utf8(range.start, &new_text, range_utf16))
+                .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len())
+        };
         cx.notify();
     }
 
@@ -798,7 +849,7 @@ impl Element for TextFieldElement {
 
 impl Render for TextField {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        let field = div()
             .flex()
             .w_full()
             .key_context("TextField")
@@ -820,10 +871,18 @@ impl Render for TextField {
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .line_height(px(26.))
-            .text_size(px(16.))
-            .child(
+            .on_mouse_move(cx.listener(Self::on_mouse_move));
+        if self.concurrency_value_input {
+            field.line_height(px(18.)).text_size(px(12.)).child(
+                div()
+                    .h(px(24.))
+                    .w_full()
+                    .px(px(4.))
+                    .bg(white())
+                    .child(TextFieldElement { input: cx.entity() }),
+            )
+        } else {
+            field.line_height(px(26.)).text_size(px(16.)).child(
                 div()
                     .h(px(40.))
                     .w_full()
@@ -831,6 +890,7 @@ impl Render for TextField {
                     .bg(white())
                     .child(TextFieldElement { input: cx.entity() }),
             )
+        }
     }
 }
 
@@ -842,6 +902,7 @@ impl Focusable for TextField {
 
 struct DesktopShell {
     peer_id: Entity<TextField>,
+    concurrency_input: Entity<TextField>,
     signal_host: Entity<TextField>,
     signal_port: Entity<TextField>,
     selected_files: Vec<PathBuf>,
@@ -867,9 +928,13 @@ struct DesktopShell {
     selected_task: Option<task_model::TaskId>,
     queue_status: SharedString,
     speed_views: ui_model::SpeedViews,
+    speedtest_upload_result: Option<speed::SpeedSnapshot>,
     speed_peer: Option<NodeId>,
     speed_request_until: Option<Instant>,
+    show_speed_test_panel: bool,
+    show_speed_duration_menu: bool,
     show_settings: bool,
+    show_settings_home: bool,
     pending_resumes: HashMap<NodeId, Vec<task_model::TaskId>>,
     applied_receive_root: Option<PathBuf>,
     task_scroll: gpui::UniformListScrollHandle,
@@ -886,6 +951,39 @@ impl Drop for DesktopShell {
 }
 
 impl DesktopShell {
+    fn open_settings_home(&mut self, cx: &mut Context<Self>) {
+        self.show_settings_home = true;
+        cx.notify();
+    }
+    fn close_settings_home(&mut self, cx: &mut Context<Self>) {
+        self.show_settings_home = false;
+        cx.notify();
+    }
+    fn toggle_speed_test_panel(&mut self, cx: &mut Context<Self>) {
+        self.show_speed_test_panel = !self.show_speed_test_panel;
+        self.show_speed_duration_menu = false;
+        cx.notify();
+    }
+    fn toggle_speed_duration_menu(&mut self, cx: &mut Context<Self>) {
+        if self.is_saving_settings {
+            return;
+        }
+        self.show_speed_duration_menu = !self.show_speed_duration_menu;
+        cx.notify();
+    }
+    fn set_speedtest_duration(&mut self, seconds: u16, cx: &mut Context<Self>) {
+        const OPTIONS: [u16; 5] = [30, 60, 120, 300, 600];
+        if self.is_saving_settings || !OPTIONS.contains(&seconds) {
+            return;
+        }
+        self.settings.speedtest_seconds = seconds;
+        self.show_speed_duration_menu = false;
+        cx.notify();
+    }
+    fn toggle_settings_home(&mut self, cx: &mut Context<Self>) {
+        self.show_settings_home = !self.show_settings_home;
+        cx.notify();
+    }
     fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show_settings = !self.show_settings;
         let field = if self.show_settings {
@@ -1031,31 +1129,6 @@ impl DesktopShell {
         }
         Some(peer)
     }
-    fn current_peer_label(&self, cx: &Context<Self>) -> String {
-        let Ok(peer) = NodeId::from_hex(self.peer_id.read(cx).content.trim()) else {
-            let connected = self
-                .peer_states
-                .values()
-                .filter(|state| matches!(state, network_state::PeerLifecycle::Connected))
-                .count();
-            return if connected == 0 {
-                "输入对端 ID 后连接；也可以被动接收对端文件".into()
-            } else {
-                format!("已有 {connected} 个对端完成身份认证；本机可被动接收")
-            };
-        };
-        let state = match self.peer_states.get(&peer) {
-            Some(network_state::PeerLifecycle::Connected) => "已认证直连".to_owned(),
-            Some(network_state::PeerLifecycle::PeerPending) => "等待对端上线".into(),
-            Some(network_state::PeerLifecycle::Punching) => "正在建立直连".into(),
-            Some(network_state::PeerLifecycle::Authenticating) => "正在核对身份".into(),
-            Some(network_state::PeerLifecycle::Negotiating) => "正在核对版本".into(),
-            Some(network_state::PeerLifecycle::Disconnected) => "连接已断开".into(),
-            Some(network_state::PeerLifecycle::Failed(error)) => format!("连接失败：{error}"),
-            None => "尚未连接".into(),
-        };
-        format!("对端 {}：{state}", peer.short())
-    }
     fn start_speed_ui(&mut self, cx: &mut Context<Self>) {
         if self.speed_request_until.is_some()
             || self
@@ -1070,20 +1143,26 @@ impl DesktopShell {
         let Some(peer) = self.authenticated_peer(cx) else {
             return;
         };
-        let direction = match self.settings.speedtest_direction {
-            SpeedtestDirection::Upload => protocol::SpeedDirection::Upload,
-            SpeedtestDirection::Download => protocol::SpeedDirection::Download,
-        };
+        let direction = self.settings.speedtest_direction;
+        let seconds = self.settings.speedtest_seconds;
         let result = self
             .network_session
             .as_ref()
             .ok_or("网络会话已关闭".to_owned())
-            .and_then(|s| s.start_speed(peer, direction, self.settings.speedtest_seconds));
+            .and_then(|s| s.start_speed(peer, direction, seconds));
         match result {
             Ok(()) => {
                 self.speed_peer = Some(peer);
+                self.speedtest_upload_result = None;
                 self.speed_request_until = Some(Instant::now() + Duration::from_secs(6));
-                self.set_status("正在请求测速；有文件活动时需先暂停，不会自动暂停任务", cx);
+                self.set_status(
+                    if direction == SpeedtestDirection::Both {
+                        format!("正在请求双向测速；先上传后下载，每个方向 {seconds} 秒")
+                    } else {
+                        "正在请求测速；有文件活动时需先暂停，不会自动暂停任务".to_owned()
+                    },
+                    cx,
+                );
             }
             Err(e) => self.set_status(e, cx),
         }
@@ -1181,6 +1260,83 @@ impl DesktopShell {
             self.set_status("先点击任务行选择任务", cx);
         }
     }
+    fn remove_task_history(&mut self, id: task_model::TaskId, cx: &mut Context<Self>) {
+        let completed = self.task_rows.iter().any(|row| {
+            matches!(row, ui_model::ListRow::Task(task) if task.id == id && task.can_remove_history())
+        });
+        if !completed {
+            self.set_status("只能移除已完成任务的历史记录", cx);
+            return;
+        }
+        let Some(service) = self.transfer_service.clone() else {
+            self.set_status("任务存储不可用", cx);
+            return;
+        };
+        let background = cx.background_executor().clone();
+        let removed_id = id.clone();
+        cx.spawn(async move |shell, cx| {
+            let result = background
+                .spawn(async move { service.remove_completed_task(&id) })
+                .await;
+            let _ = shell.update(cx, move |shell, cx| match result {
+                Ok(()) => {
+                    if shell.selected_task.as_ref() == Some(&removed_id) {
+                        shell.selected_task = None;
+                    }
+                    shell.set_status("已移除完成任务记录；传输文件保留在原位置", cx);
+                }
+                Err(error) => shell.set_status(format!("移除任务历史记录失败：{error}"), cx),
+            });
+        })
+        .detach();
+    }
+    fn confirm_delete_received_file(
+        &mut self,
+        id: task_model::TaskId,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let eligible = self.task_rows.iter().any(|row| {
+            matches!(row, ui_model::ListRow::Task(task) if task.id == id && task.can_delete_file())
+        });
+        if !eligible {
+            self.set_status("仅已完成的接收文件可以删除", cx);
+            return;
+        }
+        let Some(service) = self.transfer_service.clone() else {
+            self.set_status("任务存储不可用", cx);
+            return;
+        };
+        let detail = format!("将从接收目录永久删除“{name}”，并移除对应任务记录。此操作无法撤销。");
+        let confirmation = window.prompt(
+            PromptLevel::Warning,
+            "确定删除已接收文件？",
+            Some(&detail),
+            &[PromptButton::cancel("取消"), PromptButton::ok("删除文件")],
+            cx,
+        );
+        let background = cx.background_executor().clone();
+        cx.spawn(async move |shell, cx| {
+            if confirmation.await.ok() != Some(1) {
+                return;
+            }
+            let delete_id = id.clone();
+            let result = background
+                .spawn(async move { service.delete_completed_receive_file(&delete_id) })
+                .await;
+            let _ = shell.update(cx, move |shell, cx| match result {
+                Ok(()) => {
+                    if shell.selected_task.as_ref() == Some(&id) {
+                        shell.selected_task = None;
+                    }
+                    shell.set_status("已删除接收文件，并移除完成记录", cx);
+                }
+                Err(error) => shell.set_status(format!("删除接收文件失败：{error}"), cx),
+            });
+        })
+        .detach();
+    }
     fn task_row(&mut self, index: usize, cx: &mut Context<Self>) -> gpui::Div {
         let row = self.task_rows[index].clone();
         match row {
@@ -1188,7 +1344,8 @@ impl DesktopShell {
                 let expanded = self.expanded_groups.contains(&group.id);
                 let id = group.id.clone();
                 div()
-                    .h(px(72.))
+                    .w_full()
+                    .h(px(64.))
                     .px(px(12.))
                     .flex()
                     .items_center()
@@ -1246,8 +1403,13 @@ impl DesktopShell {
                 let select = id.clone();
                 let pause = id.clone();
                 let resume = id.clone();
+                let remove = id.clone();
+                let delete = id.clone();
+                let delete_name = task.name.clone();
                 let can_pause = task.can_pause();
                 let can_continue = task.can_continue();
+                let can_remove = task.can_remove_history();
+                let can_delete_file = task.can_delete_file();
                 let is_send = task.direction == task_model::TaskDirection::Send;
                 let direction = if is_send { "发送" } else { "接收" };
                 let (status_color, status_background) = match task.state {
@@ -1283,26 +1445,72 @@ impl DesktopShell {
                     diagnostic.unwrap_or_default()
                 );
                 let icon = if is_send { "↑" } else { "↓" };
-                let action = if can_pause {
-                    ui_components::secondary_button("暂停", true).on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |shell, _: &MouseUpEvent, _, cx| {
-                            shell.task_action(pause.clone(), false, cx);
-                        }),
-                    )
-                } else if can_continue {
-                    ui_components::secondary_button("继续", true).on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |shell, _: &MouseUpEvent, _, cx| {
-                            shell.task_action(resume.clone(), true, cx);
-                        }),
-                    )
-                } else {
-                    div().w(px(64.))
-                };
+                let mut actions = div().w(px(64.)).flex().items_center().justify_end().gap_1();
+                if can_pause {
+                    actions = actions.child(
+                        ui_components::task_icon_button(
+                            ui_components::TaskActionIcon::Pause,
+                            false,
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |shell, _: &MouseUpEvent, _, cx| {
+                                shell.task_action(pause.clone(), false, cx);
+                            }),
+                        ),
+                    );
+                }
+                if can_continue {
+                    actions = actions.child(
+                        ui_components::task_icon_button(
+                            ui_components::TaskActionIcon::Resume,
+                            false,
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |shell, _: &MouseUpEvent, _, cx| {
+                                shell.task_action(resume.clone(), true, cx);
+                            }),
+                        ),
+                    );
+                }
+                if can_remove {
+                    actions = actions.child(
+                        ui_components::task_icon_button(
+                            ui_components::TaskActionIcon::Remove,
+                            false,
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |shell, _: &MouseUpEvent, _, cx| {
+                                shell.remove_task_history(remove.clone(), cx);
+                            }),
+                        ),
+                    );
+                }
+                if can_delete_file {
+                    actions = actions.child(
+                        ui_components::task_icon_button(
+                            ui_components::TaskActionIcon::Delete,
+                            true,
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |shell, _: &MouseUpEvent, window, cx| {
+                                shell.confirm_delete_received_file(
+                                    delete.clone(),
+                                    delete_name.clone(),
+                                    window,
+                                    cx,
+                                );
+                            }),
+                        ),
+                    );
+                }
 
                 div()
-                    .h(px(72.))
+                    .w_full()
+                    .h(px(64.))
                     .px(px(12.))
                     .flex()
                     .items_center()
@@ -1341,9 +1549,12 @@ impl DesktopShell {
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .gap_1()
+                            .gap(px(2.))
+                            .line_height(px(14.))
                             .child(
                                 div()
+                                    .h(px(18.))
+                                    .line_height(px(18.))
                                     .flex()
                                     .items_center()
                                     .gap_2()
@@ -1365,7 +1576,7 @@ impl DesktopShell {
                                     .child(
                                         div()
                                             .px(px(6.))
-                                            .py(px(2.))
+                                            .py(px(0.))
                                             .rounded_md()
                                             .bg(rgb(status_background))
                                             .text_xs()
@@ -1375,10 +1586,12 @@ impl DesktopShell {
                             )
                             .child(
                                 div()
+                                    .h(px(12.))
+                                    .line_height(px(12.))
                                     .flex()
                                     .items_center()
                                     .gap_2()
-                                    .child(ui_components::progress_bar(progress))
+                                    .child(ui_components::compact_progress_bar(progress))
                                     .child(
                                         div()
                                             .w(px(48.))
@@ -1389,13 +1602,15 @@ impl DesktopShell {
                             )
                             .child(
                                 div()
+                                    .h(px(14.))
+                                    .line_height(px(14.))
                                     .text_xs()
                                     .text_color(rgb(ui_theme::TEXT_SECONDARY))
                                     .truncate()
                                     .child(metadata),
                             ),
                     )
-                    .child(action)
+                    .child(actions)
             }
         }
     }
@@ -1508,6 +1723,25 @@ impl DesktopShell {
                                     }
                                     session::SessionEvent::SelectionQueued {peer,count}=>{shell.set_status(format!("扫描已完成，{count} 项已入队，绑定对端 {}",peer.to_hex()),cx);}
                                     session::SessionEvent::SpeedRequestEnded {peer}=>{if shell.speed_peer==Some(peer){shell.speed_request_until=None;}cx.notify();}
+                                    session::SessionEvent::SpeedPhaseCompleted { peer, snapshot } => {
+                                        if shell.speed_peer == Some(peer) {
+                                            if snapshot.direction == protocol::SpeedDirection::Upload
+                                                && snapshot.status == speed::SpeedStatus::Completed
+                                                && shell.identity.as_ref().is_some_and(|identity| identity.node_id() == snapshot.owner)
+                                            {
+                                                shell.speedtest_upload_result = Some(snapshot);
+                                                if shell.settings.speedtest_direction == SpeedtestDirection::Both {
+                                                    shell.set_status("上传阶段完成，正在进行下载阶段…", cx);
+                                                }
+                                            } else if snapshot.direction == protocol::SpeedDirection::Download
+                                                && snapshot.status == speed::SpeedStatus::Completed
+                                                && shell.settings.speedtest_direction == SpeedtestDirection::Both
+                                            {
+                                                shell.set_status("双向速度测试已完成", cx);
+                                            }
+                                            cx.notify();
+                                        }
+                                    }
                                     session::SessionEvent::Diagnostic(detail) => {
                                         if detail != "信令心跳已确认" {shell.set_status(detail, cx);}
                                     }
@@ -1568,25 +1802,47 @@ impl DesktopShell {
         }
     }
 
-    fn cycle_concurrency(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.change_concurrency(cx);
-    }
     fn change_concurrency(&mut self, cx: &mut Context<Self>) {
         if self.is_saving_settings {
             return;
         }
-        self.settings.send_concurrency = self.settings.send_concurrency % 3 + 1;
+        let next = self.settings.send_concurrency % 3 + 1;
+        self.set_send_concurrency(next, cx);
+    }
+    fn sync_concurrency_input(&mut self, value: u8, cx: &mut Context<Self>) {
+        let value_text = value.to_string();
+        if self.concurrency_input.read(cx).content.to_string() != value_text {
+            self.concurrency_input.update(cx, |input, cx| {
+                input.content = value_text.into();
+                let cursor = input.content.len();
+                input.selected_range = cursor..cursor;
+                input.marked_range = None;
+                cx.notify();
+            });
+        }
+    }
+    fn set_send_concurrency(&mut self, value: u8, cx: &mut Context<Self>) {
+        if !(1..=3).contains(&value) {
+            return;
+        }
+        if self.is_saving_settings {
+            let saved_value = self.settings.send_concurrency;
+            self.sync_concurrency_input(saved_value, cx);
+            return;
+        }
+        let changed = self.settings.send_concurrency != value;
+        self.settings.send_concurrency = value;
+        self.sync_concurrency_input(value, cx);
+        if changed
+            && let Some(service) = self.transfer_service.as_ref()
+            && let Err(error) = service.set_send_limit(value)
+        {
+            self.set_status(format!("并发设置失败：{error}"), cx);
+            return;
+        }
         cx.notify();
     }
 
-    fn cycle_speedtest_duration(
-        &mut self,
-        _: &MouseUpEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.change_duration(cx);
-    }
     fn change_duration(&mut self, cx: &mut Context<Self>) {
         if self.is_saving_settings {
             return;
@@ -1606,18 +1862,81 @@ impl DesktopShell {
             return;
         }
         self.settings.speedtest_direction = match self.settings.speedtest_direction {
+            SpeedtestDirection::Both => SpeedtestDirection::Upload,
             SpeedtestDirection::Upload => SpeedtestDirection::Download,
-            SpeedtestDirection::Download => SpeedtestDirection::Upload,
+            SpeedtestDirection::Download => SpeedtestDirection::Both,
         };
+        self.speedtest_upload_result = None;
         cx.notify();
     }
 
     fn set_speed_direction(&mut self, direction: SpeedtestDirection, cx: &mut Context<Self>) {
-        if self.is_saving_settings {
+        if self.is_saving_settings
+            || self.speed_request_until.is_some()
+            || self
+                .speed_views
+                .0
+                .values()
+                .any(|view| view.snapshot.status == speed::SpeedStatus::Running)
+        {
+            return;
+        }
+        if self.settings.speedtest_direction == direction {
             return;
         }
         self.settings.speedtest_direction = direction;
+        self.speedtest_upload_result = None;
         cx.notify();
+    }
+
+    fn speed_direction_button(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        direction: SpeedtestDirection,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let selected = self.settings.speedtest_direction == direction;
+        let enabled = !self.is_saving_settings
+            && self.speed_request_until.is_none()
+            && !self
+                .speed_views
+                .0
+                .values()
+                .any(|view| view.snapshot.status == speed::SpeedStatus::Running);
+        div()
+            .id(id)
+            .h(px(36.))
+            .px(px(12.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(if selected {
+                ui_theme::PRIMARY
+            } else {
+                ui_theme::BORDER
+            }))
+            .bg(rgb(if selected {
+                ui_theme::PRIMARY
+            } else {
+                ui_theme::SURFACE_SUBTLE
+            }))
+            .text_sm()
+            .text_color(rgb(if selected {
+                ui_theme::SURFACE
+            } else {
+                ui_theme::TEXT
+            }))
+            .when(enabled, |button| button.cursor(CursorStyle::PointingHand))
+            .child(label)
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |shell, _: &MouseUpEvent, _, cx| {
+                    shell.set_speed_direction(direction, cx)
+                }),
+            )
     }
 
     fn save_settings(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -1845,71 +2164,6 @@ impl DesktopShell {
         .detach();
     }
 
-    fn enqueue_dropped_paths(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
-        if paths.is_empty() {
-            self.set_status("没有可传输的拖入路径", cx);
-            return;
-        }
-        if self
-            .speed_views
-            .0
-            .values()
-            .any(|view| view.snapshot.status == speed::SpeedStatus::Running)
-        {
-            self.set_status("测速正在进行；请先取消或等待测速结束后再添加文件", cx);
-            return;
-        }
-        if paths.iter().any(|path| path.to_str().is_none()) {
-            self.set_status("拖入路径编码不受支持；没有提交任何路径", cx);
-            return;
-        }
-        let Some(peer) = self.authenticated_peer(cx) else {
-            return;
-        };
-        let Some(session) = self.network_session.clone() else {
-            self.set_status("网络会话已关闭；没有提交拖入路径", cx);
-            return;
-        };
-
-        let mut submitted = 0usize;
-        for path in paths {
-            let result = if path.is_dir() {
-                session.send_directory(peer, path.clone())
-            } else if path.is_file() {
-                session.send_file(peer, path.clone())
-            } else {
-                Err(format!("路径不是可读取的文件或目录：{}", path.display()))
-            };
-            match result {
-                Ok(()) => submitted += 1,
-                Err(error) => {
-                    self.set_status(
-                        if submitted == 0 {
-                            format!("拖入路径未能提交：{error}")
-                        } else {
-                            format!("已提交 {submitted} 个路径，后续提交失败：{error}")
-                        },
-                        cx,
-                    );
-                    return;
-                }
-            }
-        }
-        self.selected_files = paths
-            .iter()
-            .filter(|path| path.is_file())
-            .cloned()
-            .collect();
-        self.selected_folder = paths.iter().find(|path| path.is_dir()).cloned();
-        self.set_status(
-            format!(
-                "已提交 {submitted} 个拖入路径；传输对象绑定到已认证对端 {}",
-                peer.short()
-            ),
-            cx,
-        );
-    }
-
     fn choose_receive_directory(
         &mut self,
         _: &MouseUpEvent,
@@ -1956,20 +2210,6 @@ impl DesktopShell {
         .detach();
     }
 
-    fn path_line(label: &str, path: Option<&PathBuf>) -> gpui::Div {
-        let value = path
-            .and_then(|path| path.to_str())
-            .unwrap_or("尚未选择")
-            .to_owned();
-        div()
-            .flex()
-            .gap_2()
-            .text_xs()
-            .text_color(rgb(ui_theme::TEXT_SECONDARY))
-            .child(format!("{label}："))
-            .child(div().flex_1().min_w_0().truncate().child(value))
-    }
-
     fn text_field_frame(
         field: &Entity<TextField>,
         window: &Window,
@@ -1993,9 +2233,27 @@ impl DesktopShell {
         }
     }
 
-    fn copy_identity_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        ui_components::icon_button("复制", self.identity_id.is_some())
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::copy_node_id))
+    fn compact_text_field_frame(
+        field: &Entity<TextField>,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> gpui::Div {
+        let focused = field.focus_handle(cx).is_focused(window);
+        let frame = div()
+            .w(px(42.))
+            .h(px(28.))
+            .flex()
+            .items_center()
+            .px(px(4.))
+            .bg(white())
+            .border_1()
+            .rounded_md()
+            .child(field.clone());
+        if focused {
+            frame.border_color(rgb(ui_theme::PRIMARY))
+        } else {
+            frame.border_color(rgb(ui_theme::BORDER))
+        }
     }
 
     fn save_settings_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2024,7 +2282,7 @@ impl DesktopShell {
             && self.network_session.is_some()
             && peer_is_valid
             && !peer_is_active;
-        ui_components::primary_button("连接设备", enabled)
+        ui_components::primary_button("连接", enabled)
             .on_mouse_up(MouseButton::Left, cx.listener(Self::connect_peer))
     }
 
@@ -2084,45 +2342,7 @@ impl DesktopShell {
             .items_center()
             .justify_between()
             .gap_3()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .w(px(40.))
-                            .h(px(40.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_lg()
-                            .bg(rgb(ui_theme::PRIMARY))
-                            .text_size(px(23.))
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(white())
-                            .child("↔"),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_size(px(24.))
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(rgb(ui_theme::TEXT))
-                                    .child("P2P File"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .text_color(rgb(ui_theme::TEXT_SECONDARY))
-                                    .child("设备之间，直接传文件"),
-                            ),
-                    ),
-            )
+            .child(Self::brand_identity("P2P File", "设备之间，直接传文件"))
             .child(
                 div()
                     .flex()
@@ -2131,11 +2351,86 @@ impl DesktopShell {
                     .child(ui_components::status_badge(status, tone))
                     .child(ui_components::secondary_button("设置", true).on_mouse_up(
                         MouseButton::Left,
-                        cx.listener(|shell, _: &MouseUpEvent, window, cx| {
-                            shell.toggle_settings(window, cx)
-                        }),
+                        cx.listener(|shell, _: &MouseUpEvent, _, cx| shell.open_settings_home(cx)),
                     )),
             )
+    }
+
+    fn brand_identity(title: &'static str, subtitle: &'static str) -> gpui::Div {
+        div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(
+                div()
+                    .w(px(40.))
+                    .h(px(40.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_lg()
+                    .bg(rgb(ui_theme::PRIMARY))
+                    .text_size(px(23.))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(white())
+                    .child("↔"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(24.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgb(ui_theme::TEXT))
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                            .child(subtitle),
+                    ),
+            )
+    }
+
+    fn settings_home(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .id("settings-home")
+            .key_context("DesktopShell")
+            .track_focus(&self.focus_handle)
+            .overflow_y_scroll()
+            .overflow_x_hidden()
+            .bg(rgb(ui_theme::PAGE_BG))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p(px(20.))
+            .text_color(rgb(ui_theme::TEXT))
+            .child(
+                div()
+                    .h(px(56.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(Self::brand_identity(
+                        "P2P File 设置",
+                        "个性化设置你的使用体验",
+                    ))
+                    .child(
+                        ui_components::secondary_button("返回主界面", true).on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|shell, _: &MouseUpEvent, _, cx| {
+                                shell.close_settings_home(cx)
+                            }),
+                        ),
+                    ),
+            )
+            .child(self.advanced_network_card(window, cx))
     }
 
     fn connection_card(&self, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
@@ -2143,69 +2438,95 @@ impl DesktopShell {
             .identity_id
             .clone()
             .unwrap_or_else(|| "身份不可用".to_owned());
-        let (peer_label, peer_tone) = self.header_status(cx);
-        let width = window.viewport_size().width / px(window.scale_factor());
-        let horizontal = width >= 900.;
+        let connected = NodeId::from_hex(self.peer_id.read(cx).content.trim())
+            .ok()
+            .is_some_and(|peer| {
+                matches!(
+                    self.peer_states.get(&peer),
+                    Some(network_state::PeerLifecycle::Connected)
+                )
+            });
 
         let local = div()
-            .flex_1()
-            .min_w_0()
+            .w_full()
             .flex()
-            .flex_col()
+            .items_center()
             .gap_2()
-            .child(ui_components::field_label("本机 ID"))
             .child(
                 div()
-                    .w_full()
-                    .h(px(44.))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px(px(8.))
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(ui_theme::BORDER))
-                    .bg(rgb(ui_theme::SURFACE_SUBTLE))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_sm()
-                            .text_color(rgb(ui_theme::TEXT))
-                            .child(identity),
-                    )
-                    .child(self.copy_identity_button(cx)),
+                    .text_xs()
+                    .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                    .child("本机 ID"),
+            )
+            .child(
+                div()
+                    .max_w(px(240.))
+                    .min_w_0()
+                    .text_xs()
+                    .text_color(rgb(ui_theme::TEXT_MUTED))
+                    .cursor(if self.identity_id.is_some() {
+                        CursorStyle::PointingHand
+                    } else {
+                        CursorStyle::Arrow
+                    })
+                    .hover(|style| style.bg(rgb(ui_theme::PRIMARY_SOFT)))
+                    .rounded_sm()
+                    .px(px(4.))
+                    .truncate()
+                    .child(identity)
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::copy_node_id)),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(ui_theme::PRIMARY))
+                    .cursor(if self.identity_id.is_some() {
+                        CursorStyle::PointingHand
+                    } else {
+                        CursorStyle::Arrow
+                    })
+                    .hover(|style| style.bg(rgb(ui_theme::PRIMARY_SOFT)))
+                    .rounded_sm()
+                    .px(px(4.))
+                    .child("复制")
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::copy_node_id)),
             );
 
         let peer = div()
-            .flex_1()
-            .min_w_0()
             .flex()
-            .flex_col()
+            .w_full()
+            .items_center()
             .gap_2()
-            .child(ui_components::field_label("对端设备 ID"))
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(Self::text_field_frame(&self.peer_id, window, cx))
-                    .child(self.connect_peer_button(cx)),
-            );
+                    .flex_1()
+                    .min_w_0()
+                    .child(Self::text_field_frame(&self.peer_id, window, cx).rounded_lg()),
+            )
+            .child(self.connect_peer_button(cx));
 
-        let fields = if horizontal {
-            div()
-                .flex()
-                .items_start()
-                .gap_4()
-                .child(local)
-                .child(div().w(px(1.)).h(px(64.)).bg(rgb(ui_theme::BORDER)))
-                .child(peer)
-        } else {
-            div().flex().flex_col().gap_3().child(local).child(peer)
-        };
+        let fields = div().flex().flex_col().gap_2().child(local).child(peer);
+
+        let mut speed_test_button = ui_components::compact_secondary_button("速度测试", connected);
+        if connected {
+            speed_test_button = speed_test_button
+                .bg(rgb(ui_theme::PRIMARY_SOFT))
+                .border_color(rgb(ui_theme::PRIMARY))
+                .text_color(rgb(ui_theme::PRIMARY));
+        }
+        let speed_test_action = speed_test_button.on_mouse_up(
+            MouseButton::Left,
+            cx.listener(move |shell, _: &MouseUpEvent, _, cx| {
+                if connected {
+                    shell.toggle_speed_test_panel(cx);
+                }
+            }),
+        );
 
         ui_components::card()
+            .h(px(184.))
+            .p(px(12.))
+            .gap_2()
             .child(ui_components::section_header(
                 "↔",
                 "连接设备",
@@ -2214,23 +2535,14 @@ impl DesktopShell {
             .child(fields)
             .child(
                 div()
+                    .w_full()
                     .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(ui_components::status_badge(peer_label, peer_tone))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_xs()
-                            .text_color(rgb(ui_theme::TEXT_SECONDARY))
-                            .truncate()
-                            .child(self.current_peer_label(cx)),
-                    ),
+                    .justify_start()
+                    .child(speed_test_action),
             )
     }
 
-    fn transfer_card(&mut self, cx: &mut Context<Self>) -> gpui::Div {
+    fn transfer_card(&mut self, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
         let connected = NodeId::from_hex(self.peer_id.read(cx).content.trim())
             .ok()
             .is_some_and(|peer| {
@@ -2245,104 +2557,59 @@ impl DesktopShell {
             .values()
             .any(|view| view.snapshot.status == speed::SpeedStatus::Running);
         let enabled = connected && !speed_running && self.transfer_service.is_some();
-        let task_count = self.task_rows.len();
-        let list_height = task_count.clamp(1, 4) as f32 * 72.;
-
-        let actions = div()
+        let concurrency_selector = div()
             .flex()
             .items_center()
-            .gap_2()
-            .child(
-                ui_components::secondary_button("选择文件", enabled)
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::choose_files)),
-            )
-            .child(
-                ui_components::secondary_button("选择文件夹", enabled)
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::choose_folder)),
-            )
-            .child(
-                ui_components::secondary_button(
-                    format!("并发 {}", self.settings.send_concurrency),
-                    !self.is_saving_settings,
-                )
-                .on_mouse_up(MouseButton::Left, cx.listener(Self::cycle_concurrency)),
-            );
-
-        let drop_zone = div()
-            .w_full()
-            .h(px(104.))
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap_2()
-            .rounded_lg()
-            .border_1()
-            .border_dashed()
-            .border_color(rgb(if enabled {
-                ui_theme::DROP_BORDER
-            } else {
-                ui_theme::BORDER
-            }))
-            .bg(rgb(if enabled {
-                ui_theme::SURFACE_SUBTLE
-            } else {
-                ui_theme::DISABLED_BG
-            }))
-            .child(
-                div()
-                    .w(px(34.))
-                    .h(px(34.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_full()
-                    .bg(rgb(ui_theme::PRIMARY_SOFT))
-                    .text_size(px(22.))
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(rgb(ui_theme::PRIMARY))
-                    .child("↑"),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(rgb(ui_theme::TEXT))
-                    .child(if enabled {
-                        "将文件或文件夹拖到此处"
-                    } else if connected {
-                        "测速完成或取消后再添加待发送文件"
-                    } else {
-                        "连接设备后可添加待发送文件"
-                    }),
-            )
+            .gap_1()
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(ui_theme::TEXT_SECONDARY))
-                    .child(if enabled {
-                        "也可以使用右上角按钮打开系统选择器"
-                    } else {
-                        "本机仍可被动接收对端发送的文件"
-                    }),
+                    .text_color(rgb(ui_theme::TEXT))
+                    .child("并发："),
             )
-            .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| {
-                if enabled {
-                    style
-                        .bg(rgb(ui_theme::PRIMARY_SOFT))
-                        .border_color(rgb(ui_theme::PRIMARY))
-                } else {
-                    style
-                }
-            })
-            .can_drop(move |_, _, _| enabled)
-            .on_drop(cx.listener(|shell, paths: &gpui::ExternalPaths, _, cx| {
-                shell.enqueue_dropped_paths(paths.paths(), cx)
-            }));
+            .child(Self::compact_text_field_frame(
+                &self.concurrency_input,
+                window,
+                cx,
+            ));
+
+        let file_actions = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                ui_components::compact_secondary_button("选择文件", enabled)
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::choose_files)),
+            )
+            .child(
+                ui_components::compact_secondary_button("选择目录", enabled)
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::choose_folder)),
+            );
+        let transfer_toolbar = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .child(file_actions)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(concurrency_selector)
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(rgb(ui_theme::TEXT))
+                            .child(format!("传输列表（{} 个任务）", self.task_rows.len())),
+                    ),
+            );
 
         let task_list = if self.task_rows.is_empty() {
             div()
-                .h(px(132.))
+                .flex_1()
+                .min_h_0()
                 .flex()
                 .flex_col()
                 .items_center()
@@ -2376,11 +2643,17 @@ impl DesktopShell {
                 }),
             )
             .track_scroll(self.task_scroll.clone())
-            .h(px(list_height))
+            .flex_1()
+            .min_h_0()
             .into_any_element()
         };
 
         ui_components::card()
+            .p(px(12.))
+            .gap_2()
+            .flex_1()
+            .min_h_0()
+            .flex_shrink()
             .child(
                 div()
                     .flex()
@@ -2399,32 +2672,14 @@ impl DesktopShell {
                             .child(self.queue_status.clone()),
                     ),
             )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(rgb(ui_theme::TEXT))
-                            .child("传输任务"),
-                    )
-                    .child(actions),
-            )
-            .child(drop_zone)
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(rgb(ui_theme::TEXT))
-                    .child(format!("传输列表（{} 个任务）", self.task_rows.len())),
-            )
+            .child(transfer_toolbar)
             .child(
                 div()
                     .w_full()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
                     .overflow_hidden()
                     .rounded_md()
                     .border_1()
@@ -2433,7 +2688,7 @@ impl DesktopShell {
             )
     }
 
-    fn receive_connection_bar(&self, wide: bool, cx: &Context<Self>) -> gpui::Div {
+    fn receive_directory_card(&self, cx: &Context<Self>) -> gpui::Div {
         let directory = self
             .settings
             .receive_directory
@@ -2445,80 +2700,22 @@ impl DesktopShell {
             .flex_1()
             .min_w_0()
             .flex()
-            .flex_col()
+            .items_center()
             .gap_2()
-            .child(ui_components::field_label("接收目录（仅本机可见）"))
             .child(
                 div()
+                    .flex_1()
+                    .min_w_0()
+                    .h(px(36.))
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .h(px(36.))
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .px(px(10.))
-                            .rounded_md()
-                            .border_1()
-                            .border_color(rgb(ui_theme::BORDER))
-                            .bg(rgb(ui_theme::SURFACE_SUBTLE))
-                            .child(div().text_color(rgb(ui_theme::PRIMARY)).child("▱"))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_sm()
-                                    .text_color(rgb(ui_theme::TEXT_SECONDARY))
-                                    .child(directory.to_owned()),
-                            ),
-                    )
-                    .child(ui_components::secondary_button("更改", true).on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(Self::choose_receive_directory),
-                    )),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(if applied_differs {
-                        ui_theme::WARNING
-                    } else {
-                        ui_theme::TEXT_SECONDARY
-                    }))
-                    .child(if applied_differs {
-                        "目录草稿待保存；保存后仅用于新任务"
-                    } else {
-                        "保存接收目录的更改后，仅新任务使用新路径"
-                    }),
-            );
-        let receive = if applied_differs {
-            receive.child(Self::path_line(
-                "当前任务仍使用",
-                self.applied_receive_root.as_ref(),
-            ))
-        } else {
-            receive
-        };
-
-        let (peer_label, peer_tone) = self.header_status(cx);
-        let mut connection = div()
-            .flex_1()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(ui_components::field_label("连接状态"))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(ui_components::status_badge(peer_label, peer_tone))
+                    .px(px(10.))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(ui_theme::BORDER))
+                    .bg(rgb(ui_theme::SURFACE_SUBTLE))
+                    .child(div().text_color(rgb(ui_theme::PRIMARY)).child("▱"))
                     .child(
                         div()
                             .flex_1()
@@ -2526,53 +2723,37 @@ impl DesktopShell {
                             .truncate()
                             .text_sm()
                             .text_color(rgb(ui_theme::TEXT_SECONDARY))
-                            .child(self.network_status.clone()),
+                            .child(directory.to_owned()),
                     ),
             )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(ui_theme::TEXT_SECONDARY))
-                    .truncate()
-                    .child(self.current_peer_label(cx)),
-            );
-        if let Ok(peer) = NodeId::from_hex(self.peer_id.read(cx).content.trim())
-            && let Some(speed) = self.speed_views.0.get(&peer)
-            && !speed.snapshot.rtt.is_zero()
-        {
-            connection = connection.child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(ui_theme::TEXT_SECONDARY))
-                    .child(format!(
-                        "当前对端最近测速 RTT {:.1} ms",
-                        speed.snapshot.rtt.as_secs_f64() * 1_000.
-                    )),
-            );
-        }
+            .child(ui_components::secondary_button("更改", true).on_mouse_up(
+                MouseButton::Left,
+                cx.listener(Self::choose_receive_directory),
+            ));
+        ui_components::card()
+            .h(px(184.))
+            .p(px(12.))
+            .gap_2()
+            .child(ui_components::section_header(
+                "▱",
+                "接收目录",
+                if applied_differs {
+                    "目录更改待保存；保存后仅新任务生效（仅本机可见）"
+                } else {
+                    "接收文件默认保存在此处；目录更改仅新任务生效（仅本机可见）"
+                },
+            ))
+            .child(receive)
+    }
 
-        let content = div().gap_4();
-        let content = if wide {
-            content
-                .flex()
-                .items_start()
-                .child(receive)
-                .child(div().w(px(1.)).h(px(54.)).bg(rgb(ui_theme::BORDER)))
-                .child(connection)
-        } else {
-            content.flex_col().child(receive).child(connection)
-        };
+    fn connection_receive_row(&self, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
+        let connection = self.connection_card(window, cx);
+        let receive_directory = self.receive_directory_card(cx);
         div()
             .flex()
-            .flex_col()
             .gap_3()
-            .p(px(12.))
-            .bg(rgb(ui_theme::SURFACE))
-            .border_1()
-            .border_color(rgb(ui_theme::BORDER))
-            .rounded_xl()
-            .flex_shrink_0()
-            .child(content)
+            .child(div().flex_1().min_w_0().child(connection))
+            .child(div().flex_1().min_w_0().child(receive_directory))
     }
 
     fn speed_test_card(&mut self, cx: &mut Context<Self>) -> gpui::Div {
@@ -2594,55 +2775,127 @@ impl DesktopShell {
             && !waiting;
         let editing_enabled = !self.is_saving_settings;
 
-        let upload_selected = self.settings.speedtest_direction == SpeedtestDirection::Upload;
-        let download_selected = !upload_selected;
-        let upload_button = ui_components::secondary_button("发送", editing_enabled);
-        let upload_button = if upload_selected {
-            upload_button
-                .bg(rgb(ui_theme::PRIMARY_SOFT))
-                .border_color(rgb(ui_theme::PRIMARY))
-                .text_color(rgb(ui_theme::PRIMARY))
-        } else {
-            upload_button
+        let direction_selector = div()
+            .flex()
+            .items_center()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(ui_theme::BORDER))
+            .overflow_hidden()
+            .child(self.speed_direction_button("speed-both", "双向", SpeedtestDirection::Both, cx))
+            .child(self.speed_direction_button(
+                "speed-upload",
+                "仅上传",
+                SpeedtestDirection::Upload,
+                cx,
+            ))
+            .child(self.speed_direction_button(
+                "speed-download",
+                "仅下载",
+                SpeedtestDirection::Download,
+                cx,
+            ));
+        let duration_label = match self.settings.speedtest_seconds {
+            30 => "30 秒（最短）".to_owned(),
+            seconds if seconds.is_multiple_of(60) => {
+                format!("{} 分钟", seconds / 60)
+            }
+            seconds => format!("{seconds} 秒"),
+        };
+        let duration_button = div()
+            .id("speed-duration-select")
+            .h(px(36.))
+            .w(px(152.))
+            .px(px(10.))
+            .flex()
+            .items_center()
+            .justify_between()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(ui_theme::BORDER))
+            .bg(rgb(ui_theme::SURFACE))
+            .text_sm()
+            .text_color(rgb(ui_theme::TEXT))
+            .cursor(if editing_enabled {
+                CursorStyle::PointingHand
+            } else {
+                CursorStyle::Arrow
+            })
+            .child(duration_label)
+            .child("⌄")
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|shell, _: &MouseUpEvent, _, cx| shell.toggle_speed_duration_menu(cx)),
+            );
+        let duration_options = [
+            (30, "30 秒（最短）"),
+            (60, "1 分钟"),
+            (120, "2 分钟"),
+            (300, "5 分钟"),
+            (600, "10 分钟"),
+        ];
+        let mut duration_menu = div()
+            .absolute()
+            .top(px(40.))
+            .left(px(0.))
+            .w(px(152.))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p(px(4.))
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(ui_theme::BORDER))
+            .bg(rgb(ui_theme::SURFACE));
+        for (seconds, label) in duration_options {
+            let mut option = div()
+                .id(("speed-duration", u32::from(seconds)))
+                .h(px(32.))
+                .px(px(8.))
+                .flex()
+                .items_center()
+                .rounded_sm()
+                .text_sm()
+                .text_color(rgb(ui_theme::TEXT))
+                .child(label);
+            if self.settings.speedtest_seconds == seconds {
+                option = option
+                    .bg(rgb(ui_theme::PRIMARY_SOFT))
+                    .text_color(rgb(ui_theme::PRIMARY));
+            }
+            duration_menu = duration_menu.child(option.on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |shell, _: &MouseUpEvent, _, cx| {
+                    shell.set_speedtest_duration(seconds, cx)
+                }),
+            ));
         }
-        .on_mouse_up(
-            MouseButton::Left,
-            cx.listener(|shell, _: &MouseUpEvent, _, cx| {
-                shell.set_speed_direction(SpeedtestDirection::Upload, cx)
-            }),
-        );
-        let download_button = ui_components::secondary_button("接收", editing_enabled);
-        let download_button = if download_selected {
-            download_button
-                .bg(rgb(ui_theme::PRIMARY_SOFT))
-                .border_color(rgb(ui_theme::PRIMARY))
-                .text_color(rgb(ui_theme::PRIMARY))
-        } else {
-            download_button
-        }
-        .on_mouse_up(
-            MouseButton::Left,
-            cx.listener(|shell, _: &MouseUpEvent, _, cx| {
-                shell.set_speed_direction(SpeedtestDirection::Download, cx)
-            }),
-        );
-
+        let duration_selector = div()
+            .relative()
+            .child(duration_button)
+            .when(self.show_speed_duration_menu, |selector| {
+                selector.child(gpui::deferred(duration_menu).with_priority(10))
+            });
         let controls = div()
             .flex()
             .items_center()
             .gap_2()
-            .child(upload_button)
-            .child(download_button)
             .child(
-                ui_components::secondary_button(
-                    format!("时长 {} 秒", self.settings.speedtest_seconds),
-                    editing_enabled,
-                )
-                .on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(Self::cycle_speedtest_duration),
-                ),
+                div()
+                    .text_sm()
+                    .text_color(rgb(ui_theme::TEXT))
+                    .child("方向"),
             )
+            .child(direction_selector)
+            .child(div().w(px(1.)).h(px(28.)).bg(rgb(ui_theme::BORDER)))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(ui_theme::TEXT))
+                    .child("时长"),
+            )
+            .child(duration_selector)
+            .child(div().flex_1())
             .child(
                 ui_components::primary_button(
                     if running {
@@ -2659,20 +2912,47 @@ impl DesktopShell {
                     cx.listener(|shell, _: &MouseUpEvent, _, cx| shell.start_speed_ui(cx)),
                 ),
             )
-            .child(
-                ui_components::secondary_button("取消", running).on_mouse_up(
+            .when(running, |controls| {
+                controls.child(ui_components::secondary_button("取消", true).on_mouse_up(
                     MouseButton::Left,
                     cx.listener(|shell, _: &MouseUpEvent, _, cx| shell.cancel_speed_ui(cx)),
-                ),
-            );
+                ))
+            });
 
-        let mut result = ui_components::card()
+        let header = div()
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_between()
             .child(ui_components::section_header(
                 "◉",
-                "直连测速",
-                "测试当前已认证对端的真实直连性能",
+                "速度测试",
+                "测试与对端设备的直连网络性能，了解当前连接质量",
             ))
-            .child(controls);
+            .child(
+                div()
+                    .id("close-speed-test")
+                    .w(px(28.))
+                    .h(px(28.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .px(px(8.))
+                    .text_size(px(18.))
+                    .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                    .rounded_md()
+                    .cursor(CursorStyle::PointingHand)
+                    .hover(|style| style.bg(rgb(ui_theme::SURFACE_SUBTLE)))
+                    .child("×")
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|shell, _: &MouseUpEvent, _, cx| {
+                            shell.toggle_speed_test_panel(cx)
+                        }),
+                    ),
+            );
+        let mut result = ui_components::card().child(header);
+        result = result.child(controls);
 
         if let Some((peer, view)) = self.displayed_speed() {
             let snapshot = &view.snapshot;
@@ -2686,11 +2966,7 @@ impl DesktopShell {
                     .as_ref()
                     .is_some_and(|identity| identity.node_id() != snapshot.owner),
             };
-            let direction = if sending {
-                "本机 → 对端"
-            } else {
-                "对端 → 本机"
-            };
+            let direction = self.settings.speedtest_direction.label();
             let status = match snapshot.status {
                 speed::SpeedStatus::Running => "测速中",
                 speed::SpeedStatus::Completed => "已完成",
@@ -2707,59 +2983,140 @@ impl DesktopShell {
                 * 100.)
                 .min(100.);
             let rtt = if snapshot.rtt.is_zero() {
-                "无可用样本".to_owned()
+                "暂无样本".to_owned()
             } else {
                 format!("{:.1} ms", snapshot.rtt.as_secs_f64() * 1_000.)
+            };
+            let actual_speed = if snapshot.status == speed::SpeedStatus::Running {
+                view.instant
+            } else {
+                snapshot.bytes_per_second
+            };
+            let speed_result_available = matches!(
+                snapshot.status,
+                speed::SpeedStatus::Running | speed::SpeedStatus::Completed
+            );
+            let retained_upload = if self.settings.speedtest_direction == SpeedtestDirection::Both {
+                self.speedtest_upload_result
+                    .as_ref()
+                    .filter(|upload| upload.status == speed::SpeedStatus::Completed)
+            } else {
+                None
+            };
+            let upload_speed = if sending && speed_result_available {
+                format!("{:.2} MB/s", actual_speed / 1_000_000.)
+            } else if let Some(upload) = retained_upload {
+                format!("{:.2} MB/s", upload.bytes_per_second / 1_000_000.)
+            } else if sending {
+                "未完成".to_owned()
+            } else {
+                "未测试".to_owned()
+            };
+            let download_speed = if sending {
+                "未测试".to_owned()
+            } else if speed_result_available {
+                format!("{:.2} MB/s", actual_speed / 1_000_000.)
+            } else {
+                "未完成".to_owned()
+            };
+            let result_description = match snapshot.status {
+                speed::SpeedStatus::Running => "正在通过认证直连采集真实传输数据",
+                speed::SpeedStatus::Completed
+                    if self.settings.speedtest_direction == SpeedtestDirection::Both
+                        && snapshot.direction == protocol::SpeedDirection::Upload =>
+                {
+                    "上传阶段完成，正在准备下载阶段"
+                }
+                speed::SpeedStatus::Completed
+                    if self.settings.speedtest_direction == SpeedtestDirection::Both =>
+                {
+                    "双向测速已完成，结果来自本次直连传输"
+                }
+                speed::SpeedStatus::Completed => "测试已完成，结果来自本次直连传输",
+                speed::SpeedStatus::Cancelled => "本次测速已取消",
+                speed::SpeedStatus::Interrupted => "连接中断，本次测速未完成",
             };
             result = result
                 .child(
                     div()
                         .flex()
                         .items_center()
-                        .gap_2()
+                        .gap_3()
                         .child(ui_components::status_badge(status, status_tone))
                         .child(
                             div()
+                                .flex_1()
                                 .text_xs()
                                 .text_color(rgb(ui_theme::TEXT_SECONDARY))
-                                .child(format!("对端 {} · {direction}", peer.short())),
+                                .child(format!(
+                                    "{result_description} · 对端 {} · {direction}",
+                                    peer.short()
+                                )),
                         )
-                        .child(ui_components::progress_bar(progress))
-                        .child(
-                            div()
-                                .w(px(52.))
-                                .text_xs()
-                                .text_color(rgb(ui_theme::TEXT_SECONDARY))
-                                .child(format!("{progress:.0}%")),
-                        ),
+                        .when(running, |row| {
+                            row.child(ui_components::progress_bar(progress)).child(
+                                div()
+                                    .w(px(42.))
+                                    .text_xs()
+                                    .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                                    .child(format!("{progress:.0}%")),
+                            )
+                        }),
                 )
                 .child(
                     div()
                         .flex()
                         .gap_2()
                         .child(ui_components::metric_tile(
-                            "瞬时速度",
-                            format!("{:.2} MiB/s", view.instant / 1_048_576.),
-                            "当前采样",
+                            "上传速度",
+                            upload_speed,
+                            if retained_upload.is_some() || sending && speed_result_available {
+                                "本次测试"
+                            } else if self.settings.speedtest_direction == SpeedtestDirection::Both
+                            {
+                                "等待上传阶段"
+                            } else {
+                                "选择仅上传后测试"
+                            },
+                            ui_theme::SUCCESS_SOFT,
+                        ))
+                        .child(ui_components::metric_tile(
+                            "下载速度",
+                            download_speed,
+                            if sending {
+                                if self.settings.speedtest_direction == SpeedtestDirection::Both {
+                                    "等待下载阶段"
+                                } else {
+                                    "选择仅下载后测试"
+                                }
+                            } else {
+                                "本次测试"
+                            },
                             ui_theme::PRIMARY_SOFT,
                         ))
                         .child(ui_components::metric_tile(
-                            "平均速度",
-                            format!("{:.2} Mbps", snapshot.bytes_per_second * 8. / 1_000_000.),
-                            "按真实字节和耗时计算",
+                            "延迟",
+                            rtt,
+                            "直连往返时延",
                             ui_theme::SURFACE_SUBTLE,
                         )),
                 )
                 .child(
                     div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
+                        .w_full()
+                        .px(px(12.))
+                        .py(px(8.))
+                        .rounded_md()
+                        .bg(rgb(ui_theme::SURFACE_SUBTLE))
                         .text_xs()
                         .text_color(rgb(ui_theme::TEXT_SECONDARY))
                         .child(format!(
-                            "实际传输 {} · 耗时 {:.2} 秒 · RTT {rtt}",
+                            "{} · 实际传输 {} · 耗时 {:.1} 秒",
+                            if snapshot.rtt.is_zero() {
+                                "连接质量数据尚不足"
+                            } else {
+                                "直连质量测试完成"
+                            },
                             format_bytes(snapshot.bytes),
                             snapshot.elapsed.as_secs_f64()
                         )),
@@ -2772,7 +3129,7 @@ impl DesktopShell {
                     .bg(rgb(ui_theme::WARNING_SOFT))
                     .text_sm()
                     .text_color(rgb(ui_theme::WARNING))
-                    .child("等待双方授权；有文件活动时测速会明确拒绝，不会自动暂停任务"),
+                    .child("等待对端确认；文件传输活动期间无法测速，不会自动暂停任务"),
             );
         } else {
             result = result.child(
@@ -2782,9 +3139,8 @@ impl DesktopShell {
                     .bg(rgb(ui_theme::SURFACE_SUBTLE))
                     .text_sm()
                     .text_color(rgb(ui_theme::TEXT_SECONDARY))
-                    .child("尚未测速；测速使用已认证直连，不读取或生成文件")
                     .child(format!(
-                        "当前方向：{}",
+                        "尚未测速 · 当前方向：{} · 使用认证直连，不读取或生成本地文件",
                         self.settings.speedtest_direction.label()
                     )),
             );
@@ -2895,12 +3251,7 @@ impl DesktopShell {
                     ),
             );
         }
-        card.child(
-            div()
-                .text_xs()
-                .text_color(rgb(ui_theme::TEXT_SECONDARY))
-                .child("接收目录保存后仅供新任务使用；已运行任务保留原接收目录"),
-        )
+        card
     }
 }
 
@@ -2912,36 +3263,10 @@ impl Focusable for DesktopShell {
 
 impl Render for DesktopShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let logical_width = window.viewport_size().width / px(window.scale_factor());
-        let wide_layout = logical_width >= 1040.;
-        let speed_card = self.speed_test_card(cx);
-        let advanced_card = self.advanced_network_card(window, cx);
-        let bottom_cards = if wide_layout {
-            div()
-                .flex()
-                .gap_3()
-                .child(
-                    div()
-                        .flex_basis(relative(0.55))
-                        .flex_grow()
-                        .min_w_0()
-                        .child(speed_card),
-                )
-                .child(
-                    div()
-                        .flex_basis(relative(0.45))
-                        .flex_grow()
-                        .min_w_0()
-                        .child(advanced_card),
-                )
-        } else {
-            div()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(speed_card)
-                .child(advanced_card)
-        };
+        if self.show_settings_home {
+            return self.settings_home(window, cx).into_any_element();
+        }
+        let speed_card = self.show_speed_test_panel.then(|| self.speed_test_card(cx));
 
         div()
             .size_full()
@@ -2987,9 +3312,9 @@ impl Render for DesktopShell {
             .on_action(cx.listener(|shell, _: &SaveSettings, _, cx| shell.persist_settings(cx)))
             .on_action(cx.listener(|shell, _: &StartSpeed, _, cx| shell.start_speed_ui(cx)))
             .on_action(cx.listener(|shell, _: &CancelSpeed, _, cx| shell.cancel_speed_ui(cx)))
-            .on_action(cx.listener(|shell, _: &ToggleSettings, window, cx| {
-                shell.toggle_settings(window, cx)
-            }))
+            .on_action(
+                cx.listener(|shell, _: &ToggleSettings, _, cx| shell.toggle_settings_home(cx)),
+            )
             .on_action(
                 cx.listener(|shell, _: &PauseSelected, _, cx| shell.selected_action(false, cx)),
             )
@@ -2997,10 +3322,9 @@ impl Render for DesktopShell {
                 cx.listener(|shell, _: &ResumeSelected, _, cx| shell.selected_action(true, cx)),
             )
             .child(self.app_header(cx))
-            .child(self.connection_card(window, cx))
-            .child(self.transfer_card(cx))
-            .child(self.receive_connection_bar(wide_layout, cx))
-            .child(bottom_cards)
+            .child(self.connection_receive_row(window, cx))
+            .when_some(speed_card, |page, speed_card| page.child(speed_card))
+            .child(self.transfer_card(window, cx))
             .child(
                 div()
                     .w_full()
@@ -3011,6 +3335,7 @@ impl Render for DesktopShell {
                     .text_color(rgb(ui_theme::TEXT_SECONDARY))
                     .child(self.status.clone()),
             )
+            .into_any_element()
     }
 }
 
@@ -3102,6 +3427,7 @@ pub fn run() {
             service
         });
         let initial_receive_root = settings.receive_directory.clone();
+        let initial_concurrency = settings.send_concurrency;
         let initial_host = settings.signal_host.clone();
         let initial_port = settings.signal_port.clone();
         let startup_session_config = if has_saved_network_config && identity.is_some() {
@@ -3130,7 +3456,9 @@ pub fn run() {
                 ..Default::default()
             },
             move |_, cx| {
-                let peer_id = cx.new(|cx| TextField::new(cx, "输入或粘贴完整的 32 位对端 ID"));
+                let peer_id = cx.new(|cx| TextField::new(cx, "输入对方 ID"));
+                let concurrency_input =
+                    cx.new(|cx| TextField::new_concurrency_value(cx, initial_concurrency));
                 let signal_host = cx.new(|cx| {
                     let mut field = TextField::new(cx, "输入 IPv4、IPv6 或主机名");
                     field.content = initial_host.into();
@@ -3141,41 +3469,61 @@ pub fn run() {
                     field.content = initial_port.into();
                     field
                 });
-                cx.new(|cx| DesktopShell {
-                    peer_id,
-                    signal_host,
-                    signal_port,
-                    selected_files: Vec::new(),
-                    selected_folder: None,
-                    settings,
-                    identity_id,
-                    identity,
-                    identity_status: identity_status.into(),
-                    config_file,
-                    config_note: config_note.into(),
-                    can_save_settings,
-                    is_saving_settings: false,
-                    _instance_lock: instance_lock,
-                    transfer_service,
-                    network_session: None,
-                    network_status: initial_network_status.into(),
-                    peer_status: "尚未连接对端".into(),
-                    network_epoch: 0,
-                    peer_generations: HashMap::new(),
-                    peer_states: HashMap::new(),
-                    task_rows: Vec::new(),
-                    expanded_groups: HashSet::new(),
-                    selected_task: None,
-                    queue_status: "正在载入任务…".into(),
-                    speed_views: Default::default(),
-                    speed_peer: None,
-                    speed_request_until: None,
-                    show_settings: !has_saved_network_config,
-                    pending_resumes: HashMap::new(),
-                    applied_receive_root: initial_receive_root,
-                    task_scroll: Default::default(),
-                    status: initial_status.into(),
-                    focus_handle: cx.focus_handle(),
+                cx.new(|cx| {
+                    cx.observe(
+                        &concurrency_input,
+                        |shell: &mut DesktopShell,
+                         input: Entity<TextField>,
+                         cx: &mut Context<DesktopShell>| {
+                            if let Ok(value) = input.read(cx).content.to_string().parse::<u8>()
+                                && (1..=3).contains(&value)
+                            {
+                                shell.set_send_concurrency(value, cx);
+                            }
+                        },
+                    )
+                    .detach();
+                    DesktopShell {
+                        peer_id,
+                        concurrency_input,
+                        signal_host,
+                        signal_port,
+                        selected_files: Vec::new(),
+                        selected_folder: None,
+                        settings,
+                        identity_id,
+                        identity,
+                        identity_status: identity_status.into(),
+                        config_file,
+                        config_note: config_note.into(),
+                        can_save_settings,
+                        is_saving_settings: false,
+                        _instance_lock: instance_lock,
+                        transfer_service,
+                        network_session: None,
+                        network_status: initial_network_status.into(),
+                        peer_status: "尚未连接对端".into(),
+                        network_epoch: 0,
+                        peer_generations: HashMap::new(),
+                        peer_states: HashMap::new(),
+                        task_rows: Vec::new(),
+                        expanded_groups: HashSet::new(),
+                        selected_task: None,
+                        queue_status: "正在载入任务…".into(),
+                        speed_views: Default::default(),
+                        speedtest_upload_result: None,
+                        speed_peer: None,
+                        speed_request_until: None,
+                        show_speed_test_panel: false,
+                        show_speed_duration_menu: false,
+                        show_settings: !has_saved_network_config,
+                        show_settings_home: false,
+                        pending_resumes: HashMap::new(),
+                        applied_receive_root: initial_receive_root,
+                        task_scroll: Default::default(),
+                        status: initial_status.into(),
+                        focus_handle: cx.focus_handle(),
+                    }
                 })
             },
         );
@@ -3210,9 +3558,26 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        marked_selection_to_utf8, mouse_index_for_layout, utf8_offset_from_utf16,
-        utf16_offset_from_utf8,
+        concurrency_value_replacement, marked_selection_to_utf8, mouse_index_for_layout,
+        utf8_offset_from_utf16, utf16_offset_from_utf8,
     };
+
+    #[test]
+    fn concurrency_input_only_accepts_single_values_from_one_to_three() {
+        assert_eq!(
+            concurrency_value_replacement("1", 1..1, "3"),
+            Some((0..1, "3".to_owned()))
+        );
+        assert_eq!(concurrency_value_replacement("1", 1..1, "4"), None);
+        assert_eq!(
+            concurrency_value_replacement("2", 0..1, ""),
+            Some((0..1, "2".to_owned()))
+        );
+        assert_eq!(
+            concurrency_value_replacement("1", 1..1, "invalid3"),
+            Some((0..1, "3".to_owned()))
+        );
+    }
 
     #[test]
     fn utf16_offsets_preserve_cjk_and_surrogate_pairs() {

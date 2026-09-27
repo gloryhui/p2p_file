@@ -78,6 +78,7 @@ impl AppPaths {
 #[serde(rename_all = "snake_case")]
 pub enum SpeedtestDirection {
     #[default]
+    Both,
     Upload,
     Download,
 }
@@ -85,8 +86,9 @@ pub enum SpeedtestDirection {
 impl SpeedtestDirection {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Upload => "发送",
-            Self::Download => "接收",
+            Self::Both => "双向",
+            Self::Upload => "仅上传",
+            Self::Download => "仅下载",
         }
     }
 }
@@ -109,18 +111,24 @@ impl SettingsDraft {
             receive_directory: downloads_dir,
             send_concurrency: 1,
             speedtest_seconds: 30,
-            speedtest_direction: SpeedtestDirection::Upload,
+            speedtest_direction: SpeedtestDirection::Both,
         }
     }
 
     pub(super) fn from_config(config: DesktopConfig) -> Self {
+        // Upload was the previous default. Treat that legacy value as the new default
+        // so upgraded installations start with bidirectional testing.
+        let speedtest_direction = match config.speedtest_direction {
+            SpeedtestDirection::Upload => SpeedtestDirection::Both,
+            direction => direction,
+        };
         Self {
             signal_host: config.signal.host,
             signal_port: config.signal.port.to_string(),
             receive_directory: Some(config.receive_directory),
             send_concurrency: config.send_concurrency,
             speedtest_seconds: config.speedtest_seconds,
-            speedtest_direction: config.speedtest_direction,
+            speedtest_direction,
         }
     }
 
@@ -556,6 +564,31 @@ mod tests {
             speedtest_seconds: 30,
             speedtest_direction: SpeedtestDirection::Upload,
         }
+    }
+
+    #[test]
+    fn speedtest_defaults_to_bidirectional_and_reads_legacy_directions() {
+        assert_eq!(
+            SettingsDraft::defaults(None).speedtest_direction,
+            SpeedtestDirection::Both
+        );
+        assert_eq!(SpeedtestDirection::default().label(), "双向");
+        assert_eq!(
+            serde_json::from_str::<SpeedtestDirection>("\"upload\"").unwrap(),
+            SpeedtestDirection::Upload
+        );
+        let upgraded = SettingsDraft::from_config(DesktopConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            signal: SignalConfig {
+                host: "relay.example.test".into(),
+                port: 7000,
+            },
+            receive_directory: PathBuf::from("/tmp/Downloads"),
+            send_concurrency: 1,
+            speedtest_seconds: 30,
+            speedtest_direction: SpeedtestDirection::Upload,
+        });
+        assert_eq!(upgraded.speedtest_direction, SpeedtestDirection::Both);
     }
 
     #[test]

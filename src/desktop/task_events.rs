@@ -14,6 +14,7 @@ const MAX_PENDING_EVENTS: usize = 256;
 pub(crate) enum TaskEventKind {
     Created,
     StateChanged { from: TaskState, to: TaskState },
+    Removed,
     RecoveredAfterRestart,
     ProgressHintChanged,
 }

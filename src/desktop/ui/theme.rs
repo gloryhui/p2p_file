@@ -11,7 +11,6 @@ pub(in crate::desktop) const PRIMARY: u32 = 0x2563EB;
 pub(in crate::desktop) const PRIMARY_HOVER: u32 = 0x1D4ED8;
 pub(in crate::desktop) const PRIMARY_PRESSED: u32 = 0x1E40AF;
 pub(in crate::desktop) const PRIMARY_SOFT: u32 = 0xEFF6FF;
-pub(in crate::desktop) const DROP_BORDER: u32 = 0xBFDBFE;
 pub(in crate::desktop) const SUCCESS: u32 = 0x16A34A;
 pub(in crate::desktop) const SUCCESS_SOFT: u32 = 0xF0FDF4;
 pub(in crate::desktop) const WARNING: u32 = 0xD97706;

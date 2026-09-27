@@ -22,6 +22,7 @@ pub(super) struct TaskRow {
     pub rate: f64,
     pub diagnostic: Option<&'static str>,
     pub retryable: bool,
+    pub can_delete_file: bool,
 }
 impl TaskRow {
     pub fn from_record(r: &TaskRecord, rate: f64) -> Self {
@@ -54,6 +55,10 @@ impl TaskRow {
             },
             diagnostic: r.diagnostic().map(|d| d.safe_message()),
             retryable: r.diagnostic().is_some_and(|d| d.is_retryable()),
+            can_delete_file: r.direction() == TaskDirection::Receive
+                && r.state() == TaskState::Completed
+                && r.file_details()
+                    .is_some_and(|details| details.receipt_committed),
         }
     }
     pub fn percent(&self) -> f64 {
@@ -79,6 +84,12 @@ impl TaskRow {
     pub fn can_continue(&self) -> bool {
         matches!(self.state, TaskState::Paused | TaskState::Interrupted)
             || (self.state == TaskState::Failed && self.retryable)
+    }
+    pub fn can_remove_history(&self) -> bool {
+        self.state == TaskState::Completed
+    }
+    pub fn can_delete_file(&self) -> bool {
+        self.can_delete_file
     }
     pub fn state_label(&self) -> &'static str {
         match self.state {
@@ -302,6 +313,7 @@ mod tests {
             rate: 0.,
             diagnostic: None,
             retryable: false,
+            can_delete_file: false,
         };
         assert_eq!(a.percent(), 0.);
         assert!(a.can_continue());

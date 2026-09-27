@@ -74,6 +74,10 @@ pub enum SessionEvent {
     SpeedRequestEnded {
         peer: NodeId,
     },
+    SpeedPhaseCompleted {
+        peer: NodeId,
+        snapshot: super::speed::SpeedSnapshot,
+    },
 }
 
 #[derive(Clone)]
@@ -159,7 +163,7 @@ impl DesktopSessionHandle {
     pub fn start_speed(
         &self,
         peer: NodeId,
-        direction: super::protocol::SpeedDirection,
+        direction: super::config::SpeedtestDirection,
         seconds: u16,
     ) -> std::result::Result<(), String> {
         self.commands
@@ -192,7 +196,7 @@ impl DesktopSessionHandle {
 enum SessionCommand {
     StartSpeed {
         peer: NodeId,
-        direction: super::protocol::SpeedDirection,
+        direction: super::config::SpeedtestDirection,
         seconds: u16,
     },
     CancelSpeed {
@@ -421,7 +425,68 @@ async fn run_session(
                 if let Some(service) = config.transfer.clone() {
                     let events = events.clone();
                     peer_tasks.spawn(async move {
-                        if let Err(error) = service.start_speed(peer, direction, seconds).await {
+                        let result = match direction {
+                            super::config::SpeedtestDirection::Both => {
+                                match service
+                                    .start_speed(
+                                        peer,
+                                        super::protocol::SpeedDirection::Upload,
+                                        seconds,
+                                    )
+                                    .await
+                                {
+                                    Ok(upload) => {
+                                        let _ = events
+                                            .send(SessionEvent::SpeedPhaseCompleted {
+                                                peer,
+                                                snapshot: upload,
+                                            })
+                                            .await;
+                                        let download = service
+                                            .start_speed(
+                                                peer,
+                                                super::protocol::SpeedDirection::Download,
+                                                seconds,
+                                            )
+                                            .await;
+                                        if let Ok(snapshot) = &download {
+                                            let _ = events
+                                                .send(SessionEvent::SpeedPhaseCompleted {
+                                                    peer,
+                                                    snapshot: snapshot.clone(),
+                                                })
+                                                .await;
+                                        }
+                                        download
+                                    }
+                                    Err(error) => Err(error),
+                                }
+                            }
+                            super::config::SpeedtestDirection::Upload
+                            | super::config::SpeedtestDirection::Download => {
+                                let wire_direction = match direction {
+                                    super::config::SpeedtestDirection::Upload => {
+                                        super::protocol::SpeedDirection::Upload
+                                    }
+                                    super::config::SpeedtestDirection::Download => {
+                                        super::protocol::SpeedDirection::Download
+                                    }
+                                    super::config::SpeedtestDirection::Both => unreachable!(),
+                                };
+                                let result =
+                                    service.start_speed(peer, wire_direction, seconds).await;
+                                if let Ok(snapshot) = &result {
+                                    let _ = events
+                                        .send(SessionEvent::SpeedPhaseCompleted {
+                                            peer,
+                                            snapshot: snapshot.clone(),
+                                        })
+                                        .await;
+                                }
+                                result
+                            }
+                        };
+                        if let Err(error) = result {
                             let _ = events
                                 .send(SessionEvent::Diagnostic(error.to_string()))
                                 .await;

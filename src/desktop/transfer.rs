@@ -436,6 +436,37 @@ impl TransferService {
     pub async fn snapshot(&self) -> Result<Vec<TaskRecord>> {
         self.read_store(|store| Ok(store.list().to_vec())).await
     }
+    pub(super) fn remove_completed_task(&self, id: &TaskId) -> Result<()> {
+        {
+            let mut store = self
+                .store
+                .lock()
+                .map_err(|_| disk::failure("任务库锁不可用"))?;
+            store.remove_completed(id).map_err(disk::local_error)?;
+        }
+        self.rates.lock().unwrap().remove(id);
+        self.changed
+            .send_modify(|version| *version = version.wrapping_add(1));
+        Ok(())
+    }
+    pub(super) fn delete_completed_receive_file(&self, id: &TaskId) -> Result<()> {
+        if self.active.lock().unwrap().contains_key(id) {
+            return Err(disk::failure("传输任务仍在活动，不能删除文件"));
+        }
+        {
+            let mut store = self
+                .store
+                .lock()
+                .map_err(|_| disk::failure("任务库锁不可用"))?;
+            let record = store.task(id).map_err(disk::local_error)?;
+            disk::delete_completed_receive_file(&record)?;
+            store.remove_completed(id).map_err(disk::local_error)?;
+        }
+        self.rates.lock().unwrap().remove(id);
+        self.changed
+            .send_modify(|version| *version = version.wrapping_add(1));
+        Ok(())
+    }
     pub fn set_receive_root(&self, root: PathBuf) {
         *self.receive_root.lock().unwrap() = root;
     }
@@ -2054,6 +2085,30 @@ mod tests {
             fs::read(pair.root.join("a-receive/返回.bin")).unwrap(),
             reverse_bytes
         );
+        pair.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deleting_completed_receive_file_removes_only_received_copy_and_history() {
+        let pair = Pair::new().await;
+        let (id, bytes) = pair.select(256 * 1024).await;
+        let source = pair.root.join("文件.bin");
+        let received = pair.root.join("b-receive/文件.bin");
+        pair.a
+            .send_file(&pair.ca, pair.ib, id.clone())
+            .await
+            .unwrap();
+        wait_state(&pair.b, &id, TaskState::Completed).await;
+
+        assert!(pair.a.delete_completed_receive_file(&id).is_err());
+        assert_eq!(fs::read(&source).unwrap(), bytes);
+        assert!(received.exists());
+
+        pair.b.delete_completed_receive_file(&id).unwrap();
+        assert!(!received.exists());
+        assert!(pair.b.task(id.clone()).await.is_err());
+        assert!(pair.a.task(id).await.is_ok());
+        assert_eq!(fs::read(&source).unwrap(), bytes);
         pair.shutdown().await;
     }
     #[tokio::test]

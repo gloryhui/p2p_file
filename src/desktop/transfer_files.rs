@@ -27,6 +27,43 @@ pub fn local_error(error: impl std::fmt::Display) -> Error {
     Error::Protocol(error.to_string())
 }
 
+pub fn delete_completed_receive_file(record: &TaskRecord) -> Result<()> {
+    use std::io::Read;
+
+    if record.direction() != TaskDirection::Receive || record.state() != TaskState::Completed {
+        return Err(failure("只能删除已完成的接收文件"));
+    }
+    let details = record
+        .file_details()
+        .filter(|details| details.receipt_committed)
+        .ok_or_else(|| failure("任务没有已完成的接收文件"))?;
+    let root = super::secure_fs::root(record.local_path())?;
+    let (parent, name) = super::secure_fs::parent(&root, &details.relative_path, false)?;
+    let opened = super::secure_fs::open(&parent, &name, false, false)?;
+    if opened.metadata()?.len() != details.manifest.total_len {
+        return Err(failure("接收文件已变化，未删除"));
+    }
+    let mut reader = std::io::BufReader::new(
+        opened
+            .try_clone()?
+            .take(details.manifest.total_len.saturating_add(1)),
+    );
+    if manifest_from_reader(
+        &details.manifest.file_name,
+        details.manifest.chunk_size,
+        &mut reader,
+    )? != details.manifest
+    {
+        return Err(failure("接收文件已变化，未删除"));
+    }
+    let current = super::secure_fs::open(&parent, &name, false, false)?;
+    if !same_handles(&opened, &current)? {
+        return Err(failure("接收文件已变化，未删除"));
+    }
+    parent.remove_file(&name)?;
+    super::secure_fs::sync(&parent)
+}
+
 pub fn validate_single_file(manifest: &FileManifest, relative: &str) -> Result<()> {
     protocol::validate_relative_path(relative)?;
     manifest.validate()?;

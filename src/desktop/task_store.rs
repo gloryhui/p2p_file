@@ -17,7 +17,10 @@ use thiserror::Error;
 use super::{
     instance_lock::{InstanceLock, InstanceLockError},
     task_events::{TaskEvent, TaskEventBuffer, TaskEventKind},
-    task_model::{ProgressHint, TaskDiagnostic, TaskId, TaskModelError, TaskRecord, TaskState},
+    task_model::{
+        ProgressHint, TaskDiagnostic, TaskId, TaskModelError, TaskRecord, TaskState,
+        system_time_unix_ms,
+    },
     task_recovery::{self, StartupRecoveryReport},
 };
 
@@ -36,6 +39,8 @@ pub(crate) enum TaskStoreError {
     Model(#[from] TaskModelError),
     #[error("任务记录不存在")]
     TaskNotFound,
+    #[error("只能移除已完成任务的历史记录")]
+    NotCompleted,
     #[error("任务目录已由另一个写入者使用")]
     AlreadyRunning,
     #[error("任务存储提交状态不确定；请重启应用后重试")]
@@ -151,6 +156,31 @@ impl TaskStore {
             .find(|task| task.task_id() == task_id)
             .cloned()
             .ok_or(TaskStoreError::TaskNotFound)
+    }
+
+    /// Remove only the durable history for a completed task. Transferred files
+    /// are outside the task store and are never touched by this operation.
+    pub(crate) fn remove_completed(&mut self, task_id: &TaskId) -> Result<(), TaskStoreError> {
+        self.ensure_healthy()?;
+        let task = self
+            .tasks
+            .iter()
+            .find(|task| task.task_id() == task_id)
+            .ok_or(TaskStoreError::TaskNotFound)?;
+        if task.state() != TaskState::Completed {
+            return Err(TaskStoreError::NotCompleted);
+        }
+        let removed_at = system_time_unix_ms()?;
+        let candidate = self
+            .tasks
+            .iter()
+            .filter(|task| task.task_id() != task_id)
+            .cloned()
+            .collect();
+        self.commit_tasks(candidate)?;
+        self.events
+            .record(task_id.clone(), removed_at, TaskEventKind::Removed);
+        Ok(())
     }
 
     /// Make a task visible only after its complete snapshot is durable.
