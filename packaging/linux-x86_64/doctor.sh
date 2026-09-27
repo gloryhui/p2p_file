@@ -39,6 +39,60 @@ check_versioned_command() {
     fi
 }
 
+extract_rust_version() {
+    local tool=$1 output=$2
+    local pattern="^${tool}[[:space:]]+([0-9]+)\\.([0-9]+)\\.([0-9]+)([-+][[:alnum:].-]+)?([[:space:]]|$)"
+    if [[ "$output" =~ $pattern ]]; then
+        printf '%s.%s.%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+    else
+        return 1
+    fi
+}
+
+rust_version_at_least_minimum() {
+    local version=$1 major minor patch
+    [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || return 2
+    major=${BASH_REMATCH[1]}
+    minor=${BASH_REMATCH[2]}
+    patch=${BASH_REMATCH[3]}
+
+    if (( 10#$major > 1 )); then
+        return 0
+    elif (( 10#$major < 1 )); then
+        return 1
+    elif (( 10#$minor > 85 )); then
+        return 0
+    elif (( 10#$minor < 85 )); then
+        return 1
+    fi
+    (( 10#$patch >= 0 ))
+}
+
+check_rust_version() {
+    local name=$1 path output version remediation
+    remediation="Run: rustup update stable"
+    if ! path=$(command -v "$name" 2>/dev/null); then
+        report FAIL "$name version" "not found" ">= 1.85.0" "Install Rust with rustup, then run: $remediation"
+        return
+    fi
+
+    if ! output=$("$path" --version 2>&1); then
+        report FAIL "$name version" "$path (version command failed: ${output%%$'\n'*})" ">= 1.85.0" "$remediation"
+        return
+    fi
+    output=${output%%$'\n'*}
+    if ! version=$(extract_rust_version "$name" "$output"); then
+        report FAIL "$name version" "$path (unrecognized version output: $output)" ">= 1.85.0" "$remediation"
+        return
+    fi
+
+    if rust_version_at_least_minimum "$version"; then
+        report PASS "$name version" "$path ($version)" ">= 1.85.0" "none"
+    else
+        report FAIL "$name version" "$path ($version)" ">= 1.85.0" "$remediation"
+    fi
+}
+
 native_package_for() {
     local module=$1
     case "$DISTRO_FAMILY:$module" in
@@ -224,8 +278,8 @@ check_versioned_command git --version "Git available with a readable version" "$
 check_versioned_command ldd --version "ldd available for ELF dependency inspection" "$(basic_remediation ldd)"
 check_versioned_command readelf --version "readelf available for ELF version inspection" "$(basic_remediation readelf)"
 check_versioned_command rustup --version "rustup available; use rustup for Rust installation" "Install Rust using the official rustup instructions at https://rustup.rs/; do not prefer an older distro rustc package."
-check_versioned_command cargo --version "Cargo available on PATH with a readable version" "Install the stable Rust toolchain using rustup."
-check_versioned_command rustc --version "Rust compiler available on PATH with a readable version" "Install the stable Rust toolchain using rustup."
+check_rust_version rustc
+check_rust_version cargo
 
 if command -v rustup >/dev/null 2>&1; then
     INSTALLED_TARGETS=$(rustup target list --installed 2>/dev/null || true)
