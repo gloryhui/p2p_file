@@ -40,6 +40,9 @@ env/
 # ---- Rust ----
 target/
 
+# ---- 本机各平台发布产物 ----
+/release/
+
 # ---- 编辑器 / IDE ----
 .idea/
 .vscode/
