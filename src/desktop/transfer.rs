@@ -1185,11 +1185,24 @@ impl TransferService {
             .filter_map(|(peer, speed)| speed.snapshot().map(|s| (*peer, s)))
             .collect()
     }
+    #[cfg(test)]
     pub async fn serve_peer_with_speed(
         &self,
         connection: Connection,
         peer: NodeId,
         local: NodeId,
+    ) -> Result<()> {
+        let (_, allowed_forward_targets) = tokio::sync::watch::channel(Vec::new());
+        self.serve_peer_with_speed_and_targets(connection, peer, local, allowed_forward_targets)
+            .await
+    }
+
+    pub async fn serve_peer_with_speed_and_targets(
+        &self,
+        connection: Connection,
+        peer: NodeId,
+        local: NodeId,
+        allowed_forward_targets: watch::Receiver<Vec<std::net::SocketAddr>>,
     ) -> Result<()> {
         let speed = super::speed::SpeedPeer::new(
             connection.clone(),
@@ -1221,18 +1234,22 @@ impl TransferService {
             peer,
             speed: speed.clone(),
         };
-        self.serve_peer_inner(connection, peer, Some(speed)).await
+        self.serve_peer_inner(connection, peer, Some(speed), allowed_forward_targets)
+            .await
     }
     /// Test convenience; production always enables negotiated speed business.
     #[cfg(test)]
     pub async fn serve_peer(&self, connection: Connection, peer: NodeId) -> Result<()> {
-        self.serve_peer_inner(connection, peer, None).await
+        let (_, allowed_forward_targets) = watch::channel(Vec::new());
+        self.serve_peer_inner(connection, peer, None, allowed_forward_targets)
+            .await
     }
     async fn serve_peer_inner(
         &self,
         connection: Connection,
         peer: NodeId,
         speed: Option<super::speed::SpeedPeer>,
+        allowed_forward_targets: watch::Receiver<Vec<std::net::SocketAddr>>,
     ) -> Result<()> {
         let mut streams = JoinSet::new();
         if let Some(speed) = speed.clone() {
@@ -1246,11 +1263,16 @@ impl TransferService {
                 accepted=connection.accept_bi()=> {
                     let (mut send,mut recv)=match accepted { Ok(streams)=>streams, Err(_)=>break };
                     if streams.len()>=8 {let _=send.reset(4u32.into());let _=recv.stop(4u32.into());continue;}
-                    let service=self.clone();let connection=connection.clone();let speed=speed.clone();
+                    let service=self.clone();let connection=connection.clone();let speed=speed.clone();let allowed_forward_targets=allowed_forward_targets.clone();
                     streams.spawn(async move {
                         let buffered=tokio::time::timeout(Duration::from_secs(5),service.frame_budget.read(&mut recv,None)).await.map_err(|_|disk::failure("文件流首帧超时"))??;
                         let super::frame_budget::BufferedFrame {frame:first,_lease}=buffered;
                         match &first.message {
+                            Message::TunnelOpen{target}=> {
+                                drop(_lease);
+                                let allowed=allowed_forward_targets.borrow().clone();
+                                super::tunnel::serve_open(send,recv,*target,&allowed).await
+                            },
                             Message::Speed(_)=> { let speed=speed.ok_or_else(||disk::failure("对端不支持测速执行"))?;drop(_lease);speed.serve_control(send,recv,first).await },
                             Message::Offer{..} => service.receive_offer(send,recv,peer,super::frame_budget::BufferedFrame{frame:first,_lease}).await,
                             Message::ResumeTask{task_id} if first.request_id==1 => {
@@ -1288,7 +1310,7 @@ impl TransferService {
                                 }
                                 result
                             }
-                            _=>Err(disk::failure("桌面流入口仅接受任务 Offer 或 ID-only Continue")),
+                            _=>Err(disk::failure("桌面流入口仅接受任务、测速或 TCP 隧道请求")),
                         }
                     });
                 }

@@ -1,6 +1,7 @@
 #[cfg(unix)]
 use std::fs::File;
 use std::{
+    collections::HashSet,
     fs::{self, OpenOptions},
     io::{self, Write},
     net::IpAddr,
@@ -11,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const APP_DIR_NAME: &str = "p2p_file";
-const CONFIG_SCHEMA_VERSION: u32 = 1;
+const CONFIG_SCHEMA_VERSION: u32 = 2;
+const LEGACY_CONFIG_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -101,6 +103,75 @@ pub struct SettingsDraft {
     pub send_concurrency: u8,
     pub speedtest_seconds: u16,
     pub speedtest_direction: SpeedtestDirection,
+    pub allowed_forward_targets: Vec<AllowedForwardTarget>,
+    pub tunnel_rules: Vec<TunnelRule>,
+}
+
+/// A local TCP service that authenticated peers may reach through this device.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AllowedForwardTarget {
+    pub id: String,
+    pub name: String,
+    pub target: std::net::SocketAddr,
+    pub enabled: bool,
+}
+
+/// A local TCP listener bound to one specific authenticated peer.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TunnelRule {
+    pub id: String,
+    pub name: String,
+    pub peer_node_id: String,
+    pub listen: std::net::SocketAddr,
+    pub target: std::net::SocketAddr,
+    pub enabled: bool,
+    pub auto_start: bool,
+}
+
+impl AllowedForwardTarget {
+    pub fn new(name: impl Into<String>, target: std::net::SocketAddr) -> Self {
+        Self {
+            id: new_rule_id(),
+            name: name.into(),
+            target,
+            enabled: true,
+        }
+    }
+}
+
+impl TunnelRule {
+    pub fn new(
+        name: impl Into<String>,
+        peer_node_id: impl Into<String>,
+        listen_port: u16,
+        target: std::net::SocketAddr,
+    ) -> Self {
+        Self {
+            id: new_rule_id(),
+            name: name.into(),
+            peer_node_id: peer_node_id.into(),
+            listen: std::net::SocketAddr::from(([127, 0, 0, 1], listen_port)),
+            target,
+            enabled: true,
+            auto_start: false,
+        }
+    }
+}
+
+impl SettingsDraft {
+    pub fn enabled_forward_targets(&self) -> Vec<std::net::SocketAddr> {
+        self.allowed_forward_targets
+            .iter()
+            .filter(|entry| entry.enabled)
+            .map(|entry| entry.target)
+            .collect()
+    }
+}
+
+fn new_rule_id() -> String {
+    format!("{:032x}", rand::random::<u128>())
 }
 
 impl SettingsDraft {
@@ -112,6 +183,8 @@ impl SettingsDraft {
             send_concurrency: 1,
             speedtest_seconds: 30,
             speedtest_direction: SpeedtestDirection::Both,
+            allowed_forward_targets: Vec::new(),
+            tunnel_rules: Vec::new(),
         }
     }
 
@@ -129,6 +202,8 @@ impl SettingsDraft {
             send_concurrency: config.send_concurrency,
             speedtest_seconds: config.speedtest_seconds,
             speedtest_direction,
+            allowed_forward_targets: config.allowed_forward_targets,
+            tunnel_rules: config.tunnel_rules,
         }
     }
 
@@ -150,7 +225,7 @@ impl SettingsDraft {
             return Err(ConfigError::UnsupportedPathEncoding);
         }
 
-        Ok(DesktopConfig {
+        let config = DesktopConfig {
             schema_version: CONFIG_SCHEMA_VERSION,
             signal: SignalConfig {
                 host: host.to_owned(),
@@ -160,7 +235,11 @@ impl SettingsDraft {
             send_concurrency: self.send_concurrency,
             speedtest_seconds: self.speedtest_seconds,
             speedtest_direction: self.speedtest_direction,
-        })
+            allowed_forward_targets: self.allowed_forward_targets.clone(),
+            tunnel_rules: self.tunnel_rules.clone(),
+        };
+        config.validate()?;
+        Ok(config)
     }
 
     pub fn save_atomic(&self, path: &Path) -> Result<(), ConfigError> {
@@ -202,6 +281,21 @@ pub struct DesktopConfig {
     send_concurrency: u8,
     speedtest_seconds: u16,
     speedtest_direction: SpeedtestDirection,
+    #[serde(default)]
+    allowed_forward_targets: Vec<AllowedForwardTarget>,
+    #[serde(default)]
+    tunnel_rules: Vec<TunnelRule>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyDesktopConfig {
+    schema_version: u32,
+    signal: SignalConfig,
+    receive_directory: PathBuf,
+    send_concurrency: u8,
+    speedtest_seconds: u16,
+    speedtest_direction: SpeedtestDirection,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -226,8 +320,38 @@ impl DesktopConfig {
         }
 
         let bytes = fs::read(path)?;
-        let config: Self = serde_json::from_slice(&bytes)
-            .map_err(|error| ConfigError::Corrupt(error.to_string()))?;
+        let version = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .map_err(|error| ConfigError::Corrupt(error.to_string()))?
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| ConfigError::Corrupt("缺少有效的 schema_version".into()))?;
+        let config = match version {
+            LEGACY_CONFIG_SCHEMA_VERSION => {
+                let legacy: LegacyDesktopConfig = serde_json::from_slice(&bytes)
+                    .map_err(|error| ConfigError::Corrupt(error.to_string()))?;
+                if legacy.schema_version != LEGACY_CONFIG_SCHEMA_VERSION {
+                    return Err(ConfigError::Corrupt("旧配置版本字段不一致".into()));
+                }
+                Self {
+                    schema_version: CONFIG_SCHEMA_VERSION,
+                    signal: legacy.signal,
+                    receive_directory: legacy.receive_directory,
+                    send_concurrency: legacy.send_concurrency,
+                    speedtest_seconds: legacy.speedtest_seconds,
+                    speedtest_direction: legacy.speedtest_direction,
+                    allowed_forward_targets: Vec::new(),
+                    tunnel_rules: Vec::new(),
+                }
+            }
+            CONFIG_SCHEMA_VERSION => serde_json::from_slice::<Self>(&bytes)
+                .map_err(|error| ConfigError::Corrupt(error.to_string()))?,
+            other => {
+                return Err(ConfigError::Corrupt(format!(
+                    "不支持的 schema_version {other}"
+                )));
+            }
+        };
         config
             .validate()
             .map_err(|error| ConfigError::Corrupt(error.to_string()))?;
@@ -253,6 +377,7 @@ impl DesktopConfig {
         if self.receive_directory.to_str().is_none() {
             return Err(ConfigError::UnsupportedPathEncoding);
         }
+        validate_forward_configuration(&self.allowed_forward_targets, &self.tunnel_rules)?;
         Ok(())
     }
 }
@@ -268,10 +393,10 @@ fn restore_saved_settings_with_validator(
     let settings = SettingsDraft::from_config(config);
     let note = match settings.receive_directory.as_deref() {
         Some(path) => match validate(path) {
-            Ok(()) => "已加载已保存设置；网络功能待接入".to_owned(),
-            Err(error) => format!("已加载设置；{error}。可选择新的接收目录并保存；网络功能待接入"),
+            Ok(()) => "已加载已保存设置；端口转发规则已就绪".to_owned(),
+            Err(error) => format!("已加载设置；{error}。可选择新的接收目录并保存"),
         },
-        None => "已加载设置；请重新选择接收目录；网络功能待接入".to_owned(),
+        None => "已加载设置；请重新选择接收目录".to_owned(),
     };
     // The parsed JSON and settings fields are valid even if the saved directory
     // has since become unavailable. Keep remediation enabled so the user can
@@ -359,6 +484,84 @@ pub fn validate_speedtest_seconds(value: u16) -> Result<(), ConfigError> {
             "测速时长仅支持 30 秒或 1 到 10 分钟（每分钟递增）".into(),
         ))
     }
+}
+
+fn validate_rule_id(id: &str) -> Result<(), ConfigError> {
+    if id.is_empty()
+        || id.len() > 64
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(ConfigError::Invalid("转发规则 ID 格式无效".into()));
+    }
+    Ok(())
+}
+
+fn validate_rule_name(name: &str) -> Result<(), ConfigError> {
+    let name = name.trim();
+    if name.is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
+        return Err(ConfigError::Invalid(
+            "转发规则名称不能为空、不能包含控制字符且最多 128 字节".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_forward_target(target: std::net::SocketAddr) -> Result<(), ConfigError> {
+    if target.port() == 0 || target.ip().is_unspecified() || target.ip().is_multicast() {
+        return Err(ConfigError::Invalid(format!(
+            "目标地址 {target} 必须使用具体 IP 和 1..65535 端口"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_forward_configuration(
+    allowed: &[AllowedForwardTarget],
+    rules: &[TunnelRule],
+) -> Result<(), ConfigError> {
+    let mut allowed_ids = HashSet::new();
+    let mut enabled_targets = HashSet::new();
+    for entry in allowed {
+        validate_rule_id(&entry.id)?;
+        validate_rule_name(&entry.name)?;
+        validate_forward_target(entry.target)?;
+        if !allowed_ids.insert(entry.id.as_str()) {
+            return Err(ConfigError::Invalid(format!(
+                "允许服务规则 ID 重复：{}",
+                entry.id
+            )));
+        }
+        if entry.enabled && !enabled_targets.insert(entry.target) {
+            return Err(ConfigError::Invalid(format!(
+                "已启用的允许服务目标重复：{}",
+                entry.target
+            )));
+        }
+    }
+
+    let mut rule_ids = HashSet::new();
+    for rule in rules {
+        validate_rule_id(&rule.id)?;
+        validate_rule_name(&rule.name)?;
+        crate::identity::NodeId::from_hex(&rule.peer_node_id)
+            .map_err(|error| ConfigError::Invalid(format!("对端 Node ID 无效：{error}")))?;
+        if !rule_ids.insert(rule.id.as_str()) {
+            return Err(ConfigError::Invalid(format!(
+                "本机转发规则 ID 重复：{}",
+                rule.id
+            )));
+        }
+        if !rule.listen.ip().is_loopback() || rule.listen.port() == 0 {
+            return Err(ConfigError::Invalid(format!(
+                "本机监听地址 {} 必须是 127.0.0.1 或 ::1 且端口在 1..65535 内",
+                rule.listen
+            )));
+        }
+        validate_forward_target(rule.target)?;
+    }
+    Ok(())
 }
 
 pub(super) fn validate_receive_directory(path: &Path) -> Result<(), ConfigError> {
@@ -563,6 +766,8 @@ mod tests {
             send_concurrency: 1,
             speedtest_seconds: 30,
             speedtest_direction: SpeedtestDirection::Upload,
+            allowed_forward_targets: Vec::new(),
+            tunnel_rules: Vec::new(),
         }
     }
 
@@ -587,6 +792,8 @@ mod tests {
             send_concurrency: 1,
             speedtest_seconds: 30,
             speedtest_direction: SpeedtestDirection::Upload,
+            allowed_forward_targets: Vec::new(),
+            tunnel_rules: Vec::new(),
         });
         assert_eq!(upgraded.speedtest_direction, SpeedtestDirection::Both);
     }
@@ -732,12 +939,41 @@ mod tests {
         ensure_private_app_dir(&root.join("config")).unwrap();
         let config_file = root.join("config").join("settings.json");
         let mut draft = valid_draft(receive.clone());
+        draft.allowed_forward_targets = vec![
+            AllowedForwardTarget {
+                id: "ssh".into(),
+                name: "SSH".into(),
+                target: "127.0.0.1:22".parse().unwrap(),
+                enabled: true,
+            },
+            AllowedForwardTarget {
+                id: "web".into(),
+                name: "Web 管理".into(),
+                target: "192.168.1.20:8080".parse().unwrap(),
+                enabled: false,
+            },
+        ];
+        draft.tunnel_rules = vec![TunnelRule {
+            id: "home-ssh".into(),
+            name: "家里 SSH".into(),
+            peer_node_id: crate::identity::Identity::generate().node_id().to_hex(),
+            listen: "127.0.0.1:2222".parse().unwrap(),
+            target: "127.0.0.1:22".parse().unwrap(),
+            enabled: true,
+            auto_start: true,
+        }];
 
         draft.save_atomic(&config_file).unwrap();
         let first = DesktopConfig::load(&config_file).unwrap().unwrap();
         assert_eq!(first.signal.host, "relay.example.test");
         assert_eq!(first.signal.port, 7000);
         assert_eq!(first.receive_directory, receive);
+        assert_eq!(first.allowed_forward_targets, draft.allowed_forward_targets);
+        assert_eq!(first.tunnel_rules, draft.tunnel_rules);
+        assert_eq!(
+            draft.enabled_forward_targets(),
+            vec!["127.0.0.1:22".parse().unwrap()]
+        );
 
         draft.send_concurrency = 3;
         draft.speedtest_seconds = 600;
@@ -752,6 +988,74 @@ mod tests {
             1
         );
         assert_eq!(fs::read_dir(&receive).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn schema_one_config_migrates_with_empty_forward_lists_and_is_rewritten_as_schema_two() {
+        let root = temp_dir("schema_migration");
+        fs::create_dir_all(&root).unwrap();
+        let receive = root.join("Downloads");
+        fs::create_dir(&receive).unwrap();
+        let config_file = root.join("settings.json");
+        let legacy = serde_json::json!({
+            "schema_version": 1,
+            "signal": { "host": "relay.example.test", "port": 7000 },
+            "receive_directory": receive,
+            "send_concurrency": 1,
+            "speedtest_seconds": 30,
+            "speedtest_direction": "upload"
+        });
+        fs::write(&config_file, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let config = DesktopConfig::load(&config_file).unwrap().unwrap();
+        let (settings, _, can_save) = restore_saved_settings_with_validator(config, |_| Ok(()));
+        assert!(can_save);
+        assert!(settings.allowed_forward_targets.is_empty());
+        assert!(settings.tunnel_rules.is_empty());
+        settings.save_atomic(&config_file).unwrap();
+
+        let migrated: serde_json::Value =
+            serde_json::from_slice(&fs::read(&config_file).unwrap()).unwrap();
+        assert_eq!(migrated["schema_version"], CONFIG_SCHEMA_VERSION);
+        assert_eq!(migrated["allowed_forward_targets"], serde_json::json!([]));
+        assert_eq!(migrated["tunnel_rules"], serde_json::json!([]));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_duplicate_enabled_targets_and_non_loopback_tunnel_listeners() {
+        let root = temp_dir("forward_validation");
+        fs::create_dir_all(&root).unwrap();
+        let mut draft = valid_draft(root.clone());
+        let target = "127.0.0.1:22".parse().unwrap();
+        draft.allowed_forward_targets = vec![
+            AllowedForwardTarget {
+                id: "one".into(),
+                name: "One".into(),
+                target,
+                enabled: true,
+            },
+            AllowedForwardTarget {
+                id: "two".into(),
+                name: "Two".into(),
+                target,
+                enabled: true,
+            },
+        ];
+        assert!(matches!(draft.to_config(), Err(ConfigError::Invalid(_))));
+
+        draft.allowed_forward_targets[1].enabled = false;
+        draft.tunnel_rules.push(TunnelRule {
+            id: "lan-listener".into(),
+            name: "LAN listener".into(),
+            peer_node_id: crate::identity::Identity::generate().node_id().to_hex(),
+            listen: "0.0.0.0:2222".parse().unwrap(),
+            target,
+            enabled: true,
+            auto_start: false,
+        });
+        assert!(matches!(draft.to_config(), Err(ConfigError::Invalid(_))));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -773,7 +1077,7 @@ mod tests {
         let (mut settings, note, can_save) = restore_saved_settings(config);
 
         assert!(note.contains("接收目录不可用"), "{note}");
-        assert!(note.contains("网络功能待接入"), "{note}");
+        assert!(!note.contains("网络功能待接入"), "{note}");
         assert!(can_save, "a stale receive directory must remain repairable");
         assert_eq!(
             settings.receive_directory.as_deref(),
@@ -819,7 +1123,7 @@ mod tests {
         });
 
         assert!(note.contains("接收目录没有写权限"), "{note}");
-        assert!(note.contains("网络功能待接入"), "{note}");
+        assert!(!note.contains("网络功能待接入"), "{note}");
         assert!(can_save, "a write failure must leave settings repairable");
         assert_eq!(
             settings.receive_directory.as_deref(),

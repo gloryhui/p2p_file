@@ -21,6 +21,7 @@
 //! - 服务端只接受 `allowed_peers` 白名单里的节点。
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -30,7 +31,7 @@ use std::time::Duration;
 use quinn::{Connection, RecvStream, SendStream};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
@@ -54,6 +55,8 @@ pub const DEFAULT_MAX_PENDING_HANDSHAKES: usize = 64;
 pub const DEFAULT_MAX_BUSINESS_STREAMS: usize = 16;
 /// 一个 serve 会话最多同时落盘的文件数。
 pub const DEFAULT_MAX_FILE_RECEIVES: usize = 4;
+/// Maximum concurrent local TCP connections served by one desktop rule.
+pub const DEFAULT_MAX_TUNNEL_STREAMS: usize = 32;
 
 /// 空闲多久后重新打洞（默认 2 分钟，比常见的 NAT 映射超时短一些）。
 pub const DEFAULT_RE_PUNCH_AFTER: Duration = Duration::from_secs(120);
@@ -610,46 +613,140 @@ async fn handle_tunnel_request(
         }
     };
 
-    if !allowed.contains(&target_addr) {
-        let reason = format!(
-            "目标 {target_addr} 不在允许转发的列表里（当前允许：{}）",
-            allowed
-                .iter()
-                .map(|addr| addr.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        write_frame(
-            &mut send,
-            &ControlMessage::TunnelError {
-                reason: reason.clone(),
-            },
-        )
-        .await?;
-        let _ = send.finish();
-        warn!(%target_addr, "拒绝了未经授权的转发请求");
-        return Err(Error::Protocol(reason));
-    }
-
-    let tcp = match TcpStream::connect(target_addr).await {
+    let tcp = match connect_allowed_target(target_addr, allowed).await {
         Ok(tcp) => tcp,
         Err(err) => {
-            let reason = format!("连接 {target_addr} 失败: {err}");
             write_frame(
                 &mut send,
                 &ControlMessage::TunnelError {
-                    reason: reason.clone(),
+                    reason: err.to_string(),
                 },
             )
             .await?;
             let _ = send.finish();
-            return Err(Error::Transport(reason));
+            return Err(err);
         }
     };
 
     info!(%target_addr, "隧道已建立");
     write_frame(&mut send, &ControlMessage::TunnelReady).await?;
     splice(tcp, send, recv).await
+}
+
+/// Check the serve-side target allowlist before opening its TCP socket.
+/// Desktop's protocol adapter uses the same check as the existing tunnel core.
+pub async fn connect_allowed_target(
+    target: SocketAddr,
+    allowed: &[SocketAddr],
+) -> Result<TcpStream> {
+    if !allowed.contains(&target) {
+        let reason = format!(
+            "目标 {target} 不在允许转发的列表里（当前允许：{}）",
+            allowed
+                .iter()
+                .map(|addr| addr.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        warn!(%target, "拒绝了未经授权的转发请求");
+        return Err(Error::Protocol(reason));
+    }
+
+    TcpStream::connect(target)
+        .await
+        .map_err(|err| Error::Transport(format!("连接 {target} 失败: {err}")))
+}
+
+/// Reuse the tunnel core's TCP/QUIC bidirectional copy loop from another
+/// authenticated session protocol adapter.
+pub async fn bridge_tcp(tcp: TcpStream, send: SendStream, recv: RecvStream) -> Result<()> {
+    splice(tcp, send, recv).await
+}
+
+/// Run one local listener over an already authenticated peer session.
+/// The accepted TCP connections and their QUIC streams are owned by this task.
+pub async fn forward_on_authenticated_session<F, Fut>(
+    listener: TcpListener,
+    target: SocketAddr,
+    connections: watch::Receiver<Option<Connection>>,
+    mut shutdown: watch::Receiver<bool>,
+    errors: mpsc::UnboundedSender<String>,
+    open_stream: F,
+) -> Result<()>
+where
+    F: Fn(TcpStream, Connection, SocketAddr) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    let actual = listener.local_addr()?;
+    let streams = Arc::new(Semaphore::new(DEFAULT_MAX_TUNNEL_STREAMS));
+    let mut tasks = JoinSet::new();
+    let open_stream = Arc::new(open_stream);
+
+    loop {
+        let accepted = tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+                continue;
+            }
+            accepted = listener.accept() => accepted,
+            result = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(Err(error)) = result {
+                    debug!(%error, "桌面转发连接 task 结束");
+                }
+                continue;
+            }
+        };
+        let (tcp, from) = accepted
+            .map_err(|err| Error::Transport(format!("接受本地连接 {actual} 失败: {err}")))?;
+        let permit = match streams.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let _ = errors.send(format!("本机转发 {actual} 的并发连接已达上限"));
+                drop(tcp);
+                continue;
+            }
+        };
+        let mut connection_updates = connections.clone();
+        let mut child_shutdown = shutdown.clone();
+        let errors = errors.clone();
+        let open_stream = Arc::clone(&open_stream);
+        tasks.spawn(async move {
+            let _permit = permit;
+            let connection = loop {
+                if *child_shutdown.borrow() {
+                    return;
+                }
+                if let Some(connection) = connection_updates.borrow().clone()
+                    && connection.close_reason().is_none()
+                {
+                    break connection;
+                }
+                tokio::select! {
+                    changed = child_shutdown.changed() => {
+                        if changed.is_err() || *child_shutdown.borrow() { return; }
+                    }
+                    changed = connection_updates.changed() => {
+                        if changed.is_err() { return; }
+                    }
+                }
+            };
+            if let Err(error) = open_stream(tcp, connection, target).await {
+                let _ = errors.send(error.to_string());
+                debug!(%from, %target, error = %error, "本机转发连接失败");
+            }
+        });
+    }
+
+    tasks.abort_all();
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result {
+            debug!(%error, "桌面转发连接 task 已取消");
+        }
+    }
+    Ok(())
 }
 
 /// 把一条 TCP 连接和一条 QUIC 双向流对接起来，双向搬字节。
@@ -943,6 +1040,56 @@ mod tests {
         assert!(config.forwards.is_empty());
         assert!(config.recv_dir.is_none());
         assert!(config.allowed_peers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn authenticated_desktop_forwarders_stop_independently_and_drain_waiting_tcp() {
+        let listener_one = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address_one = listener_one.local_addr().unwrap();
+        let listener_two = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address_two = listener_two.local_addr().unwrap();
+        let (_peer_sender, peer_updates) = watch::channel(None);
+        let (stop_one, stop_one_rx) = watch::channel(false);
+        let (stop_two, stop_two_rx) = watch::channel(false);
+        let (errors_one, _errors_one_rx) = mpsc::unbounded_channel();
+        let (errors_two, _errors_two_rx) = mpsc::unbounded_channel();
+        let mut task_one = tokio::spawn(forward_on_authenticated_session(
+            listener_one,
+            "127.0.0.1:22".parse().unwrap(),
+            peer_updates.clone(),
+            stop_one_rx,
+            errors_one,
+            |_, _, _| async { Ok(()) },
+        ));
+        let mut task_two = tokio::spawn(forward_on_authenticated_session(
+            listener_two,
+            "127.0.0.1:22".parse().unwrap(),
+            peer_updates,
+            stop_two_rx,
+            errors_two,
+            |_, _, _| async { Ok(()) },
+        ));
+
+        let _client_one = tokio::net::TcpStream::connect(address_one).await.unwrap();
+        let _client_two = tokio::net::TcpStream::connect(address_two).await.unwrap();
+        tokio::task::yield_now().await;
+        stop_one.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), &mut task_one)
+            .await
+            .expect("first listener and its waiting local connection should stop")
+            .unwrap()
+            .unwrap();
+        assert!(
+            !task_two.is_finished(),
+            "stopping one rule must not stop another"
+        );
+
+        stop_two.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), &mut task_two)
+            .await
+            .expect("second listener should stop independently")
+            .unwrap()
+            .unwrap();
     }
 
     #[test]
