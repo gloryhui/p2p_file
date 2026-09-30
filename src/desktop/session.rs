@@ -2534,7 +2534,7 @@ mod tests {
         };
         assert!(conflict_detail.contains("监听"), "{conflict_detail}");
         assert!(
-            conflict_detail.contains("Address already in use"),
+            conflict_detail.contains("Address already in use") || conflict_detail.contains("10048"),
             "{conflict_detail}"
         );
         wait_connected(&mut events_a, &[identity_b.node_id()]).await;
