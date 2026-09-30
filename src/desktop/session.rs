@@ -101,6 +101,37 @@ pub enum SessionEvent {
 }
 
 #[derive(Clone)]
+struct SessionEvents {
+    sender: mpsc::Sender<SessionEvent>,
+    shutdown: watch::Receiver<bool>,
+}
+
+impl SessionEvents {
+    fn new(sender: mpsc::Sender<SessionEvent>, shutdown: watch::Receiver<bool>) -> Self {
+        Self { sender, shutdown }
+    }
+
+    async fn send(&self, event: SessionEvent) -> bool {
+        let mut shutdown = self.shutdown.clone();
+        if *shutdown.borrow() {
+            return false;
+        }
+        let mut event = Some(event);
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => false,
+            permit = self.sender.reserve() => match permit {
+                Ok(permit) => {
+                    permit.send(event.take().expect("event is sent only once"));
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct DesktopSessionHandle {
     commands: mpsc::Sender<SessionCommand>,
     lifetime: Arc<SessionLifetime>,
@@ -324,6 +355,7 @@ pub fn spawn(
     let (event_tx, event_rx) = mpsc::channel(EVENT_CAPACITY);
     let thread_events = event_tx.clone();
     let (stop, stopped) = watch::channel(false);
+    let event_shutdown = stopped.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let thread = std::thread::Builder::new()
         .name("p2p-desktop-network".into())
@@ -342,7 +374,7 @@ pub fn spawn(
                             session_command_tx,
                             command_rx,
                             stopped,
-                            event_tx.clone(),
+                            SessionEvents::new(event_tx.clone(), event_shutdown),
                         )
                         .await;
                         if let Some(transfer) = transfer {
@@ -380,7 +412,7 @@ async fn run_session(
     command_tx: mpsc::Sender<SessionCommand>,
     mut commands: mpsc::Receiver<SessionCommand>,
     mut shutdown: watch::Receiver<bool>,
-    events: mpsc::Sender<SessionEvent>,
+    events: SessionEvents,
 ) {
     emit_lifecycle(&events, NetworkLifecycle::ConnectingSignal).await;
     let network = match prepare_desktop_network(&config.network).await {
@@ -505,7 +537,7 @@ async fn run_session(
                 let _ = changed;
                 Wake::Shutdown
             }
-            _ = events.closed() => Wake::EventsClosed,
+            _ = events.sender.closed() => Wake::EventsClosed,
             _ = maintenance.tick() => Wake::Maintenance,
             _ = async {
                 match queue_changes.as_mut() {
@@ -1424,7 +1456,7 @@ async fn start_tunnel_rule(
     running_tunnels: &mut HashMap<String, RunningTunnel>,
     tunnel_tasks: &mut JoinSet<TunnelTaskResult>,
     command_tx: &mpsc::Sender<SessionCommand>,
-    events: &mpsc::Sender<SessionEvent>,
+    events: &SessionEvents,
 ) {
     if running_tunnels.contains_key(&rule.id) {
         return;
@@ -1590,7 +1622,7 @@ fn enqueue_pending_lookups(peers: &PeerRegistry, queued_lookups: &mut VecDeque<(
 }
 
 async fn schedule_reconnect(
-    events: &mpsc::Sender<SessionEvent>,
+    events: &SessionEvents,
     attempt: &mut u32,
     sleep: &mut Option<Pin<Box<Sleep>>>,
     detail: String,
@@ -1615,12 +1647,12 @@ async fn schedule_reconnect(
     .await;
 }
 
-async fn emit_lifecycle(events: &mpsc::Sender<SessionEvent>, lifecycle: NetworkLifecycle) {
+async fn emit_lifecycle(events: &SessionEvents, lifecycle: NetworkLifecycle) {
     let _ = events.send(SessionEvent::Lifecycle(lifecycle)).await;
 }
 
 async fn emit_peer_state(
-    events: &mpsc::Sender<SessionEvent>,
+    events: &SessionEvents,
     peer: NodeId,
     generation: u64,
     state: PeerLifecycle,
@@ -1665,7 +1697,7 @@ async fn start_peer_attempt(
     local_node: NodeId,
     identity: Identity,
     network: &DesktopNetwork,
-    events: &mpsc::Sender<SessionEvent>,
+    events: &SessionEvents,
     inputs: &mpsc::Sender<SessionInput>,
     semaphore: &Arc<Semaphore>,
     peers: &mut PeerRegistry,
