@@ -1177,6 +1177,22 @@ impl TransferService {
             .cancel(id)
     }
     #[cfg(test)]
+    pub(super) fn test_speed_idle(&self, peer: NodeId) -> bool {
+        self.activity.lock().can_speed(peer)
+    }
+    #[cfg(test)]
+    pub(super) fn gate_test_send_cleanup(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.source_cleanup_gate.lock().unwrap() = Some((reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+    #[cfg(test)]
     pub(super) fn set_test_speed_duration(&self, peer: NodeId, duration: Duration) -> bool {
         if let Some(speed) = self.speed_peers.lock().unwrap().get(&peer) {
             speed.set_test_duration(duration);

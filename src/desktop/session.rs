@@ -3150,6 +3150,7 @@ mod tests {
         );
         let source_a = root.join("forward.bin");
         std::fs::write(&source_a, b"forward").unwrap();
+        let (cleanup_reached, cleanup_release) = service_a.gate_test_send_cleanup();
         ha.send_file(b.node_id(), source_a).unwrap();
         time::timeout(Duration::from_secs(10), async {
             while !service_a
@@ -3168,8 +3169,30 @@ mod tests {
             std::fs::read(root.join("b-receive/forward.bin")).unwrap(),
             b"forward"
         );
+        // Completed is durable state, not proof that the stream's cleanup permit
+        // has been released. Force that ordering and retain the file/speed gate.
+        time::timeout(Duration::from_secs(5), cleanup_reached)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!service_a.test_speed_idle(b.node_id()));
+        assert!(
+            service_a
+                .start_speed(
+                    b.node_id(),
+                    super::super::protocol::SpeedDirection::Upload,
+                    30
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("文件或测速正在进行")
+        );
+        cleanup_release.send(()).unwrap();
         time::timeout(Duration::from_secs(5), async {
-            while !(service_a.set_test_speed_duration(b.node_id(), Duration::from_millis(100))
+            while !(service_a.test_speed_idle(b.node_id())
+                && service_b.test_speed_idle(a.node_id())
+                && service_a.set_test_speed_duration(b.node_id(), Duration::from_millis(100))
                 && service_b.set_test_speed_duration(a.node_id(), Duration::from_millis(100)))
             {
                 time::sleep(Duration::from_millis(10)).await;
@@ -3185,10 +3208,18 @@ mod tests {
         .unwrap();
         time::timeout(Duration::from_secs(15), async {
             let mut phases = 0;
+            let mut diagnostics = Vec::new();
             while phases < 2 {
-                if let Some(SessionEvent::SpeedPhaseCompleted { snapshot, .. }) = ea.recv().await {
-                    assert!(snapshot.bytes > 0);
-                    phases += 1;
+                match ea.recv().await.unwrap() {
+                    SessionEvent::SpeedPhaseCompleted { snapshot, .. } => {
+                        assert!(snapshot.bytes > 0);
+                        phases += 1;
+                    }
+                    SessionEvent::Diagnostic(message) => diagnostics.push(message),
+                    SessionEvent::SpeedRequestEnded { .. } => {
+                        panic!("speed request ended after {phases}/2 phases: {diagnostics:?}")
+                    }
+                    _ => {}
                 }
             }
         })
