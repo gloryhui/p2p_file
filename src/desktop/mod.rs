@@ -20,6 +20,7 @@ mod network_state;
 mod protocol;
 mod publish;
 mod queue;
+mod remote_auth;
 pub(crate) mod secure_fs;
 mod session;
 mod speed;
@@ -41,12 +42,14 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use std::{net::SocketAddr, ops::Range, path::PathBuf};
 
+use crate::discovery::short_id::ShortId;
 use crate::identity::{Identity, NodeId};
 use config::{
     AllowedForwardTarget, AppPaths, ConfigError, DesktopConfig, SettingsDraft, SpeedtestDirection,
     TunnelRule,
 };
 use instance_lock::InstanceLock;
+use remote_auth::{RemoteVerifier, SecretPassword};
 use task_store::TaskStore;
 use ui::{components as ui_components, theme as ui_theme};
 
@@ -111,6 +114,7 @@ struct DesktopStartup {
     config_note: String,
     can_save_settings: bool,
     has_saved_network_config: bool,
+    initial_password: Option<SecretPassword>,
 }
 
 impl DesktopStartup {
@@ -149,11 +153,12 @@ impl DesktopStartup {
 
         let config_file = paths.config_file();
         let defaults = || SettingsDraft::defaults(paths.downloads_dir.clone());
-        let (settings, config_note, can_save_settings, has_saved_network_config) =
+        let (mut settings, mut config_note, can_save_settings, has_saved_network_config) =
             match DesktopConfig::load(&config_file) {
                 Ok(Some(config)) => {
+                    let has_network = config.has_network_config();
                     let (settings, note, can_save) = config::restore_saved_settings(config);
-                    (settings, note, can_save, true)
+                    (settings, note, can_save, has_network)
                 }
                 Ok(None) => {
                     let note = if paths.downloads_dir.is_some() {
@@ -177,6 +182,28 @@ impl DesktopStartup {
                 ),
             };
 
+        let initial_password = if can_save_settings && settings.remote_auth.is_none() {
+            let initialized = SecretPassword::generate().and_then(|password| {
+                let verifier = RemoteVerifier::create(&password)?;
+                DesktopConfig::save_remote_auth(&config_file, verifier.clone()).map_err(|_| {
+                    crate::error::Error::Protocol("远程密码配置保存失败；认证保持禁用".into())
+                })?;
+                settings.remote_auth = Some(verifier);
+                Ok(password)
+            });
+            match initialized {
+                Ok(password) => {
+                    config_note = "已生成远程访问密码；请显示并复制保存，仅保存派生密钥".into();
+                    Some(password)
+                }
+                Err(error) => {
+                    config_note = error.to_string();
+                    None
+                }
+            }
+        } else {
+            None
+        };
         Ok(Self {
             instance_lock,
             task_store,
@@ -189,6 +216,7 @@ impl DesktopStartup {
             config_note,
             can_save_settings,
             has_saved_network_config,
+            initial_password,
         })
     }
 }
@@ -294,11 +322,21 @@ fn mouse_index_for_layout(content: &str, layout_text: &str, index: usize) -> Opt
     )
 }
 
+fn password_display(content: &str, revealed: bool) -> String {
+    if revealed {
+        content.to_owned()
+    } else {
+        "*".repeat(content.len())
+    }
+}
+
 struct TextField {
     focus_handle: FocusHandle,
     content: SharedString,
     placeholder: SharedString,
     concurrency_value_input: bool,
+    secret: bool,
+    revealed: bool,
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
@@ -314,6 +352,8 @@ impl TextField {
             content: "".into(),
             placeholder: placeholder.into(),
             concurrency_value_input: false,
+            secret: false,
+            revealed: false,
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
@@ -323,6 +363,18 @@ impl TextField {
         }
     }
 
+    fn new_password(cx: &mut Context<Self>, placeholder: &'static str) -> Self {
+        let mut field = Self::new(cx, placeholder);
+        field.secret = true;
+        field
+    }
+    fn displayed_content(&self) -> SharedString {
+        if self.secret {
+            password_display(&self.content, self.revealed).into()
+        } else {
+            self.content.clone()
+        }
+    }
     fn new_concurrency_value(cx: &mut Context<Self>, value: u8) -> Self {
         let mut field = Self::new(cx, "1–3");
         field.content = value.to_string().into();
@@ -336,6 +388,12 @@ impl TextField {
         range: Range<usize>,
         new_text: &str,
     ) -> Option<(Range<usize>, String)> {
+        if self.secret
+            && (!new_text.bytes().all(|b| b.is_ascii_alphanumeric())
+                || self.content.len() - (range.end - range.start) + new_text.len() > 12)
+        {
+            return None;
+        }
         if self.concurrency_value_input {
             concurrency_value_replacement(&self.content, range, new_text)
         } else {
@@ -476,7 +534,7 @@ impl TextField {
         else {
             return None;
         };
-        if line.text != self.content {
+        if line.text != self.displayed_content() {
             return None;
         };
         if position.y < bounds.top() {
@@ -547,7 +605,11 @@ impl EntityInputHandler for TextField {
     ) -> Option<String> {
         let range = self.range_from_utf16(&range_utf16);
         actual_range.replace(self.range_to_utf16(&range));
-        Some(self.content[range].to_string())
+        Some(if self.secret {
+            "*".repeat(range.len())
+        } else {
+            self.content[range].to_string()
+        })
     }
 
     fn selected_text_range(
@@ -726,7 +788,7 @@ impl Element for TextFieldElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let input = self.input.read(cx);
-        let content = input.content.clone();
+        let content = input.displayed_content();
         let selected_range = input.selected_range.clone();
         let cursor = input.cursor_offset();
         let style = window.text_style();
@@ -906,6 +968,10 @@ impl Focusable for TextField {
 
 struct DesktopShell {
     peer_id: Entity<TextField>,
+    peer_password: Entity<TextField>,
+    local_password: Entity<TextField>,
+    local_short_id: Option<ShortId>,
+    resolved_peer: Option<(String, NodeId)>,
     concurrency_input: Entity<TextField>,
     signal_host: Entity<TextField>,
     signal_port: Entity<TextField>,
@@ -972,6 +1038,11 @@ impl DesktopShell {
         cx.notify();
     }
     fn close_settings_home(&mut self, cx: &mut Context<Self>) {
+        self.local_password.update(cx, |field, cx| {
+            field.revealed = false;
+            field.last_layout = None;
+            cx.notify();
+        });
         self.show_settings_home = false;
         cx.notify();
     }
@@ -1015,6 +1086,7 @@ impl DesktopShell {
             vec![
                 self.signal_host.clone(),
                 self.signal_port.clone(),
+                self.local_password.clone(),
                 self.allowed_name.clone(),
                 self.allowed_target.clone(),
                 self.allowed_peers.clone(),
@@ -1025,7 +1097,7 @@ impl DesktopShell {
                 self.peer_id.clone(),
             ]
         } else {
-            vec![self.peer_id.clone()]
+            vec![self.peer_id.clone(), self.peer_password.clone()]
         };
         let current = fields
             .iter()
@@ -1133,17 +1205,26 @@ impl DesktopShell {
         })
         .detach();
     }
+    fn selected_peer(&self, cx: &Context<Self>) -> Option<NodeId> {
+        let text = self.peer_id.read(cx).content.trim();
+        NodeId::from_hex(text).ok().or_else(|| {
+            self.resolved_peer
+                .as_ref()
+                .filter(|(query, _)| query == text)
+                .map(|(_, peer)| *peer)
+        })
+    }
     fn authenticated_peer(&mut self, cx: &mut Context<Self>) -> Option<NodeId> {
-        let result = NodeId::from_hex(self.peer_id.read(cx).content.trim());
-        let Ok(peer) = result else {
-            self.set_status("请先输入有效的完整对端 ID 并连接", cx);
+        let result = self.selected_peer(cx);
+        let Some(peer) = result else {
+            self.set_status("请先输入对端设备 ID 和密码并连接", cx);
             return None;
         };
         if !matches!(
             self.peer_states.get(&peer),
             Some(network_state::PeerLifecycle::Connected)
         ) {
-            self.set_status("请先连接并等待对端身份认证完成", cx);
+            self.set_status("请先连接并等待远程访问授权完成", cx);
             return None;
         }
         if self.transfer_service.is_none() {
@@ -1251,7 +1332,10 @@ impl DesktopShell {
                         self.peer_states.get(&row.peer),
                         Some(network_state::PeerLifecycle::Connected)
                     ) {
-                        s.connect_peer(row.peer)?;
+                        let password =
+                            SecretPassword::new(self.peer_password.read(cx).content.to_string())
+                                .map_err(|e| e.to_string())?;
+                        s.connect_peer_with_password(row.peer, password)?;
                         let pending = self.pending_resumes.entry(row.peer).or_default();
                         if !pending.contains(&row.id) {
                             pending.push(row.id);
@@ -2016,6 +2100,7 @@ impl DesktopShell {
             self.set_status(self.network_status.clone(), cx);
             return false;
         };
+        config.remote_auth = self.settings.remote_auth.clone();
         config.transfer = self.transfer_service.clone();
         config.allowed_forward_targets = self.settings.enabled_forward_targets();
         config.tunnel_rules = self.settings.tunnel_rules.clone();
@@ -2091,8 +2176,9 @@ impl DesktopShell {
                                             network_state::PeerLifecycle::Negotiating => {
                                                 "正在协商桌面版本与能力".to_owned()
                                             }
+                                            network_state::PeerLifecycle::RemoteAuthPending => { "身份已认证，等待远程密码授权".to_owned() }
                                             network_state::PeerLifecycle::Connected => {
-                                                "已认证直连".to_owned()
+                                                "远程访问已授权".to_owned()
                                             }
                                             network_state::PeerLifecycle::Disconnected => {
                                                 "连接已断开".to_owned()
@@ -2104,6 +2190,14 @@ impl DesktopShell {
                                         let message = format!("对端 {}：{label}", peer.short());
                                         shell.peer_status = message.clone().into();
                                         shell.set_status(message, cx);
+                                    }
+                                    session::SessionEvent::ShortIdRegistered(id) => {shell.local_short_id = Some(id); cx.notify();}
+                                    session::SessionEvent::ShortIdResolved {short_id, peer} => {
+                                        let text = shell.peer_id.read(cx).content.trim().to_owned();
+                                        if ShortId::normalize(&text).ok() == Some(short_id) {
+                                            shell.resolved_peer = peer.map(|peer| (text,peer));
+                                            if peer.is_none() {shell.set_status("短 ID 无法解析或查询暂时受限",cx);}
+                                        }
                                     }
                                     session::SessionEvent::SignalIdentityRegistered(peer) => {
                                         let label =
@@ -2177,36 +2271,175 @@ impl DesktopShell {
         self.connect_current_peer(cx);
     }
     fn connect_current_peer(&mut self, cx: &mut Context<Self>) {
-        let peer_text = self.peer_id.read(cx).content.to_string();
-        let peer = match NodeId::from_hex(peer_text.trim()) {
-            Ok(peer) => peer,
+        let text = self.peer_id.read(cx).content.trim().to_owned();
+        let password = match SecretPassword::new(self.peer_password.read(cx).content.to_string()) {
+            Ok(password) => password,
             Err(error) => {
-                self.set_status(format!("对端 Node ID 无效：{error}"), cx);
+                self.set_status(error.to_string(), cx);
                 return;
             }
         };
-        if self
-            .identity
-            .as_ref()
-            .is_some_and(|identity| identity.node_id() == peer)
-        {
-            self.set_status("不能连接本机 Node ID", cx);
-            return;
-        }
         let Some(session) = self.network_session.as_ref() else {
-            self.set_status("请先保存有效的信令配置；网络会话尚未启动", cx);
+            self.set_status("请先保存有效的信令配置", cx);
             return;
         };
-        match session.connect_peer(peer) {
-            Ok(()) => self.set_status(format!("已提交对端 {} 的连接请求", peer.short()), cx),
+        let result = if let Ok(short_id) = ShortId::normalize(&text) {
+            if self.local_short_id == Some(short_id) {
+                self.set_status("不能连接本机设备 ID", cx);
+                return;
+            }
+            self.resolved_peer = None;
+            session.connect_short_id(short_id, password)
+        } else if let Ok(peer) = NodeId::from_hex(&text) {
+            if self.identity.as_ref().is_some_and(|i| i.node_id() == peer) {
+                self.set_status("不能连接本机设备 ID", cx);
+                return;
+            }
+            session.connect_peer_with_password(peer, password)
+        } else {
+            self.set_status("设备 ID 须为 9 位短 ID 或完整 Node ID", cx);
+            return;
+        };
+        match result {
+            Ok(()) => self.set_status("正在查询设备并建立认证连接", cx),
             Err(error) => self.set_status(error, cx),
         }
     }
-
-    fn copy_node_id(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(identity_id) = self.identity_id.as_ref() {
-            cx.write_to_clipboard(ClipboardItem::new_string(identity_id.clone()));
-            self.set_status("已复制完整本机 Node ID", cx);
+    fn save_remote_password(&mut self, regenerate: bool, cx: &mut Context<Self>) {
+        if !self.can_save_settings || self.is_saving_settings {
+            return;
+        }
+        let password = if regenerate {
+            SecretPassword::generate()
+        } else {
+            SecretPassword::new(self.local_password.read(cx).content.to_string())
+        };
+        let password = match password {
+            Ok(password) => password,
+            Err(error) => {
+                self.set_status(error.to_string(), cx);
+                return;
+            }
+        };
+        let path = self.config_file.clone();
+        let session = self.network_session.clone();
+        let background = cx.background_executor().clone();
+        self.is_saving_settings = true;
+        self.set_status("正在保存远程密码并撤销已有会话授权…", cx);
+        cx.spawn(async move |shell, cx| {
+            let result = background
+                .spawn(async move {
+                    let verifier = RemoteVerifier::create(&password).map_err(|e| e.to_string())?;
+                    DesktopConfig::save_remote_auth(&path, verifier.clone())
+                        .map_err(|e| e.to_string())?;
+                    let applied = if let Some(session) = session {
+                        session.update_remote_auth(verifier.clone()).await
+                    } else {
+                        Ok(())
+                    };
+                    Ok::<_, String>((verifier, password, applied))
+                })
+                .await;
+            let _ = shell.update(cx, |shell, cx| {
+                shell.is_saving_settings = false;
+                match result {
+                    Ok((verifier, password, applied)) => {
+                        shell.settings.remote_auth = Some(verifier);
+                        shell.peer_states.clear();
+                        shell.pending_resumes.clear();
+                        shell.local_password.update(cx, |field, cx| {
+                            field.content = password.expose().to_owned().into();
+                            field.revealed = false;
+                            field.selected_range = field.content.len()..field.content.len();
+                            field.last_layout = None;
+                            cx.notify();
+                        });
+                        match applied {
+                            Ok(()) => {
+                                shell.set_status("远程密码已保存；已有会话已撤销，请重新连接", cx)
+                            }
+                            Err(_) => {
+                                if let Some(session) = shell.network_session.take() {
+                                    session.shutdown();
+                                }
+                                shell.set_status("密码已保存；网络会话已关闭，请重新启动网络", cx);
+                            }
+                        }
+                    }
+                    Err(error) => shell
+                        .set_status(format!("密码保存未确认；当前会话仍使用原密码：{error}"), cx),
+                }
+            });
+        })
+        .detach();
+    }
+    fn remote_password_card(&self, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
+        let enabled = self.can_save_settings && !self.is_saving_settings;
+        ui_components::card()
+            .child(ui_components::section_header(
+                "🔑",
+                "远程访问密码",
+                "首次生成后请复制保存；重启后不能从派生密钥回显密码",
+            ))
+            .child(Self::text_field_frame(&self.local_password, window, cx))
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        ui_components::secondary_button(
+                            if self.local_password.read(cx).revealed {
+                                "隐藏"
+                            } else {
+                                "显示"
+                            },
+                            true,
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|shell, _, _, cx| {
+                                shell.local_password.update(cx, |field, cx| {
+                                    field.revealed = !field.revealed;
+                                    field.last_layout = None;
+                                    cx.notify();
+                                });
+                            }),
+                        ),
+                    )
+                    .child(
+                        ui_components::secondary_button(
+                            "复制",
+                            !self.local_password.read(cx).content.is_empty(),
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|shell, _, _, cx| {
+                                let value = shell.local_password.read(cx).content.to_string();
+                                if !value.is_empty() {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(value));
+                                    shell.set_status("已复制密码，请妥善保存", cx);
+                                }
+                            }),
+                        ),
+                    )
+                    .child(
+                        ui_components::secondary_button("保存新密码", enabled).on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|shell, _, _, cx| shell.save_remote_password(false, cx)),
+                        ),
+                    )
+                    .child(
+                        ui_components::secondary_button("重新生成", enabled).on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|shell, _, _, cx| shell.save_remote_password(true, cx)),
+                        ),
+                    ),
+            )
+    }
+    fn copy_short_id(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.local_short_id {
+            cx.write_to_clipboard(ClipboardItem::new_string(id.to_string()));
+            self.set_status("已复制本机短设备 ID", cx);
         }
     }
 
@@ -2697,19 +2930,23 @@ impl DesktopShell {
     }
 
     fn connect_peer_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let peer_is_valid = NodeId::from_hex(self.peer_id.read(cx).content.trim())
-            .ok()
-            .is_some_and(|peer| {
-                self.identity
-                    .as_ref()
-                    .is_none_or(|identity| identity.node_id() != peer)
-            });
-        let peer_is_active = NodeId::from_hex(self.peer_id.read(cx).content.trim())
-            .ok()
+        let peer_is_valid = self.selected_peer(cx).is_some_and(|peer| {
+            self.identity
+                .as_ref()
+                .is_none_or(|identity| identity.node_id() != peer)
+        });
+        let peer_is_active = self
+            .selected_peer(cx)
             .and_then(|peer| self.peer_states.get(&peer))
             .is_some_and(network_state::PeerLifecycle::is_active);
+        let peer_is_valid = peer_is_valid
+            || ShortId::normalize(self.peer_id.read(cx).content.trim())
+                .is_ok_and(|id| self.local_short_id != Some(id));
+        let password_valid =
+            SecretPassword::new(self.peer_password.read(cx).content.to_string()).is_ok();
         let enabled = self.identity.is_some()
             && self.network_session.is_some()
+            && password_valid
             && peer_is_valid
             && !peer_is_active;
         ui_components::primary_button("连接", enabled)
@@ -2717,7 +2954,7 @@ impl DesktopShell {
     }
 
     fn header_status(&self, cx: &Context<Self>) -> (String, ui_components::StatusTone) {
-        if let Ok(peer) = NodeId::from_hex(self.peer_id.read(cx).content.trim()) {
+        if let Some(peer) = self.selected_peer(cx) {
             match self.peer_states.get(&peer) {
                 Some(network_state::PeerLifecycle::Connected) => {
                     return ("已连接".into(), ui_components::StatusTone::Success);
@@ -2730,6 +2967,9 @@ impl DesktopShell {
                 }
                 Some(network_state::PeerLifecycle::Authenticating) => {
                     return ("正在认证".into(), ui_components::StatusTone::Info);
+                }
+                Some(network_state::PeerLifecycle::RemoteAuthPending) => {
+                    return ("等待密码授权".into(), ui_components::StatusTone::Info);
                 }
                 Some(network_state::PeerLifecycle::Negotiating) => {
                     return ("正在协商".into(), ui_components::StatusTone::Info);
@@ -2856,22 +3096,21 @@ impl DesktopShell {
                         ),
                     ),
             )
+            .child(self.remote_password_card(window, cx))
             .child(self.advanced_network_card(window, cx))
     }
 
     fn connection_card(&self, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
         let identity = self
-            .identity_id
-            .clone()
-            .unwrap_or_else(|| "身份不可用".to_owned());
-        let connected = NodeId::from_hex(self.peer_id.read(cx).content.trim())
-            .ok()
-            .is_some_and(|peer| {
-                matches!(
-                    self.peer_states.get(&peer),
-                    Some(network_state::PeerLifecycle::Connected)
-                )
-            });
+            .local_short_id
+            .map(|id| id.display())
+            .unwrap_or_else(|| "等待信令分配设备 ID".to_owned());
+        let connected = self.selected_peer(cx).is_some_and(|peer| {
+            matches!(
+                self.peer_states.get(&peer),
+                Some(network_state::PeerLifecycle::Connected)
+            )
+        });
 
         let local = div()
             .w_full()
@@ -2900,7 +3139,7 @@ impl DesktopShell {
                     .px(px(4.))
                     .truncate()
                     .child(identity)
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::copy_node_id)),
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::copy_short_id)),
             )
             .child(
                 div()
@@ -2915,7 +3154,7 @@ impl DesktopShell {
                     .rounded_sm()
                     .px(px(4.))
                     .child("复制")
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::copy_node_id)),
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::copy_short_id)),
             );
 
         let peer = div()
@@ -2931,7 +3170,13 @@ impl DesktopShell {
             )
             .child(self.connect_peer_button(cx));
 
-        let fields = div().flex().flex_col().gap_2().child(local).child(peer);
+        let fields = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(local)
+            .child(peer)
+            .child(Self::text_field_frame(&self.peer_password, window, cx));
 
         let mut speed_test_button = ui_components::compact_secondary_button("速度测试", connected);
         if connected {
@@ -2950,15 +3195,22 @@ impl DesktopShell {
         );
 
         ui_components::card()
-            .h(px(184.))
+            .h(px(224.))
             .p(px(12.))
             .gap_2()
             .child(ui_components::section_header(
                 "↔",
                 "连接设备",
-                "输入完整设备 ID，等待身份认证后开始传输",
+                "输入对端短设备 ID 和远程密码，授权后开始传输",
             ))
             .child(fields)
+            .when(!self.local_password.read(cx).content.is_empty(), |card| {
+                card.child(
+                    div()
+                        .text_xs()
+                        .child("已生成本机密码：在设置中显示、复制并保存"),
+                )
+            })
             .child(
                 div()
                     .w_full()
@@ -2969,14 +3221,12 @@ impl DesktopShell {
     }
 
     fn transfer_card(&mut self, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
-        let connected = NodeId::from_hex(self.peer_id.read(cx).content.trim())
-            .ok()
-            .is_some_and(|peer| {
-                matches!(
-                    self.peer_states.get(&peer),
-                    Some(network_state::PeerLifecycle::Connected)
-                )
-            });
+        let connected = self.selected_peer(cx).is_some_and(|peer| {
+            matches!(
+                self.peer_states.get(&peer),
+                Some(network_state::PeerLifecycle::Connected)
+            )
+        });
         let speed_running = self
             .speed_views
             .0
@@ -3188,15 +3438,12 @@ impl DesktopShell {
             .filter(|(_, view)| view.snapshot.status == speed::SpeedStatus::Running);
         let running = running_view.is_some();
         let waiting = self.speed_request_until.is_some() && !running;
-        let can_start = NodeId::from_hex(self.peer_id.read(cx).content.trim())
-            .ok()
-            .is_some_and(|peer| {
-                matches!(
-                    self.peer_states.get(&peer),
-                    Some(network_state::PeerLifecycle::Connected)
-                )
-            })
-            && self.transfer_service.is_some()
+        let can_start = self.selected_peer(cx).is_some_and(|peer| {
+            matches!(
+                self.peer_states.get(&peer),
+                Some(network_state::PeerLifecycle::Connected)
+            )
+        }) && self.transfer_service.is_some()
             && !running
             && !waiting;
         let editing_enabled = !self.is_saving_settings;
@@ -4252,6 +4499,7 @@ pub fn run() {
             config_note,
             can_save_settings,
             has_saved_network_config,
+            initial_password,
         } = startup;
         let initial_status = if task_store.is_none() || !task_store_status.contains("已就绪") {
             task_store_status.clone()
@@ -4294,6 +4542,7 @@ pub fn run() {
         } else {
             "本机身份不可用；网络会话未启动".to_owned()
         };
+        let show_initial_password = initial_password.is_some();
         let window = cx.open_window(
             WindowOptions {
                 titlebar: Some(gpui::TitlebarOptions {
@@ -4306,7 +4555,17 @@ pub fn run() {
                 ..Default::default()
             },
             move |_, cx| {
-                let peer_id = cx.new(|cx| TextField::new(cx, "输入对方 ID"));
+                let peer_id = cx.new(|cx| TextField::new(cx, "输入 9 位对方 ID"));
+                let peer_password = cx.new(|cx| TextField::new_password(cx, "对方的远程访问密码"));
+                let local_password = cx.new(|cx| {
+                    let mut field = TextField::new_password(cx, "已设置；输入 6～12 位新密码");
+                    if let Some(password) = initial_password {
+                        field.content = password.expose().to_owned().into();
+                        field.revealed = true;
+                        field.selected_range = field.content.len()..field.content.len();
+                    }
+                    field
+                });
                 let concurrency_input =
                     cx.new(|cx| TextField::new_concurrency_value(cx, initial_concurrency));
                 let signal_host = cx.new(|cx| {
@@ -4347,6 +4606,10 @@ pub fn run() {
                     .detach();
                     DesktopShell {
                         peer_id,
+                        peer_password,
+                        local_password,
+                        local_short_id: None,
+                        resolved_peer: None,
                         concurrency_input,
                         signal_host,
                         signal_port,
@@ -4391,7 +4654,7 @@ pub fn run() {
                         show_speed_test_panel: false,
                         show_speed_duration_menu: false,
                         show_settings: !has_saved_network_config,
-                        show_settings_home: false,
+                        show_settings_home: show_initial_password,
                         pending_resumes: HashMap::new(),
                         applied_receive_root: initial_receive_root,
                         task_scroll: Default::default(),
@@ -4433,9 +4696,17 @@ pub fn run() {
 mod tests {
     use super::{
         concurrency_value_replacement, marked_selection_to_utf8, mouse_index_for_layout,
-        utf8_offset_from_utf16, utf16_offset_from_utf8,
+        password_display, utf8_offset_from_utf16, utf16_offset_from_utf8,
     };
 
+    #[test]
+    fn password_display_masks_ascii_without_changing_cursor_offsets() {
+        let value = "A9b8C7";
+        assert_eq!(password_display(value, false), "******");
+        assert_eq!(password_display(value, true), value);
+        assert_eq!(password_display(value, false).len(), value.len());
+        assert_eq!(password_display("", false), "");
+    }
     #[test]
     fn concurrency_input_only_accepts_single_values_from_one_to_three() {
         assert_eq!(

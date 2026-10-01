@@ -53,6 +53,7 @@ fn start(
         include_loopback: true,
         ..Default::default()
     };
+    conf.remote_auth = draft.remote_auth.clone();
     conf.transfer = Some(service);
     session::spawn(identity, conf).unwrap()
 }
@@ -127,6 +128,14 @@ fn actor(root: PathBuf) {
         let result: Result<Value, String> = (|| match command {
             "configure" => {
                 let addr: SocketAddr = str_field(&v, "signal").parse().unwrap();
+                if draft.remote_auth.is_none() {
+                    draft.remote_auth = Some(
+                        super::remote_auth::RemoteVerifier::create(
+                            &super::remote_auth::SecretPassword::new("Test9Pass".into()).unwrap(),
+                        )
+                        .unwrap(),
+                    );
+                }
                 draft.signal_host = addr.ip().to_string();
                 draft.signal_port = addr.port().to_string();
                 draft
@@ -414,7 +423,7 @@ impl Server {
                     tx.send(listener.local_addr().unwrap()).unwrap();
                     let job = tokio::spawn(crate::discovery::signal::run_signal_server_on_with(
                         listener,
-                        Default::default(),
+                        crate::discovery::signal::SignalServerConfig::for_tests(),
                     ));
                     let _ = stopped.await;
                     job.abort();

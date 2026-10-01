@@ -22,6 +22,9 @@ use crate::transport::quic::{
     QUIC_HANDSHAKE_TIMEOUT, connect as quic_connect,
 };
 
+use super::remote_auth::{AuthContext, RemoteVerifier, SecretPassword};
+use crate::discovery::short_id::ShortId;
+
 use super::network_state::{
     BeginPeerAttempt, MAX_PENDING_PEERS, NetworkLifecycle, PeerLifecycle, PeerRegistry,
     reconnect_delay, should_initiate_quic,
@@ -45,6 +48,9 @@ fn is_current_signal_generation(current: u64, result_generation: u64) -> bool {
 #[derive(Clone, Debug)]
 pub struct DesktopSessionConfig {
     pub signal_server: String,
+    pub remote_auth: Option<RemoteVerifier>,
+    #[cfg(test)]
+    pub test_outgoing_password: Option<SecretPassword>,
     pub network: DesktopNetworkConfig,
     pub allowed_forward_targets: Vec<super::config::AllowedForwardTarget>,
     pub tunnel_rules: Vec<super::config::TunnelRule>,
@@ -55,6 +61,9 @@ impl DesktopSessionConfig {
     pub fn new(signal_server: impl Into<String>) -> Self {
         Self {
             signal_server: signal_server.into(),
+            remote_auth: None,
+            #[cfg(test)]
+            test_outgoing_password: None,
             network: DesktopNetworkConfig::default(),
             allowed_forward_targets: Vec::new(),
             tunnel_rules: Vec::new(),
@@ -80,6 +89,11 @@ pub enum SessionEvent {
         state: PeerLifecycle,
     },
     SignalIdentityRegistered(NodeId),
+    ShortIdRegistered(ShortId),
+    ShortIdResolved {
+        short_id: ShortId,
+        peer: Option<NodeId>,
+    },
     Diagnostic(String),
     SelectionQueued {
         peer: NodeId,
@@ -164,10 +178,38 @@ impl Drop for SessionLifetime {
 }
 
 impl DesktopSessionHandle {
+    #[cfg(test)]
     pub fn connect_peer(&self, peer: NodeId) -> std::result::Result<(), String> {
+        self.connect_peer_with_password(peer, test_password())
+    }
+    pub fn connect_peer_with_password(
+        &self,
+        peer: NodeId,
+        password: SecretPassword,
+    ) -> std::result::Result<(), String> {
         self.commands
-            .try_send(SessionCommand::ConnectPeer(peer))
-            .map_err(|error| format!("网络会话暂时无法接收连接请求：{error}"))
+            .try_send(SessionCommand::ConnectAuthenticated { peer, password })
+            .map_err(|_| "网络会话暂时无法接收连接请求".into())
+    }
+    pub fn connect_short_id(
+        &self,
+        short_id: ShortId,
+        password: SecretPassword,
+    ) -> std::result::Result<(), String> {
+        self.commands
+            .try_send(SessionCommand::ConnectShort { short_id, password })
+            .map_err(|_| "网络会话暂时无法接收短 ID 查询".into())
+    }
+    pub async fn update_remote_auth(
+        &self,
+        verifier: RemoteVerifier,
+    ) -> std::result::Result<(), String> {
+        let (done, finished) = oneshot::channel();
+        self.commands
+            .send(SessionCommand::UpdateRemoteAuth { verifier, done })
+            .await
+            .map_err(|_| "网络会话已经关闭".to_owned())?;
+        finished.await.map_err(|_| "网络会话已经关闭".into())
     }
 
     pub fn reconfigure_signal(&self, server: impl Into<String>) -> std::result::Result<(), String> {
@@ -337,6 +379,18 @@ enum SessionCommand {
         id: super::task_model::TaskId,
     },
     ConnectPeer(NodeId),
+    ConnectAuthenticated {
+        peer: NodeId,
+        password: SecretPassword,
+    },
+    ConnectShort {
+        short_id: ShortId,
+        password: SecretPassword,
+    },
+    UpdateRemoteAuth {
+        verifier: RemoteVerifier,
+        done: oneshot::Sender<()>,
+    },
     ReconfigureSignal(String),
     StartTunnel(String),
     StopTunnel(String),
@@ -350,6 +404,18 @@ enum SessionCommand {
     },
     #[cfg(test)]
     Inspect(oneshot::Sender<HashMap<NodeId, (u64, quinn::Connection)>>),
+}
+
+impl SessionCommand {
+    fn business_peer(&self) -> Option<NodeId> {
+        match self {
+            Self::SendFile { peer, .. }
+            | Self::SendDirectory { peer, .. }
+            | Self::ResumeTask { peer, .. }
+            | Self::StartSpeed { peer, .. } => Some(*peer),
+            _ => None,
+        }
+    }
 }
 
 enum SessionInput {
@@ -490,6 +556,10 @@ async fn run_session(
         }
     };
 
+    let mut remote_verifier = config.remote_auth.clone();
+    let auth_context = AuthContext::default();
+    let mut credentials: HashMap<NodeId, SecretPassword> = HashMap::new();
+    let mut short_queries: HashMap<ShortId, (SecretPassword, time::Instant)> = HashMap::new();
     let local_node = identity.node_id();
     let endpoint = network.endpoint.clone();
     let (input_tx, mut inputs) = mpsc::channel(SESSION_INPUT_CAPACITY);
@@ -612,6 +682,24 @@ async fn run_session(
             task = tunnel_tasks.join_next(), if !tunnel_tasks.is_empty() => Wake::TunnelTask(task),
         };
 
+        // One authorization gate covers outgoing sensitive commands. Local cancellation,
+        // settings, and listener startup remain available while a peer is unavailable.
+        if let Wake::Command(Some(command)) = &wake
+            && let Some(peer) = command.business_peer()
+            && !connections
+                .get(&peer)
+                .is_some_and(|(_, connection)| connection.close_reason().is_none())
+        {
+            let _ = events
+                .send(SessionEvent::Diagnostic(
+                    "远程访问尚未授权；请先连接设备并完成密码认证".into(),
+                ))
+                .await;
+            if matches!(command, SessionCommand::StartSpeed { .. }) {
+                let _ = events.send(SessionEvent::SpeedRequestEnded { peer }).await;
+            }
+            continue;
+        }
         match wake {
             #[cfg(test)]
             Wake::Command(Some(SessionCommand::Inspect(reply))) => {
@@ -808,6 +896,45 @@ async fn run_session(
                     }
                 });
             }
+            Wake::Command(Some(SessionCommand::ConnectAuthenticated { peer, password })) => {
+                if credentials.len() >= super::network_state::MAX_PEERS
+                    && !credentials.contains_key(&peer)
+                {
+                    let _ = events
+                        .send(SessionEvent::Diagnostic(
+                            "连接凭据数量已达上限，请重启会话后重试".into(),
+                        ))
+                        .await;
+                    continue;
+                }
+                credentials.insert(peer, password);
+                let _ = command_tx.try_send(SessionCommand::ConnectPeer(peer));
+            }
+            Wake::Command(Some(SessionCommand::ConnectShort { short_id, password })) => {
+                if short_queries.len() >= MAX_PENDING_PEERS || short_queries.contains_key(&short_id)
+                {
+                    let _ = events
+                        .send(SessionEvent::Diagnostic(
+                            "短 ID 查询已在进行或达到上限".into(),
+                        ))
+                        .await;
+                    continue;
+                }
+                if let Some(client) = signal.as_ref()
+                    && client.request_short_lookup(short_id).await.is_ok()
+                {
+                    short_queries.insert(short_id, (password, time::Instant::now()));
+                    let _ = events
+                        .send(SessionEvent::Diagnostic("正在查询短设备 ID".into()))
+                        .await;
+                    continue;
+                }
+                let _ = events
+                    .send(SessionEvent::Diagnostic(
+                        "信令尚未就绪，无法查询短设备 ID".into(),
+                    ))
+                    .await;
+            }
             Wake::Command(Some(SessionCommand::ConnectPeer(peer))) => {
                 if peer == local_node {
                     let _ = events
@@ -864,12 +991,31 @@ async fn run_session(
                     }
                 }
             }
-            Wake::Command(Some(SessionCommand::ReconfigureSignal(server))) => {
-                signal_server = server;
+            Wake::Command(Some(
+                command @ (SessionCommand::ReconfigureSignal(_)
+                | SessionCommand::UpdateRemoteAuth { .. }),
+            )) => {
+                let mut auth_updated = None;
+                match command {
+                    SessionCommand::ReconfigureSignal(server) => {
+                        signal_server = server;
+                        credentials.clear();
+                    }
+                    SessionCommand::UpdateRemoteAuth { verifier, done } => {
+                        credentials.clear();
+                        remote_verifier = Some(verifier);
+                        auth_updated = Some(done);
+                    }
+                    _ => unreachable!(),
+                }
+                short_queries.clear();
                 peer_candidates.clear();
                 signal_generation = signal_generation.wrapping_add(1);
                 // An explicit server change supersedes this generation's attempts
                 // and authenticated peers. An involuntary outage below preserves them.
+                for (_, (_, connection)) in connections.drain() {
+                    connection.close(0u32.into(), b"desktop network reconfigured");
+                }
                 peer_tasks.abort_all();
                 while peer_tasks.join_next().await.is_some() {}
                 if let Some(service) = &config.transfer {
@@ -877,9 +1023,6 @@ async fn run_session(
                 }
                 pending_inbound.clear();
                 queued_lookups.clear();
-                for (_, (_, connection)) in connections.drain() {
-                    connection.close(0u32.into(), b"desktop network reconfigured");
-                }
                 peer_capabilities.clear();
                 for update in peer_connection_updates.values() {
                     update.send_replace(None);
@@ -916,6 +1059,9 @@ async fn run_session(
                     &mut connect_task,
                     &mut session_tasks,
                 );
+                if let Some(done) = auth_updated {
+                    let _ = done.send(());
+                }
             }
             Wake::Command(Some(SessionCommand::StartTunnel(rule_id))) => {
                 let Some(rule) = tunnel_rules.get(&rule_id).cloned() else {
@@ -1098,10 +1244,47 @@ async fn run_session(
                         &mut peers,
                         &mut pending_inbound,
                         &mut peer_tasks,
+                        auth_context.clone(),
+                        remote_verifier.clone(),
+                        credentials.get(&node_id).cloned().or_else(|| {
+                            #[cfg(test)]
+                            {
+                                config.test_outgoing_password.clone()
+                            }
+                            #[cfg(not(test))]
+                            {
+                                None
+                            }
+                        }),
                     )
                     .await
                     {
                         peer_candidates.insert(node_id, (generation, canonical));
+                    }
+                }
+                SignalMessage::ShortResolved { short_id, node_id } => {
+                    if let Some((password, _)) = short_queries.remove(&short_id) {
+                        let _ = events
+                            .send(SessionEvent::ShortIdResolved {
+                                short_id,
+                                peer: node_id,
+                            })
+                            .await;
+                        if let Some(peer) = node_id {
+                            if peer != local_node
+                                && (credentials.len() < super::network_state::MAX_PEERS
+                                    || credentials.contains_key(&peer))
+                            {
+                                credentials.insert(peer, password);
+                                let _ = command_tx.try_send(SessionCommand::ConnectPeer(peer));
+                            }
+                        } else {
+                            let _ = events
+                                .send(SessionEvent::Diagnostic(
+                                    "短 ID 无法解析或查询暂时受限".into(),
+                                ))
+                                .await;
+                        }
                     }
                 }
                 SignalMessage::Error { reason } => {
@@ -1159,6 +1342,9 @@ async fn run_session(
                 match result {
                     Ok(client) => {
                         let registered_node = client.node_id();
+                        if let Some(short_id) = client.short_id() {
+                            let _ = events.send(SessionEvent::ShortIdRegistered(short_id)).await;
+                        }
                         signal = Some(client);
                         reconnect_attempt = 0;
                         reconnect_sleep = None;
@@ -1394,6 +1580,22 @@ async fn run_session(
             }
             Wake::QueueChanged => {}
             Wake::Maintenance => {
+                let expired = short_queries
+                    .iter()
+                    .filter(|(_, (_, started))| {
+                        started.elapsed() >= super::network_state::PEER_LOOKUP_TIMEOUT
+                    })
+                    .map(|(id, _)| *id)
+                    .collect::<Vec<_>>();
+                for short_id in expired {
+                    short_queries.remove(&short_id);
+                    let _ = events
+                        .send(SessionEvent::ShortIdResolved {
+                            short_id,
+                            peer: None,
+                        })
+                        .await;
+                }
                 for (peer, generation) in peers.expired_lookups(time::Instant::now()) {
                     let state = PeerLifecycle::Failed("目标离线或候选等待超时，请重试连接".into());
                     if peers.transition(peer, generation, state.clone()) {
@@ -1739,7 +1941,8 @@ fn start_signal_connect(
     let candidates = candidates.to_vec();
     *task = Some(tasks.spawn(async move {
         let result =
-            SignalingClient::connect_with_events(&signal_server, &identity, candidates).await;
+            SignalingClient::connect_desktop_with_events(&signal_server, &identity, candidates)
+                .await;
         let _ = inputs
             .send(SessionInput::SignalConnected { generation, result })
             .await;
@@ -1836,6 +2039,9 @@ async fn start_peer_attempt(
     peers: &mut PeerRegistry,
     pending_inbound: &mut HashMap<(NodeId, u64), oneshot::Sender<quinn::Incoming>>,
     tasks: &mut JoinSet<()>,
+    auth: AuthContext,
+    verifier: Option<RemoteVerifier>,
+    password: Option<SecretPassword>,
 ) -> Option<u64> {
     if peer == local_node {
         return None;
@@ -1910,6 +2116,9 @@ async fn start_peer_attempt(
             inbound_rx,
             permit,
             input_sender.clone(),
+            auth,
+            verifier,
+            password,
         )
         .await;
         if let Err(detail) = result {
@@ -1938,6 +2147,9 @@ async fn run_peer_attempt(
     inbound: oneshot::Receiver<quinn::Incoming>,
     _pending_permit: tokio::sync::OwnedSemaphorePermit,
     inputs: mpsc::Sender<SessionInput>,
+    auth: AuthContext,
+    verifier: Option<RemoteVerifier>,
+    password: Option<SecretPassword>,
 ) -> std::result::Result<(), String> {
     let mut probe_events = punch_socket
         .register_peer_probe(&token, peer, generation)
@@ -1981,6 +2193,33 @@ async fn run_peer_attempt(
             .await
             .map_err(|error| error.to_string())?;
 
+    let _ = inputs
+        .send(SessionInput::PeerProgress {
+            peer,
+            generation,
+            state: PeerLifecycle::RemoteAuthPending,
+        })
+        .await;
+    let authorization = match verifier {
+        Some(verifier) => {
+            auth.authorize(
+                &connection,
+                should_initiate_quic(local_node, peer),
+                local_node,
+                peer,
+                verifier,
+                password,
+                capabilities,
+            )
+            .await
+        }
+        None => Err(Error::Protocol("本机远程访问密码尚未初始化".into())),
+    };
+    if let Err(error) = authorization {
+        connection.close(3u32.into(), b"remote authorization failed");
+        return Err(error.to_string());
+    }
+    // No business stream handler or listener availability is published before this point.
     inputs
         .send(SessionInput::PeerConnected {
             peer,
@@ -2098,6 +2337,18 @@ async fn authenticate_incoming(
 }
 
 #[cfg(test)]
+fn test_password() -> SecretPassword {
+    SecretPassword::new("Test9Pass".into()).unwrap()
+}
+#[cfg(test)]
+fn test_verifier() -> RemoteVerifier {
+    static VERIFIER: std::sync::OnceLock<RemoteVerifier> = std::sync::OnceLock::new();
+    VERIFIER
+        .get_or_init(|| RemoteVerifier::create(&test_password()).unwrap())
+        .clone()
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
@@ -2106,12 +2357,206 @@ mod tests {
     use tokio::task::JoinHandle;
 
     use super::*;
-    use crate::discovery::signal::{
-        SignalServerConfig, run_signal_server_on, run_signal_server_on_with,
-    };
+    use crate::discovery::signal::{SignalServerConfig, run_signal_server_on_with};
 
+    fn auth_config(server: SocketAddr) -> DesktopSessionConfig {
+        let mut config = local_config(server);
+        config.test_outgoing_password = None;
+        config
+    }
+    async fn wait_failed(events: &mut mpsc::Receiver<SessionEvent>) {
+        time::timeout(Duration::from_secs(20), async {
+            while let Some(event) = events.recv().await {
+                match event {
+                    SessionEvent::PeerState {
+                        state: PeerLifecycle::Connected,
+                        ..
+                    } => panic!("unauthorized peer was published"),
+                    SessionEvent::PeerState {
+                        state: PeerLifecycle::Failed(_),
+                        ..
+                    } => return,
+                    _ => {}
+                }
+            }
+            panic!("session ended before failure");
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn unauthorized_file_directory_resume_and_speed_commands_cannot_start_business() {
+        use super::super::{task_store::TaskStore, transfer::TransferService};
+        let root =
+            std::env::temp_dir().join(format!("p2p-auth-gate-{:032x}", rand::random::<u128>()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(root.join("receive")).unwrap();
+        let (store, _) = TaskStore::open(&root.join("state/tasks.json")).unwrap();
+        let service = TransferService::new(store, root.join("receive"));
+        let (address, server) = start_local_server().await;
+        let mut config = auth_config(address);
+        config.transfer = Some(service.clone());
+        let (handle, mut events) = spawn(Identity::generate(), config).unwrap();
+        wait_signal_online(&mut events).await;
+        let peer = Identity::generate().node_id();
+        let source = root.join("source.txt");
+        std::fs::write(&source, b"sensitive").unwrap();
+        handle.send_file(peer, source).unwrap();
+        handle.send_directory(peer, root.join("receive")).unwrap();
+        handle
+            .resume_task(peer, super::super::task_model::TaskId::generate())
+            .unwrap();
+        handle
+            .start_speed(peer, super::super::config::SpeedtestDirection::Upload, 30)
+            .unwrap();
+        time::timeout(Duration::from_secs(3), async {
+            let mut rejected = 0;
+            while rejected < 4 {
+                if let Some(SessionEvent::Diagnostic(message)) = events.recv().await
+                    && message.contains("远程访问尚未授权")
+                {
+                    rejected += 1;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(service.snapshot().await.unwrap().is_empty());
+        assert!(inspect(&handle).await.is_empty());
+        assert_eq!(std::fs::read_dir(root.join("receive")).unwrap().count(), 0);
+        handle.shutdown();
+        drop(handle);
+        server.abort();
+        let _ = server.await;
+        drop(service);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn wrong_password_never_publishes_business_connection_or_running_tunnel() {
+        let (address, server) = start_local_server().await;
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reserve = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = reserve.local_addr().unwrap();
+        drop(reserve);
+        let mut config = auth_config(address);
+        let mut rule = super::super::config::TunnelRule::new(
+            "protected",
+            b.node_id().to_hex(),
+            local.port(),
+            target.local_addr().unwrap(),
+        );
+        rule.auto_start = true;
+        let rule_id = rule.id.clone();
+        config.tunnel_rules.push(rule);
+        let mut destination = auth_config(address);
+        destination
+            .allowed_forward_targets
+            .push(super::super::config::AllowedForwardTarget::new(
+                "protected",
+                target.local_addr().unwrap(),
+                vec![a.node_id().to_hex()],
+            ));
+        let (ha, mut ea) = spawn(a.clone(), config).unwrap();
+        let (hb, mut eb) = spawn(b.clone(), destination).unwrap();
+        wait_signal_online(&mut ea).await;
+        wait_signal_online(&mut eb).await;
+        // Auto start without an explicitly supplied credential must fail closed.
+        wait_failed(&mut ea).await;
+        wait_failed(&mut eb).await;
+        assert!(inspect(&ha).await.is_empty());
+        assert!(inspect(&hb).await.is_empty());
+        ha.connect_peer_with_password(b.node_id(), SecretPassword::new("Wrong9".into()).unwrap())
+            .unwrap();
+        wait_failed(&mut ea).await;
+        wait_failed(&mut eb).await;
+        assert!(inspect(&ha).await.is_empty());
+        assert!(inspect(&hb).await.is_empty());
+        assert!(
+            time::timeout(Duration::from_secs(1), target.accept())
+                .await
+                .is_err()
+        );
+        // Allow all lifecycle notifications to settle, then verify the listener has actually gone.
+        ha.revoke_tunnel_rule(rule_id, true).await.unwrap();
+        assert!(tokio::net::TcpStream::connect(local).await.is_err());
+        ha.shutdown();
+        hb.shutdown();
+        server.abort();
+    }
+    #[tokio::test]
+    async fn short_id_connect_authenticates_then_rotation_revokes_and_old_password_fails() {
+        let (address, server) = start_local_server().await;
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let (ha, mut ea) = spawn(a.clone(), auth_config(address)).unwrap();
+        let short_a = time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(SessionEvent::ShortIdRegistered(id)) = ea.recv().await {
+                    break id;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        wait_signal_online(&mut ea).await;
+        let (hb, mut eb) = spawn(b.clone(), auth_config(address)).unwrap();
+        let short_b = time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(SessionEvent::ShortIdRegistered(id)) = eb.recv().await {
+                    break id;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        wait_signal_online(&mut eb).await;
+        assert_ne!(short_a, short_b);
+        ha.connect_short_id(short_b, test_password()).unwrap();
+        wait_connected(&mut ea, &[b.node_id()]).await;
+        wait_connected(&mut eb, &[a.node_id()]).await;
+        let old = inspect(&ha).await[&b.node_id()].1.clone();
+        let changed = SecretPassword::new("Changed9".into()).unwrap();
+        hb.update_remote_auth(RemoteVerifier::create(&changed).unwrap())
+            .await
+            .unwrap();
+        assert!(inspect(&hb).await.is_empty());
+        time::timeout(Duration::from_secs(5), old.closed())
+            .await
+            .unwrap();
+        // Wait until the old generation is retired on A; its authorization cannot carry over.
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                if inspect(&ha).await.is_empty() {
+                    break;
+                }
+                time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        while ea.try_recv().is_ok() {}
+        while eb.try_recv().is_ok() {}
+        ha.connect_peer_with_password(b.node_id(), test_password())
+            .unwrap();
+        wait_failed(&mut ea).await;
+        wait_failed(&mut eb).await;
+        assert!(inspect(&ha).await.is_empty());
+        while eb.try_recv().is_ok() {}
+        ha.connect_peer_with_password(b.node_id(), changed).unwrap();
+        wait_connected(&mut ea, &[b.node_id()]).await;
+        wait_connected(&mut eb, &[a.node_id()]).await;
+        assert_ne!(
+            inspect(&ha).await[&b.node_id()].1.stable_id(),
+            old.stable_id()
+        );
+        ha.shutdown();
+        hb.shutdown();
+        server.abort();
+    }
     async fn start_local_server() -> (SocketAddr, JoinHandle<()>) {
-        start_local_server_with(SignalServerConfig::default()).await
+        start_local_server_with(SignalServerConfig::for_tests()).await
     }
 
     async fn start_local_server_with(config: SignalServerConfig) -> (SocketAddr, JoinHandle<()>) {
@@ -2126,6 +2571,8 @@ mod tests {
     fn local_config(signal_server: SocketAddr) -> DesktopSessionConfig {
         DesktopSessionConfig {
             signal_server: signal_server.to_string(),
+            remote_auth: Some(test_verifier()),
+            test_outgoing_password: Some(test_password()),
             allowed_forward_targets: Vec::new(),
             tunnel_rules: Vec::new(),
             transfer: None,
@@ -2278,7 +2725,7 @@ mod tests {
     async fn signal_restart_re_registers_the_same_identity_after_bounded_backoff() {
         let (signal_server, server) = start_local_server_with(SignalServerConfig {
             idle_timeout: Duration::from_millis(250),
-            ..SignalServerConfig::default()
+            ..SignalServerConfig::for_tests()
         })
         .await;
         let identity = Identity::generate();
@@ -2302,7 +2749,7 @@ mod tests {
 
         let listener = TcpListener::bind(signal_server).await.unwrap();
         let restarted_server = tokio::spawn(async move {
-            let _ = run_signal_server_on(listener).await;
+            let _ = run_signal_server_on_with(listener, SignalServerConfig::for_tests()).await;
         });
         time::timeout(Duration::from_secs(12), async {
             while let Some(event) = events.recv().await {

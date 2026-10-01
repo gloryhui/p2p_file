@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const APP_DIR_NAME: &str = "p2p_file";
-const CONFIG_SCHEMA_VERSION: u32 = 3;
+const CONFIG_SCHEMA_VERSION: u32 = 4;
 const LEGACY_CONFIG_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Error)]
@@ -105,6 +105,7 @@ pub struct SettingsDraft {
     pub speedtest_direction: SpeedtestDirection,
     pub allowed_forward_targets: Vec<AllowedForwardTarget>,
     pub tunnel_rules: Vec<TunnelRule>,
+    pub remote_auth: Option<super::remote_auth::RemoteVerifier>,
 }
 
 /// A local TCP service that authenticated peers may reach through this device.
@@ -193,6 +194,7 @@ impl SettingsDraft {
             speedtest_direction: SpeedtestDirection::Both,
             allowed_forward_targets: Vec::new(),
             tunnel_rules: Vec::new(),
+            remote_auth: None,
         }
     }
 
@@ -204,14 +206,23 @@ impl SettingsDraft {
             direction => direction,
         };
         Self {
-            signal_host: config.signal.host,
-            signal_port: config.signal.port.to_string(),
-            receive_directory: Some(config.receive_directory),
+            signal_host: config
+                .signal
+                .as_ref()
+                .map(|s| s.host.clone())
+                .unwrap_or_default(),
+            signal_port: config
+                .signal
+                .as_ref()
+                .map(|s| s.port.to_string())
+                .unwrap_or_default(),
+            receive_directory: config.receive_directory,
             send_concurrency: config.send_concurrency,
             speedtest_seconds: config.speedtest_seconds,
             speedtest_direction,
             allowed_forward_targets: config.allowed_forward_targets,
             tunnel_rules: config.tunnel_rules,
+            remote_auth: config.remote_auth,
         }
     }
 
@@ -235,16 +246,17 @@ impl SettingsDraft {
 
         let config = DesktopConfig {
             schema_version: CONFIG_SCHEMA_VERSION,
-            signal: SignalConfig {
+            signal: Some(SignalConfig {
                 host: host.to_owned(),
                 port,
-            },
-            receive_directory: receive_directory.clone(),
+            }),
+            receive_directory: Some(receive_directory.clone()),
             send_concurrency: self.send_concurrency,
             speedtest_seconds: self.speedtest_seconds,
             speedtest_direction: self.speedtest_direction,
             allowed_forward_targets: self.allowed_forward_targets.clone(),
             tunnel_rules: self.tunnel_rules.clone(),
+            remote_auth: self.remote_auth.clone(),
         };
         config.validate()?;
         Ok(config)
@@ -252,7 +264,19 @@ impl SettingsDraft {
 
     pub fn save_atomic(&self, path: &Path) -> Result<(), ConfigError> {
         let config = self.to_config()?;
-        validate_receive_directory(&config.receive_directory)?;
+        validate_receive_directory(
+            config
+                .receive_directory
+                .as_deref()
+                .expect("validated receive directory"),
+        )?;
+        config.write_atomic(path)
+    }
+}
+
+impl DesktopConfig {
+    fn write_atomic(&self, path: &Path) -> Result<(), ConfigError> {
+        self.validate()?;
 
         let parent = path
             .parent()
@@ -269,7 +293,7 @@ impl SettingsDraft {
             }
         }
 
-        let bytes = serde_json::to_vec_pretty(&config)?;
+        let bytes = serde_json::to_vec_pretty(self)?;
         let temp_path = write_config_temp(path, parent, &bytes)?;
         if let Err(error) = fs::rename(&temp_path, path) {
             let _ = fs::remove_file(&temp_path);
@@ -284,8 +308,8 @@ impl SettingsDraft {
 #[serde(deny_unknown_fields)]
 pub struct DesktopConfig {
     schema_version: u32,
-    signal: SignalConfig,
-    receive_directory: PathBuf,
+    signal: Option<SignalConfig>,
+    receive_directory: Option<PathBuf>,
     send_concurrency: u8,
     speedtest_seconds: u16,
     speedtest_direction: SpeedtestDirection,
@@ -293,6 +317,8 @@ pub struct DesktopConfig {
     allowed_forward_targets: Vec<AllowedForwardTarget>,
     #[serde(default)]
     tunnel_rules: Vec<TunnelRule>,
+    #[serde(default)]
+    remote_auth: Option<super::remote_auth::RemoteVerifier>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -314,6 +340,30 @@ struct SignalConfig {
 }
 
 impl DesktopConfig {
+    pub fn has_network_config(&self) -> bool {
+        self.signal.is_some()
+    }
+    pub fn save_remote_auth(
+        path: &Path,
+        verifier: super::remote_auth::RemoteVerifier,
+    ) -> Result<(), ConfigError> {
+        let mut config = match Self::load(path)? {
+            Some(config) => config,
+            None => Self {
+                schema_version: CONFIG_SCHEMA_VERSION,
+                signal: None,
+                receive_directory: None,
+                send_concurrency: 1,
+                speedtest_seconds: 30,
+                speedtest_direction: SpeedtestDirection::Both,
+                allowed_forward_targets: Vec::new(),
+                tunnel_rules: Vec::new(),
+                remote_auth: None,
+            },
+        };
+        config.remote_auth = Some(verifier);
+        config.write_atomic(path)
+    }
     pub fn load(path: &Path) -> Result<Option<Self>, ConfigError> {
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
@@ -343,18 +393,24 @@ impl DesktopConfig {
                 }
                 Self {
                     schema_version: CONFIG_SCHEMA_VERSION,
-                    signal: legacy.signal,
-                    receive_directory: legacy.receive_directory,
+                    signal: Some(legacy.signal),
+                    receive_directory: Some(legacy.receive_directory),
                     send_concurrency: legacy.send_concurrency,
                     speedtest_seconds: legacy.speedtest_seconds,
                     speedtest_direction: legacy.speedtest_direction,
                     allowed_forward_targets: Vec::new(),
                     tunnel_rules: Vec::new(),
+                    remote_auth: None,
                 }
             }
-            2 | CONFIG_SCHEMA_VERSION => {
+            2 | 3 | CONFIG_SCHEMA_VERSION => {
                 let mut config = serde_json::from_slice::<Self>(&bytes)
                     .map_err(|error| ConfigError::Corrupt(error.to_string()))?;
+                if version < CONFIG_SCHEMA_VERSION
+                    && (config.signal.is_none() || config.receive_directory.is_none())
+                {
+                    return Err(ConfigError::Corrupt("旧配置缺少信令或接收目录".into()));
+                }
                 // v2 had target-only grants. Preserve rows, but require explicit peer authorization.
                 if version == 2 {
                     for entry in &mut config.allowed_forward_targets {
@@ -383,17 +439,26 @@ impl DesktopConfig {
                 self.schema_version
             )));
         }
-        validate_signal_host(&self.signal.host)?;
-        if self.signal.port == 0 {
-            return Err(ConfigError::Invalid("信令端口必须在 1..65535 内".into()));
+        if let Some(signal) = &self.signal {
+            validate_signal_host(&signal.host)?;
+            if signal.port == 0 {
+                return Err(ConfigError::Invalid("信令端口必须在 1..65535 内".into()));
+            }
         }
         validate_send_concurrency(self.send_concurrency)?;
         validate_speedtest_seconds(self.speedtest_seconds)?;
-        if !self.receive_directory.is_absolute() {
-            return Err(ConfigError::Invalid("接收目录必须是绝对路径".into()));
+        if let Some(directory) = &self.receive_directory {
+            if !directory.is_absolute() {
+                return Err(ConfigError::Invalid("接收目录必须是绝对路径".into()));
+            }
+            if directory.to_str().is_none() {
+                return Err(ConfigError::UnsupportedPathEncoding);
+            }
         }
-        if self.receive_directory.to_str().is_none() {
-            return Err(ConfigError::UnsupportedPathEncoding);
+        if let Some(verifier) = &self.remote_auth {
+            verifier
+                .validate()
+                .map_err(|_| ConfigError::Invalid("不支持的远程认证版本".into()))?;
         }
         validate_forward_configuration(&self.allowed_forward_targets, &self.tunnel_rules)?;
         Ok(())
@@ -794,9 +859,61 @@ mod tests {
             speedtest_direction: SpeedtestDirection::Upload,
             allowed_forward_targets: Vec::new(),
             tunnel_rules: Vec::new(),
+            remote_auth: None,
         }
     }
 
+    #[test]
+    fn security_only_initialization_migration_and_failed_rotation_preserve_settings() {
+        let root =
+            std::env::temp_dir().join(format!("p2p-auth-config-{:032x}", rand::random::<u128>()));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("settings.json");
+        let password = super::super::remote_auth::SecretPassword::new("A9b8C7".into()).unwrap();
+        let verifier = super::super::remote_auth::RemoteVerifier::create(&password).unwrap();
+        DesktopConfig::save_remote_auth(&path, verifier.clone()).unwrap();
+        let initial = DesktopConfig::load(&path).unwrap().unwrap();
+        assert!(!initial.has_network_config());
+        assert_eq!(initial.remote_auth, Some(verifier.clone()));
+        let bytes = fs::read(&path).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains(password.expose()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let receive = root.join("Downloads");
+        fs::create_dir(&receive).unwrap();
+        let mut draft = valid_draft(receive);
+        draft.remote_auth = Some(verifier.clone());
+        draft.save_atomic(&path).unwrap();
+        let saved = DesktopConfig::load(&path).unwrap().unwrap();
+        assert!(saved.has_network_config());
+        let next = super::super::remote_auth::RemoteVerifier::create(
+            &super::super::remote_auth::SecretPassword::new("Change9".into()).unwrap(),
+        )
+        .unwrap();
+        DesktopConfig::save_remote_auth(&path, next.clone()).unwrap();
+        let rotated = DesktopConfig::load(&path).unwrap().unwrap();
+        assert_eq!(rotated.signal, saved.signal);
+        assert_eq!(rotated.receive_directory, saved.receive_directory);
+        assert_eq!(rotated.remote_auth, Some(next));
+        // Schema 3 must retain identity-independent network/Tunnel settings, without inventing credentials.
+        let mut old = serde_json::to_value(saved).unwrap();
+        old["schema_version"] = 3.into();
+        old.as_object_mut().unwrap().remove("remote_auth");
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        let migrated = DesktopConfig::load(&path).unwrap().unwrap();
+        assert!(migrated.remote_auth.is_none());
+        assert_eq!(migrated.schema_version, 4);
+        fs::write(&path, b"corrupt").unwrap();
+        assert!(DesktopConfig::save_remote_auth(&path, verifier).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"corrupt");
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn speedtest_defaults_to_bidirectional_and_reads_legacy_directions() {
         assert_eq!(
@@ -810,16 +927,17 @@ mod tests {
         );
         let upgraded = SettingsDraft::from_config(DesktopConfig {
             schema_version: CONFIG_SCHEMA_VERSION,
-            signal: SignalConfig {
+            signal: Some(SignalConfig {
                 host: "relay.example.test".into(),
                 port: 7000,
-            },
-            receive_directory: PathBuf::from("/tmp/Downloads"),
+            }),
+            receive_directory: Some(PathBuf::from("/tmp/Downloads")),
             send_concurrency: 1,
             speedtest_seconds: 30,
             speedtest_direction: SpeedtestDirection::Upload,
             allowed_forward_targets: Vec::new(),
             tunnel_rules: Vec::new(),
+            remote_auth: None,
         });
         assert_eq!(upgraded.speedtest_direction, SpeedtestDirection::Both);
     }
@@ -993,9 +1111,9 @@ mod tests {
 
         draft.save_atomic(&config_file).unwrap();
         let first = DesktopConfig::load(&config_file).unwrap().unwrap();
-        assert_eq!(first.signal.host, "relay.example.test");
-        assert_eq!(first.signal.port, 7000);
-        assert_eq!(first.receive_directory, receive);
+        assert_eq!(first.signal.as_ref().unwrap().host, "relay.example.test");
+        assert_eq!(first.signal.as_ref().unwrap().port, 7000);
+        assert_eq!(first.receive_directory, Some(receive.clone()));
         assert_eq!(first.allowed_forward_targets, draft.allowed_forward_targets);
         assert_eq!(first.tunnel_rules, draft.tunnel_rules);
         assert_eq!(
@@ -1162,7 +1280,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .receive_directory,
-            replacement
+            Some(replacement)
         );
         fs::remove_dir_all(root).unwrap();
     }

@@ -77,7 +77,7 @@ python3 "$WORK/target.py" > "$WORK/target.log" 2>&1 &
 PIDS+=($!)
 pass "目标服务 127.0.0.1:9999"
 
-"$BIN" --log warn signal-server --listen 127.0.0.1:7000 > "$WORK/signal.log" 2>&1 &
+"$BIN" --log warn signal-server --listen 127.0.0.1:7000 --short-id-db "$WORK/device-ids.sqlite3" > "$WORK/signal.log" 2>&1 &
 PIDS+=($!)
 sleep 1
 pass "信令服务器 127.0.0.1:7000"
