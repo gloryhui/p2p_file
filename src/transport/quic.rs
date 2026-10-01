@@ -309,6 +309,8 @@ struct PunchRouter {
     next_id: Arc<AtomicU64>,
 }
 
+const MAX_PUNCH_ROUTES: usize = 48;
+
 impl PunchRouter {
     fn register(
         &self,
@@ -323,7 +325,9 @@ impl PunchRouter {
             .routes
             .lock()
             .map_err(|_| Error::Transport("打洞事件路由锁已损坏".into()))?;
-        if routes.by_token.len() >= 16 {
+        // Desktop keeps at most two recent reconnect tokens per connected peer,
+        // plus an active handshake route, with at most 16 peers.
+        if routes.by_token.len() >= MAX_PUNCH_ROUTES {
             return Err(Error::Transport("打洞令牌注册已达资源上限".into()));
         }
         if routes.by_token.contains_key(&key) {
@@ -463,6 +467,12 @@ pub struct PunchProbeReceiver {
 }
 
 impl PunchProbeReceiver {
+    pub fn poll_recv(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<SocketAddr>> {
+        self.receiver.poll_recv(cx)
+    }
     pub async fn recv(&mut self) -> Option<SocketAddr> {
         self.receiver.recv().await
     }
@@ -815,6 +825,29 @@ mod tests {
         assert_eq!(&buffers[0][..metadata[0].len], quic);
         assert_eq!(&buffers[1][..metadata[1].len], b"xyz");
         assert_eq!(route.recv().await, Some(source));
+    }
+
+    #[test]
+    fn punch_route_capacity_is_bounded_and_reclaimed_on_drop() {
+        let router = PunchRouter::default();
+        let peer = Identity::generate().node_id();
+        let mut routes: Vec<_> = (0..MAX_PUNCH_ROUTES)
+            .map(|generation| {
+                router
+                    .register(&PunchToken::random(), Some(peer), generation as u64)
+                    .unwrap()
+            })
+            .collect();
+        let token = PunchToken::random();
+        assert!(router.register(&token, Some(peer), 99).is_err());
+        routes.pop();
+        let receiver = router.register(&token, Some(peer), 99).unwrap();
+        assert_eq!(
+            router.routes.lock().unwrap().by_token.len(),
+            MAX_PUNCH_ROUTES
+        );
+        drop((routes, receiver));
+        assert!(router.routes.lock().unwrap().by_token.is_empty());
     }
 
     #[test]

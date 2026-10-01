@@ -524,7 +524,7 @@ mod tests {
 
     /// 每个 RequestChunk/Chunk 间隔都小于 idle timeout，但总传输时间明确超过
     /// idle timeout；持续有进度的文件不能被当成总工期超时。
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn 持续有流量的长传输不会被总时长误杀() {
         let dir = temp_dir("transfer_long_progress");
         let sender_identity = Identity::generate();
@@ -593,7 +593,13 @@ mod tests {
                     for _ in 0..8 {
                         tokio::task::yield_now().await;
                     }
+                    // Real UDP I/O must run with an advancing real clock: Tokio's
+                    // idle auto-advance can outrun kernel delivery on loaded CI.
+                    // Pause only for the deliberate gap, preserving the >30s
+                    // total and <30s per-idle-window assertions.
+                    tokio::time::pause();
                     tokio::time::advance(gap).await;
+                    tokio::time::resume();
                     for _ in 0..8 {
                         tokio::task::yield_now().await;
                     }

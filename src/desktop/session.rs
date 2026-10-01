@@ -1,9 +1,11 @@
 //! Long-lived desktop network session. One task owns signaling events; Quinn owns all UDP reads.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
@@ -34,6 +36,7 @@ const COMMAND_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 128;
 const SESSION_INPUT_CAPACITY: usize = 64;
 const MAX_CANDIDATES: usize = 16;
+const MAX_RECONNECT_PROBES_PER_PEER: usize = 2;
 // Bound waiting across signaling, punching and application authentication.
 const TUNNEL_PEER_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 const PEER_PUNCH_CONFIG: PunchConfig = PunchConfig {
@@ -449,6 +452,33 @@ enum SessionInput {
     },
 }
 
+// A lookup alone must preserve a live connection. A matching fresh probe is
+// evidence that the peer is actually establishing a new transport. These watches
+// use Quinn's existing dispatcher, never a second UDP receive owner.
+struct ReconnectProbe {
+    generation: u64,
+    candidates: Vec<Candidate>,
+    token: PunchToken,
+    receiver: crate::transport::quic::PunchProbeReceiver,
+    deadline: Pin<Box<Sleep>>,
+}
+fn poll_reconnect_probes(
+    probes: &mut HashMap<NodeId, VecDeque<ReconnectProbe>>,
+    cx: &mut std::task::Context<'_>,
+) -> Poll<(NodeId, usize, bool)> {
+    for (peer, watches) in probes {
+        for (index, watch) in watches.iter_mut().enumerate() {
+            if let Poll::Ready(source) = watch.receiver.poll_recv(cx) {
+                return Poll::Ready((*peer, index, source.is_some()));
+            }
+            if watch.deadline.as_mut().poll(cx).is_ready() {
+                return Poll::Ready((*peer, index, false));
+            }
+        }
+    }
+    Poll::Pending
+}
+
 struct RunningTunnel {
     rule: super::config::TunnelRule,
     shutdown: watch::Sender<bool>,
@@ -581,6 +611,7 @@ async fn run_session(
     let mut queue_changes = config.transfer.as_ref().map(|service| service.subscribe());
     let mut peers = PeerRegistry::default();
     let mut connections: HashMap<NodeId, (u64, quinn::Connection)> = HashMap::new();
+    let mut reconnect_probes: HashMap<NodeId, VecDeque<ReconnectProbe>> = HashMap::new();
     let mut peer_capabilities: HashMap<NodeId, u64> = HashMap::new();
     let mut peer_connection_updates: HashMap<NodeId, watch::Sender<Option<quinn::Connection>>> =
         HashMap::new();
@@ -659,6 +690,7 @@ async fn run_session(
             Signal(Result<SignalMessage>),
             Input(Option<SessionInput>),
             Retry,
+            ReconnectProbe(NodeId, usize, bool),
             Maintenance,
             QueueChanged,
             Shutdown,
@@ -675,6 +707,7 @@ async fn run_session(
             }
             _ = events.sender.closed() => Wake::EventsClosed,
             _ = maintenance.tick() => Wake::Maintenance,
+            (peer, index, ready) = std::future::poll_fn(|cx| poll_reconnect_probes(&mut reconnect_probes, cx)) => Wake::ReconnectProbe(peer, index, ready),
             _ = async {
                 match queue_changes.as_mut() {
                     Some(changes) => {let _ = changes.changed().await;},
@@ -942,6 +975,7 @@ async fn run_session(
                     });
                 credentials.insert(peer, password);
                 if !reuse_authorized {
+                    reconnect_probes.remove(&peer);
                     // Explicit credentials upgrade rights on a fresh transport; never copy
                     // the previous generation's authorization into a new exchange.
                     if let Some((generation, connection)) = connections.remove(&peer) {
@@ -1063,6 +1097,7 @@ async fn run_session(
                 }
                 short_queries.clear();
                 peer_candidates.clear();
+                reconnect_probes.clear();
                 let signal_changed = auth_updated.is_none();
                 if signal_changed {
                     signal_generation = signal_generation.wrapping_add(1);
@@ -1291,6 +1326,33 @@ async fn run_session(
                                 "地址核对完毕，现有认证连接继续使用".into(),
                             ))
                             .await;
+                        if candidates.len() <= MAX_CANDIDATES
+                            && !network.reachable_candidates(&candidates).is_empty()
+                            && connections
+                                .get(&node_id)
+                                .is_some_and(|(_, c)| c.close_reason().is_none())
+                        {
+                            let generation = peers.generation(node_id).unwrap();
+                            let watches = reconnect_probes.entry(node_id).or_default();
+                            if watches.len() >= MAX_RECONNECT_PROBES_PER_PEER {
+                                watches.pop_front();
+                            }
+                            if let Ok(receiver) = network
+                                .punch_socket
+                                .register_peer_probe(&token, node_id, generation)
+                            {
+                                watches.push_back(ReconnectProbe {
+                                    generation,
+                                    candidates,
+                                    token,
+                                    receiver,
+                                    deadline: Box::pin(time::sleep(
+                                        PEER_PUNCH_CONFIG.interval * PEER_PUNCH_CONFIG.attempts,
+                                    )),
+                                });
+                            }
+                            continue;
+                        }
                     }
                     if peers
                         .state(node_id)
@@ -1326,6 +1388,7 @@ async fn run_session(
                             }
                         }
                         peer_candidates.remove(&node_id);
+                        reconnect_probes.remove(&node_id);
                     }
                     if let Some(generation) = start_peer_attempt(
                         node_id,
@@ -1371,8 +1434,10 @@ async fn run_session(
                                 && (credentials.len() < super::network_state::MAX_PEERS
                                     || credentials.contains_key(&peer))
                             {
-                                credentials.insert(peer, password);
-                                let _ = command_tx.try_send(SessionCommand::ConnectPeer(peer));
+                                let _ = command_tx.try_send(SessionCommand::ConnectAuthenticated {
+                                    peer,
+                                    password,
+                                });
                             }
                         } else {
                             let _ = events
@@ -1534,6 +1599,7 @@ async fn run_session(
                     connection.close(0u32.into(), b"stale peer generation");
                     continue;
                 }
+                reconnect_probes.remove(&peer);
                 connections.insert(peer, (generation, connection.clone()));
                 peer_capabilities.insert(peer, capabilities);
                 if capabilities & super::protocol::CAP_TCP_TUNNEL == 0 {
@@ -1712,8 +1778,81 @@ async fn run_session(
                     }
                 }
             }
+            Wake::ReconnectProbe(peer, index, ready) => {
+                let Some(probe) = reconnect_probes
+                    .get_mut(&peer)
+                    .and_then(|w| w.remove(index))
+                else {
+                    continue;
+                };
+                let ReconnectProbe {
+                    generation,
+                    candidates,
+                    token,
+                    receiver,
+                    ..
+                } = probe;
+                drop(receiver); // Synchronously revoke the old generation's source/token route.
+                if !ready
+                    || !peers.is_current(peer, generation)
+                    || !matches!(
+                        peers.state(peer),
+                        Some(PeerLifecycle::Connected(_) | PeerLifecycle::Disconnected)
+                    )
+                {
+                    continue;
+                }
+                reconnect_probes.remove(&peer);
+                if let Some((_, old)) = connections.remove(&peer) {
+                    old.close(0u32.into(), b"peer requested fresh authenticated transport");
+                    peer_capabilities.remove(&peer);
+                    if let Some(updates) = peer_connection_updates.get(&peer) {
+                        updates.send_replace(None);
+                    }
+                    emit_peer_tunnels_starting(peer, &running_tunnels, &events).await;
+                    peers.transition(peer, generation, PeerLifecycle::Disconnected);
+                    emit_peer_state(&events, peer, generation, PeerLifecycle::Disconnected).await;
+                }
+                let canonical = canonical_candidates(&candidates);
+                if let Some(generation) = start_peer_attempt(
+                    peer,
+                    candidates,
+                    token,
+                    local_node,
+                    identity.clone(),
+                    &network,
+                    &events,
+                    &input_tx,
+                    &semaphore,
+                    &mut peers,
+                    &mut pending_inbound,
+                    &mut peer_tasks,
+                    auth_context.clone(),
+                    remote_verifier.clone(),
+                    credentials.get(&peer).cloned().or_else(|| {
+                        #[cfg(test)]
+                        {
+                            config.test_outgoing_password.clone()
+                        }
+                        #[cfg(not(test))]
+                        {
+                            None
+                        }
+                    }),
+                )
+                .await
+                {
+                    peer_candidates.insert(peer, (generation, canonical));
+                }
+            }
             Wake::QueueChanged => {}
             Wake::Maintenance => {
+                reconnect_probes.retain(|peer, watches| {
+                    watches.retain(|watch| {
+                        peers.is_current(*peer, watch.generation) && !watch.deadline.is_elapsed()
+                    });
+                    !watches.is_empty()
+                });
                 let expired = short_queries
                     .iter()
                     .filter(|(_, (_, started))| {
@@ -2554,6 +2693,80 @@ mod tests {
         .unwrap();
     }
     #[tokio::test]
+    async fn reconnect_watch_only_accepts_matching_probe_and_expires_without_reconnecting() {
+        use crate::nat::punch::probe_packet;
+        use crate::transport::quic::endpoint_from_socket_with_punch_dispatcher;
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        let (endpoint, punch) = endpoint_from_socket_with_punch_dispatcher(socket).unwrap();
+        let peer = Identity::generate().node_id();
+        let token = PunchToken::random();
+        let mut watches = HashMap::from([(
+            peer,
+            VecDeque::from([ReconnectProbe {
+                generation: 7,
+                candidates: Vec::new(),
+                token,
+                receiver: punch.register_peer_probe(&token, peer, 7).unwrap(),
+                deadline: Box::pin(time::sleep(Duration::from_secs(5))),
+            }]),
+        )]);
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .send_to(&probe_packet(&PunchToken::random()), address)
+            .await
+            .unwrap();
+        assert!(
+            time::timeout(
+                Duration::from_millis(100),
+                std::future::poll_fn(|cx| poll_reconnect_probes(&mut watches, cx))
+            )
+            .await
+            .is_err()
+        );
+        sender
+            .send_to(&probe_packet(&token), address)
+            .await
+            .unwrap();
+        assert_eq!(
+            time::timeout(
+                Duration::from_secs(2),
+                std::future::poll_fn(|cx| { poll_reconnect_probes(&mut watches, cx) })
+            )
+            .await
+            .unwrap(),
+            (peer, 0, true)
+        );
+        assert_eq!(
+            punch.claim_authorized_peer(sender.local_addr().unwrap()),
+            Some((peer, 7))
+        );
+        watches.clear();
+        assert_eq!(
+            punch.claim_authorized_peer(sender.local_addr().unwrap()),
+            None
+        );
+        let receiver = punch.register_peer_probe(&token, peer, 8).unwrap();
+        watches.insert(
+            peer,
+            VecDeque::from([ReconnectProbe {
+                generation: 8,
+                candidates: Vec::new(),
+                token,
+                receiver,
+                deadline: Box::pin(time::sleep(Duration::ZERO)),
+            }]),
+        );
+        assert_eq!(
+            std::future::poll_fn(|cx| poll_reconnect_probes(&mut watches, cx)).await,
+            (peer, 0, false)
+        );
+        watches.clear();
+        endpoint.close(0u32.into(), b"done");
+        endpoint.wait_idle().await;
+    }
+
+    #[tokio::test]
     async fn unauthorized_file_directory_resume_and_speed_commands_cannot_start_business() {
         use super::super::{task_store::TaskStore, transfer::TransferService};
         let root =
@@ -2843,6 +3056,15 @@ mod tests {
             ));
         let (ha, mut ea) = spawn(a.clone(), ca).unwrap();
         let (hb, mut eb) = spawn(b.clone(), cb).unwrap();
+        let short_a = time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(SessionEvent::ShortIdRegistered(id)) = ea.recv().await {
+                    break id;
+                }
+            }
+        })
+        .await
+        .unwrap();
         wait_signal_online(&mut ea).await;
         wait_signal_online(&mut eb).await;
         ha.connect_peer_with_password(b.node_id(), pb).unwrap();
@@ -2991,7 +3213,7 @@ mod tests {
         drop(tb.accept().await.unwrap());
         drop((send_a, recv_a));
         // B separately proves A's password; A proves its current-process B credential again.
-        hb.connect_peer_with_password(a.node_id(), pa).unwrap();
+        hb.connect_short_id(short_a, pa).unwrap();
         assert_eq!(
             wait_authorization(&mut ea, b.node_id()).await,
             RemoteAuthorization::BOTH
