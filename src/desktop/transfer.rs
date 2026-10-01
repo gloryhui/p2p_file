@@ -1202,7 +1202,7 @@ impl TransferService {
         connection: Connection,
         peer: NodeId,
         local: NodeId,
-        allowed_forward_targets: watch::Receiver<Vec<std::net::SocketAddr>>,
+        allowed_forward_targets: watch::Receiver<Vec<super::config::AllowedForwardTarget>>,
     ) -> Result<()> {
         let speed = super::speed::SpeedPeer::new(
             connection.clone(),
@@ -1249,7 +1249,7 @@ impl TransferService {
         connection: Connection,
         peer: NodeId,
         speed: Option<super::speed::SpeedPeer>,
-        allowed_forward_targets: watch::Receiver<Vec<std::net::SocketAddr>>,
+        allowed_forward_targets: watch::Receiver<Vec<super::config::AllowedForwardTarget>>,
     ) -> Result<()> {
         let mut streams = JoinSet::new();
         if let Some(speed) = speed.clone() {
@@ -1271,7 +1271,7 @@ impl TransferService {
                             Message::TunnelOpen{target}=> {
                                 drop(_lease);
                                 let allowed=allowed_forward_targets.borrow().clone();
-                                super::tunnel::serve_open(send,recv,*target,&allowed).await
+                                super::tunnel::serve_open(send,recv,*target,peer,&allowed).await
                             },
                             Message::Speed(_)=> { let speed=speed.ok_or_else(||disk::failure("对端不支持测速执行"))?;drop(_lease);speed.serve_control(send,recv,first).await },
                             Message::Offer{..} => service.receive_offer(send,recv,peer,super::frame_budget::BufferedFrame{frame:first,_lease}).await,

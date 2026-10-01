@@ -55,9 +55,21 @@ pub(super) async fn serve_open(
     mut send: SendStream,
     recv: RecvStream,
     target: SocketAddr,
-    allowed_targets: &[SocketAddr],
+    peer: NodeId,
+    allowed_targets: &[super::config::AllowedForwardTarget],
 ) -> Result<()> {
-    let tcp = match crate::tunnel::connect_allowed_target(target, allowed_targets).await {
+    let targets = allowed_targets
+        .iter()
+        .filter(|entry| {
+            entry.enabled
+                && entry
+                    .allowed_peers
+                    .iter()
+                    .any(|id| NodeId::from_hex(id).ok() == Some(peer))
+        })
+        .map(|entry| entry.target)
+        .collect::<Vec<_>>();
+    let tcp = match crate::tunnel::connect_allowed_target(target, &targets).await {
         Ok(tcp) => tcp,
         Err(error) => {
             protocol::write(
@@ -91,7 +103,7 @@ pub(super) async fn serve_open(
 pub(super) async fn serve_peer(
     connection: Connection,
     peer: NodeId,
-    allowed_updates: watch::Receiver<Vec<SocketAddr>>,
+    allowed_updates: watch::Receiver<Vec<super::config::AllowedForwardTarget>>,
 ) -> Result<()> {
     let mut streams = JoinSet::new();
     loop {
@@ -117,7 +129,7 @@ pub(super) async fn serve_peer(
                     let _ = recv.stop(4u32.into());
                     continue;
                 }
-                let allowed = allowed_updates.borrow().clone();
+                let allowed_updates = allowed_updates.clone();
                 streams.spawn(async move {
                     let mut send = send;
                     let frame = tokio::time::timeout(STREAM_OPEN_TIMEOUT, protocol::read(&mut recv))
@@ -125,7 +137,8 @@ pub(super) async fn serve_peer(
                         .map_err(|_| Error::Protocol("等待隧道请求超时".into()))??;
                     match frame.message {
                         Message::TunnelOpen { target } => {
-                            if let Err(error) = serve_open(send, recv, target, &allowed).await {
+                            let allowed = allowed_updates.borrow().clone();
+                            if let Err(error) = serve_open(send, recv, target, peer, &allowed).await {
                                 tracing::debug!(peer = %peer.short(), %target, error = %error, "桌面隧道请求结束");
                             }
                             Ok(())
@@ -162,7 +175,7 @@ mod tests {
 
     use crate::transport::quic::{client_endpoint, connect, server_endpoint};
 
-    async fn exercise_forwarding(allowed: bool) {
+    async fn exercise_forwarding(allowed: bool, peer_allowed: bool) {
         let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target = echo.local_addr().unwrap();
         tokio::spawn(async move {
@@ -183,7 +196,20 @@ mod tests {
         let client_connection = connect(&client, server_addr, "p2pfile").await.unwrap();
         let server_connection = server_connection_task.await.unwrap();
 
-        let server_allowed = if allowed { vec![target] } else { Vec::new() };
+        let peer = crate::identity::Identity::generate().node_id();
+        let server_allowed = if allowed {
+            vec![super::super::config::AllowedForwardTarget::new(
+                "echo",
+                target,
+                vec![if peer_allowed {
+                    peer.to_hex()
+                } else {
+                    crate::identity::Identity::generate().node_id().to_hex()
+                }],
+            )]
+        } else {
+            Vec::new()
+        };
         let server_task_connection = server_connection.clone();
         let server_task = tokio::spawn(async move {
             let (send, recv) = server_task_connection.accept_bi().await.unwrap();
@@ -191,7 +217,7 @@ mod tests {
             let frame = protocol::read(&mut recv).await.unwrap();
             match frame.message {
                 Message::TunnelOpen { target } => {
-                    serve_open(send, recv, target, &server_allowed).await
+                    serve_open(send, recv, target, peer, &server_allowed).await
                 }
                 _ => panic!("expected a tunnel open frame"),
             }
@@ -213,7 +239,7 @@ mod tests {
 
         let mut local = tokio::net::TcpStream::connect(local_addr).await.unwrap();
         local.write_all(b"desktop tcp tunnel").await.unwrap();
-        if allowed {
+        if allowed && peer_allowed {
             let mut echoed = [0; 18];
             local.read_exact(&mut echoed).await.unwrap();
             assert_eq!(&echoed, b"desktop tcp tunnel");
@@ -247,7 +273,58 @@ mod tests {
 
     #[tokio::test]
     async fn desktop_stream_reuses_core_for_allowed_target_and_reports_whitelist_denial() {
-        exercise_forwarding(true).await;
-        exercise_forwarding(false).await;
+        exercise_forwarding(true, true).await;
+        exercise_forwarding(false, true).await;
+        exercise_forwarding(true, false).await;
+    }
+    #[tokio::test]
+    async fn fallback_checks_latest_grant_after_delayed_tunnel_open() {
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = echo.local_addr().unwrap();
+        let peer = crate::identity::Identity::generate().node_id();
+        let server = server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let client = client_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let accept = server.clone();
+        let accepted = tokio::spawn(async move { accept.accept().await.unwrap().await.unwrap() });
+        let client_conn = connect(&client, server.local_addr().unwrap(), "p2pfile")
+            .await
+            .unwrap();
+        let server_conn = accepted.await.unwrap();
+        let grant =
+            super::super::config::AllowedForwardTarget::new("echo", target, vec![peer.to_hex()]);
+        let (updates, grants) = watch::channel(vec![grant]);
+        let service = tokio::spawn(serve_peer(server_conn.clone(), peer, grants));
+        let (mut send, mut recv) = client_conn.open_bi().await.unwrap();
+        let frame = Frame {
+            request_id: 0,
+            message: Message::TunnelOpen { target },
+        }
+        .encode()
+        .unwrap();
+        let length = (frame.len() as u32).to_le_bytes();
+        // Deliver only the header. accept_bi can complete, but authorization must wait for TunnelOpen.
+        send.write_all(&length).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while updates.receiver_count() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fallback must have accepted the pending stream");
+        updates.send_replace(Vec::new());
+        send.write_all(&frame).await.unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(2), protocol::read(&mut recv))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(reply.message, Message::TunnelError { .. }));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), echo.accept())
+                .await
+                .is_err()
+        );
+        client_conn.close(0u32.into(), b"done");
+        server_conn.close(0u32.into(), b"done");
+        service.await.unwrap().unwrap();
     }
 }

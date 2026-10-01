@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const APP_DIR_NAME: &str = "p2p_file";
-const CONFIG_SCHEMA_VERSION: u32 = 2;
+const CONFIG_SCHEMA_VERSION: u32 = 3;
 const LEGACY_CONFIG_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Error)]
@@ -111,6 +111,9 @@ pub struct SettingsDraft {
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AllowedForwardTarget {
+    /// Empty grants no access (including migrated schema v2 entries).
+    #[serde(default)]
+    pub allowed_peers: Vec<String>,
     pub id: String,
     pub name: String,
     pub target: std::net::SocketAddr,
@@ -131,10 +134,15 @@ pub struct TunnelRule {
 }
 
 impl AllowedForwardTarget {
-    pub fn new(name: impl Into<String>, target: std::net::SocketAddr) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        target: std::net::SocketAddr,
+        allowed_peers: Vec<String>,
+    ) -> Self {
         Self {
             id: new_rule_id(),
             name: name.into(),
+            allowed_peers,
             target,
             enabled: true,
         }
@@ -161,11 +169,11 @@ impl TunnelRule {
 }
 
 impl SettingsDraft {
-    pub fn enabled_forward_targets(&self) -> Vec<std::net::SocketAddr> {
+    pub fn enabled_forward_targets(&self) -> Vec<AllowedForwardTarget> {
         self.allowed_forward_targets
             .iter()
             .filter(|entry| entry.enabled)
-            .map(|entry| entry.target)
+            .cloned()
             .collect()
     }
 }
@@ -344,8 +352,18 @@ impl DesktopConfig {
                     tunnel_rules: Vec::new(),
                 }
             }
-            CONFIG_SCHEMA_VERSION => serde_json::from_slice::<Self>(&bytes)
-                .map_err(|error| ConfigError::Corrupt(error.to_string()))?,
+            2 | CONFIG_SCHEMA_VERSION => {
+                let mut config = serde_json::from_slice::<Self>(&bytes)
+                    .map_err(|error| ConfigError::Corrupt(error.to_string()))?;
+                // v2 had target-only grants. Preserve rows, but require explicit peer authorization.
+                if version == 2 {
+                    for entry in &mut config.allowed_forward_targets {
+                        entry.allowed_peers.clear();
+                    }
+                }
+                config.schema_version = CONFIG_SCHEMA_VERSION;
+                config
+            }
             other => {
                 return Err(ConfigError::Corrupt(format!(
                     "不支持的 schema_version {other}"
@@ -527,6 +545,14 @@ fn validate_forward_configuration(
         validate_rule_id(&entry.id)?;
         validate_rule_name(&entry.name)?;
         validate_forward_target(entry.target)?;
+        let mut peers = HashSet::new();
+        for peer in &entry.allowed_peers {
+            let peer = crate::identity::NodeId::from_hex(peer)
+                .map_err(|error| ConfigError::Invalid(format!("授权设备 ID 无效：{error}")))?;
+            if !peers.insert(peer) {
+                return Err(ConfigError::Invalid("授权设备 ID 重复".into()));
+            }
+        }
         if !allowed_ids.insert(entry.id.as_str()) {
             return Err(ConfigError::Invalid(format!(
                 "允许服务规则 ID 重复：{}",
@@ -941,12 +967,14 @@ mod tests {
         let mut draft = valid_draft(receive.clone());
         draft.allowed_forward_targets = vec![
             AllowedForwardTarget {
+                allowed_peers: vec![crate::identity::Identity::generate().node_id().to_hex()],
                 id: "ssh".into(),
                 name: "SSH".into(),
                 target: "127.0.0.1:22".parse().unwrap(),
                 enabled: true,
             },
             AllowedForwardTarget {
+                allowed_peers: vec![crate::identity::Identity::generate().node_id().to_hex()],
                 id: "web".into(),
                 name: "Web 管理".into(),
                 target: "192.168.1.20:8080".parse().unwrap(),
@@ -972,7 +1000,7 @@ mod tests {
         assert_eq!(first.tunnel_rules, draft.tunnel_rules);
         assert_eq!(
             draft.enabled_forward_targets(),
-            vec!["127.0.0.1:22".parse().unwrap()]
+            vec![draft.allowed_forward_targets[0].clone()]
         );
 
         draft.send_concurrency = 3;
@@ -1031,12 +1059,14 @@ mod tests {
         let target = "127.0.0.1:22".parse().unwrap();
         draft.allowed_forward_targets = vec![
             AllowedForwardTarget {
+                allowed_peers: vec![crate::identity::Identity::generate().node_id().to_hex()],
                 id: "one".into(),
                 name: "One".into(),
                 target,
                 enabled: true,
             },
             AllowedForwardTarget {
+                allowed_peers: vec![crate::identity::Identity::generate().node_id().to_hex()],
                 id: "two".into(),
                 name: "Two".into(),
                 target,
@@ -1056,6 +1086,44 @@ mod tests {
             auto_start: false,
         });
         assert!(matches!(draft.to_config(), Err(ConfigError::Invalid(_))));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn schema_v2_target_only_grants_migrate_without_authorizing_peers() {
+        let root = temp_dir("v2-peer-migration");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("settings.json");
+        let mut draft = valid_draft(root.clone());
+        draft
+            .allowed_forward_targets
+            .push(AllowedForwardTarget::new(
+                "ssh",
+                "127.0.0.1:22".parse().unwrap(),
+                vec![crate::identity::Identity::generate().node_id().to_hex()],
+            ));
+        let mut old = serde_json::to_value(draft.to_config().unwrap()).unwrap();
+        old["schema_version"] = 2.into();
+        old["allowed_forward_targets"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("allowed_peers");
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        let config = DesktopConfig::load(&path).unwrap().unwrap();
+        assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
+        assert_eq!(config.allowed_forward_targets.len(), 1);
+        assert!(config.allowed_forward_targets[0].allowed_peers.is_empty());
+        SettingsDraft::from_config(config)
+            .save_atomic(&path)
+            .unwrap();
+        assert!(
+            DesktopConfig::load(&path)
+                .unwrap()
+                .unwrap()
+                .allowed_forward_targets[0]
+                .allowed_peers
+                .is_empty()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

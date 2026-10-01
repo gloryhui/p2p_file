@@ -31,6 +31,8 @@ const COMMAND_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 128;
 const SESSION_INPUT_CAPACITY: usize = 64;
 const MAX_CANDIDATES: usize = 16;
+// Bound waiting across signaling, punching and application authentication.
+const TUNNEL_PEER_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 const PEER_PUNCH_CONFIG: PunchConfig = PunchConfig {
     interval: Duration::from_millis(200),
     attempts: 30,
@@ -44,7 +46,7 @@ fn is_current_signal_generation(current: u64, result_generation: u64) -> bool {
 pub struct DesktopSessionConfig {
     pub signal_server: String,
     pub network: DesktopNetworkConfig,
-    pub allowed_forward_targets: Vec<SocketAddr>,
+    pub allowed_forward_targets: Vec<super::config::AllowedForwardTarget>,
     pub tunnel_rules: Vec<super::config::TunnelRule>,
     pub(crate) transfer: Option<super::transfer::TransferService>,
 }
@@ -134,6 +136,7 @@ impl SessionEvents {
 #[derive(Clone)]
 pub struct DesktopSessionHandle {
     commands: mpsc::Sender<SessionCommand>,
+    allowed_forward_targets: watch::Sender<Vec<super::config::AllowedForwardTarget>>,
     lifetime: Arc<SessionLifetime>,
 }
 
@@ -187,15 +190,52 @@ impl DesktopSessionHandle {
 
     pub fn update_tunnel_settings(
         &self,
-        allowed_forward_targets: Vec<SocketAddr>,
+        allowed_forward_targets: Vec<super::config::AllowedForwardTarget>,
         tunnel_rules: Vec<super::config::TunnelRule>,
     ) -> std::result::Result<(), String> {
         self.commands
-            .try_send(SessionCommand::UpdateTunnelSettings {
-                allowed_forward_targets,
-                tunnel_rules,
+            .try_send(SessionCommand::UpdateTunnelSettings { tunnel_rules })
+            .map_err(|error| format!("无法应用端口转发设置：{error}"))?;
+        self.allowed_forward_targets
+            .send_replace(allowed_forward_targets);
+        Ok(())
+    }
+
+    /// Apply only revocations from an unsaved draft; grants require successful persistence.
+    pub fn restrict_forward_targets(&self, draft: &[super::config::AllowedForwardTarget]) {
+        self.allowed_forward_targets.send_modify(|applied| {
+            applied.retain_mut(|entry| {
+                let Some(next) = draft.iter().find(|next| {
+                    next.id == entry.id && next.enabled && next.target == entry.target
+                }) else {
+                    return false;
+                };
+                entry
+                    .allowed_peers
+                    .retain(|peer| next.allowed_peers.contains(peer));
+                !entry.allowed_peers.is_empty()
+            });
+        });
+    }
+
+    /// Complete only after the listener task has drained and released its socket.
+    pub async fn revoke_tunnel_rule(
+        &self,
+        rule_id: String,
+        delete: bool,
+    ) -> std::result::Result<(), String> {
+        let (done, stopped) = oneshot::channel();
+        self.commands
+            .send(SessionCommand::RevokeTunnel {
+                rule_id,
+                delete,
+                done,
             })
-            .map_err(|error| format!("无法应用端口转发设置：{error}"))
+            .await
+            .map_err(|_| "网络会话已关闭".to_owned())?;
+        stopped
+            .await
+            .map_err(|_| "网络会话在停止规则前退出".to_owned())
     }
 
     #[allow(dead_code)] // T010 product controls call this tested backend command.
@@ -300,8 +340,12 @@ enum SessionCommand {
     ReconfigureSignal(String),
     StartTunnel(String),
     StopTunnel(String),
+    RevokeTunnel {
+        rule_id: String,
+        delete: bool,
+        done: oneshot::Sender<()>,
+    },
     UpdateTunnelSettings {
-        allowed_forward_targets: Vec<SocketAddr>,
         tunnel_rules: Vec<super::config::TunnelRule>,
     },
     #[cfg(test)]
@@ -354,6 +398,8 @@ pub fn spawn(
     let session_command_tx = command_tx.clone();
     let (event_tx, event_rx) = mpsc::channel(EVENT_CAPACITY);
     let thread_events = event_tx.clone();
+    let (allowed_forward_targets, _) = watch::channel(config.allowed_forward_targets.clone());
+    let runtime_allowed_targets = allowed_forward_targets.clone();
     let (stop, stopped) = watch::channel(false);
     let event_shutdown = stopped.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -373,6 +419,7 @@ pub fn spawn(
                             config,
                             session_command_tx,
                             command_rx,
+                            runtime_allowed_targets,
                             stopped,
                             SessionEvents::new(event_tx.clone(), event_shutdown),
                         )
@@ -396,6 +443,7 @@ pub fn spawn(
     Ok((
         DesktopSessionHandle {
             commands: command_tx,
+            allowed_forward_targets,
             lifetime: Arc::new(SessionLifetime {
                 stop,
                 done: std::sync::Mutex::new(done_rx),
@@ -411,6 +459,7 @@ async fn run_session(
     config: DesktopSessionConfig,
     command_tx: mpsc::Sender<SessionCommand>,
     mut commands: mpsc::Receiver<SessionCommand>,
+    allowed_forward_targets: watch::Sender<Vec<super::config::AllowedForwardTarget>>,
     mut shutdown: watch::Receiver<bool>,
     events: SessionEvents,
 ) {
@@ -463,7 +512,7 @@ async fn run_session(
     let mut peer_capabilities: HashMap<NodeId, u64> = HashMap::new();
     let mut peer_connection_updates: HashMap<NodeId, watch::Sender<Option<quinn::Connection>>> =
         HashMap::new();
-    let (allowed_forward_targets, _) = watch::channel(config.allowed_forward_targets.clone());
+    let mut tunnel_stop_waiters: HashMap<String, Vec<oneshot::Sender<()>>> = HashMap::new();
     let mut tunnel_rules: HashMap<String, super::config::TunnelRule> = config
         .tunnel_rules
         .iter()
@@ -835,6 +884,9 @@ async fn run_session(
                 for update in peer_connection_updates.values() {
                     update.send_replace(None);
                 }
+                for peer in peer_connection_updates.keys() {
+                    emit_peer_tunnels_starting(*peer, &running_tunnels, &events).await;
+                }
                 let tunnel_peers = running_tunnels
                     .values()
                     .filter_map(|running| NodeId::from_hex(&running.rule.peer_node_id).ok())
@@ -901,11 +953,27 @@ async fn run_session(
                         .await;
                 }
             }
+            Wake::Command(Some(SessionCommand::RevokeTunnel {
+                rule_id,
+                delete,
+                done,
+            })) => {
+                if delete {
+                    tunnel_rules.remove(&rule_id);
+                } else if let Some(rule) = tunnel_rules.get_mut(&rule_id) {
+                    rule.enabled = false;
+                }
+                restart_after_tunnel_stop.remove(&rule_id);
+                if let Some(running) = running_tunnels.get(&rule_id) {
+                    running.shutdown.send_replace(true);
+                    tunnel_stop_waiters.entry(rule_id).or_default().push(done);
+                } else {
+                    let _ = done.send(());
+                }
+            }
             Wake::Command(Some(SessionCommand::UpdateTunnelSettings {
-                allowed_forward_targets: next_allowed,
                 tunnel_rules: next_rules,
             })) => {
-                allowed_forward_targets.send_replace(next_allowed);
                 let next_rules = next_rules
                     .into_iter()
                     .map(|rule| (rule.id.clone(), rule))
@@ -1000,6 +1068,11 @@ async fn run_session(
                         // checks remain mandatory. Old closure callbacks are fenced.
                         if let Some((generation, connection)) = connections.remove(&node_id) {
                             connection.close(0u32.into(), b"peer mapping changed");
+                            peer_capabilities.remove(&node_id);
+                            if let Some(updates) = peer_connection_updates.get(&node_id) {
+                                updates.send_replace(None);
+                            }
+                            emit_peer_tunnels_starting(node_id, &running_tunnels, &events).await;
                             if peers.transition(node_id, generation, PeerLifecycle::Disconnected) {
                                 emit_peer_state(
                                     &events,
@@ -1036,6 +1109,12 @@ async fn run_session(
                     for (peer, generation) in peers.pending_peers() {
                         if peers.transition(peer, generation, PeerLifecycle::Failed(detail.clone()))
                         {
+                            fail_peer_tunnels(
+                                peer,
+                                &detail,
+                                &running_tunnels,
+                                &mut forced_tunnel_errors,
+                            );
                             emit_peer_state(
                                 &events,
                                 peer,
@@ -1193,7 +1272,10 @@ async fn run_session(
                 peer_connection_updates
                     .entry(peer)
                     .or_insert_with(|| watch::channel(None).0)
-                    .send_replace(Some(connection.clone()));
+                    .send_replace(
+                        (capabilities & super::protocol::CAP_TCP_TUNNEL != 0)
+                            .then(|| connection.clone()),
+                    );
                 emit_peer_state(&events, peer, generation, PeerLifecycle::Connected).await;
                 emit_lifecycle(&events, NetworkLifecycle::Connected { peer }).await;
                 if let Some(service) = config.transfer.clone() {
@@ -1253,19 +1335,7 @@ async fn run_session(
                 pending_inbound.remove(&(peer, generation));
                 if peers.transition(peer, generation, PeerLifecycle::Failed(detail.clone())) {
                     peer_candidates.remove(&peer);
-                    let failed_rules = running_tunnels
-                        .iter()
-                        .filter(|(_, running)| running.rule.peer_node_id == peer.to_hex())
-                        .map(|(id, _)| id.clone())
-                        .collect::<Vec<_>>();
-                    for rule_id in failed_rules {
-                        let _ = events
-                            .send(SessionEvent::TunnelError {
-                                rule_id,
-                                detail: format!("对端连接失败：{detail}"),
-                            })
-                            .await;
-                    }
+                    fail_peer_tunnels(peer, &detail, &running_tunnels, &mut forced_tunnel_errors);
                     emit_peer_state(
                         &events,
                         peer,
@@ -1290,6 +1360,7 @@ async fn run_session(
                     if let Some(updates) = peer_connection_updates.get(&peer) {
                         updates.send_replace(None);
                     }
+                    emit_peer_tunnels_starting(peer, &running_tunnels, &events).await;
                     let affected_rules = running_tunnels
                         .values()
                         .filter(|running| running.rule.peer_node_id == peer.to_hex())
@@ -1326,6 +1397,12 @@ async fn run_session(
                 for (peer, generation) in peers.expired_lookups(time::Instant::now()) {
                     let state = PeerLifecycle::Failed("目标离线或候选等待超时，请重试连接".into());
                     if peers.transition(peer, generation, state.clone()) {
+                        fail_peer_tunnels(
+                            peer,
+                            "目标离线或候选等待超时，请重试连接",
+                            &running_tunnels,
+                            &mut forced_tunnel_errors,
+                        );
                         queued_lookups.retain(|entry| *entry != (peer, generation));
                         emit_peer_state(&events, peer, generation, state).await;
                     }
@@ -1360,6 +1437,11 @@ async fn run_session(
             Wake::Task(Some(Ok(()))) | Wake::Task(None) => {}
             Wake::TunnelTask(Some(Ok((rule_id, result)))) => {
                 running_tunnels.remove(&rule_id);
+                if let Some(waiters) = tunnel_stop_waiters.remove(&rule_id) {
+                    for done in waiters {
+                        let _ = done.send(());
+                    }
+                }
                 let result = forced_tunnel_errors.remove(&rule_id).map_or(result, Err);
                 let state = match result {
                     Ok(()) => TunnelRuntimeState::Stopped,
@@ -1444,6 +1526,39 @@ async fn run_session(
     while peer_tasks.join_next().await.is_some() {}
     while session_tasks.join_next().await.is_some() {}
     let _ = time::timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
+}
+
+async fn emit_peer_tunnels_starting(
+    peer: NodeId,
+    running: &HashMap<String, RunningTunnel>,
+    events: &SessionEvents,
+) {
+    for (rule_id, tunnel) in running {
+        if NodeId::from_hex(&tunnel.rule.peer_node_id).ok() == Some(peer)
+            && !*tunnel.shutdown.borrow()
+        {
+            let _ = events
+                .send(SessionEvent::TunnelState {
+                    rule_id: rule_id.clone(),
+                    state: TunnelRuntimeState::Starting,
+                })
+                .await;
+        }
+    }
+}
+
+fn fail_peer_tunnels(
+    peer: NodeId,
+    detail: &str,
+    running: &HashMap<String, RunningTunnel>,
+    errors: &mut HashMap<String, String>,
+) {
+    for (id, tunnel) in running {
+        if NodeId::from_hex(&tunnel.rule.peer_node_id).ok() == Some(peer) {
+            errors.insert(id.clone(), format!("对端连接失败：{detail}"));
+            tunnel.shutdown.send_replace(true);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1534,18 +1649,17 @@ async fn start_tunnel_rule(
         connection_updates.send_replace(Some(connection.clone()));
     } else if let Err(error) = command_tx.try_send(SessionCommand::ConnectPeer(peer)) {
         let _ = events
-            .send(SessionEvent::TunnelError {
-                rule_id: rule_id.clone(),
-                detail: format!(
-                    "已监听 {}，等待连接对端；连接请求未排入队列：{error}",
-                    rule.listen
-                ),
+            .send(SessionEvent::TunnelState {
+                rule_id,
+                state: TunnelRuntimeState::Error(format!("连接请求未排入队列：{error}")),
             })
             .await;
+        return;
     }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let connection_updates = connection_updates.subscribe();
+    let mut state_updates = connection_updates.clone();
     let (errors_tx, mut errors_rx) = mpsc::unbounded_channel();
     let task_events = events.clone();
     let task_rule_id = rule_id.clone();
@@ -1562,9 +1676,34 @@ async fn start_tunnel_rule(
             },
         );
         tokio::pin!(forward);
+        let availability = |updates: &watch::Receiver<Option<quinn::Connection>>| {
+            updates
+                .borrow()
+                .as_ref()
+                .is_some_and(|connection| connection.close_reason().is_none())
+        };
+        let mut ready = availability(&state_updates);
+        if ready {
+            let _ = task_events
+                .send(SessionEvent::TunnelState {
+                    rule_id: task_rule_id.clone(),
+                    state: TunnelRuntimeState::Running,
+                })
+                .await;
+        }
+        let deadline = time::sleep(TUNNEL_PEER_WAIT_TIMEOUT);
+        tokio::pin!(deadline);
         let result = loop {
             tokio::select! {
                 result = &mut forward => break result.map_err(|error| error.to_string()),
+                _ = &mut deadline, if !ready => break Err("等待对端认证连接超时；本机监听已关闭，请重试启动".into()),
+                changed = state_updates.changed() => {
+                    if changed.is_err() { break Err("对端会话已结束".into()); }
+                    ready = availability(&state_updates);
+                    deadline.as_mut().reset(time::Instant::now() + TUNNEL_PEER_WAIT_TIMEOUT);
+                    let state = if ready { TunnelRuntimeState::Running } else { TunnelRuntimeState::Starting };
+                    let _ = task_events.send(SessionEvent::TunnelState { rule_id: task_rule_id.clone(), state }).await;
+                },
                 Some(detail) = errors_rx.recv() => {
                     let _ = task_events
                         .send(SessionEvent::TunnelError {
@@ -1584,12 +1723,6 @@ async fn start_tunnel_rule(
             shutdown: shutdown_tx,
         },
     );
-    let _ = events
-        .send(SessionEvent::TunnelState {
-            rule_id,
-            state: TunnelRuntimeState::Running,
-        })
-        .await;
 }
 
 fn start_signal_connect(
@@ -2479,6 +2612,195 @@ mod tests {
         ));
     }
 
+    async fn wait_specific_tunnel_state(
+        events: &mut mpsc::Receiver<SessionEvent>,
+        id: &str,
+        wanted: TunnelRuntimeState,
+    ) {
+        let expected = format!("expected {wanted:?} for {id}");
+        time::timeout(Duration::from_secs(8), async {
+            while let Some(event) = events.recv().await {
+                if let SessionEvent::TunnelState { rule_id, state } = event
+                    && rule_id == id
+                    && state == wanted
+                {
+                    return;
+                }
+            }
+            panic!("session ended before expected tunnel state");
+        })
+        .await
+        .expect(&expected);
+    }
+
+    #[tokio::test]
+    async fn offline_rule_stays_starting_rejects_tcp_and_closes_listener_on_failure() {
+        let (signal, server) = start_local_server().await;
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let mut rule = super::super::config::TunnelRule::new(
+            "offline",
+            Identity::generate().node_id().to_hex(),
+            port,
+            "127.0.0.1:22".parse().unwrap(),
+        );
+        rule.auto_start = true;
+        let mut config = local_config(signal);
+        config.tunnel_rules.push(rule.clone());
+        let (handle, mut events) = spawn(Identity::generate(), config).unwrap();
+        wait_specific_tunnel_state(&mut events, &rule.id, TunnelRuntimeState::Starting).await;
+        let mut tcp = time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(tcp) = tokio::net::TcpStream::connect(rule.listen).await {
+                    break tcp;
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let _ = tcp.write_all(b"offline").await;
+        let mut bytes = [0; 1];
+        let read = time::timeout(Duration::from_secs(1), tcp.read(&mut bytes))
+            .await
+            .expect("offline TCP must close promptly");
+        assert!(matches!(read, Ok(0) | Err(_)));
+        time::timeout(Duration::from_secs(25), async {
+            while let Some(event) = events.recv().await {
+                if let SessionEvent::TunnelState { rule_id, state } = event
+                    && rule_id == rule.id
+                {
+                    assert_ne!(
+                        state,
+                        TunnelRuntimeState::Running,
+                        "offline listener must never report Running"
+                    );
+                    if let TunnelRuntimeState::Error(detail) = state {
+                        assert!(
+                            detail.contains("离线") || detail.contains("超时"),
+                            "{detail}"
+                        );
+                        return;
+                    }
+                }
+            }
+            panic!("offline lookup must end with Error");
+        })
+        .await
+        .unwrap();
+        assert!(tokio::net::TcpStream::connect(rule.listen).await.is_err());
+        drop(handle);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn authenticated_transfer_dispatch_checks_peer_and_live_target_revocation() {
+        use super::super::{
+            config::AllowedForwardTarget,
+            protocol::{self, Frame, Message},
+            task_store::TaskStore,
+            transfer::TransferService,
+        };
+        let root = std::env::temp_dir().join(format!("p2p-tunnel-auth-{}", rand::random::<u128>()));
+        std::fs::create_dir_all(root.join("receive")).unwrap();
+        let (store, _) = TaskStore::open(&root.join("state/tasks.json")).unwrap();
+        let (signal, server) = start_local_server().await;
+        let owner = Identity::generate();
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = echo.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            while let Ok((mut tcp, _)) = echo.accept().await {
+                tokio::spawn(async move {
+                    let (mut r, mut w) = tcp.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+        let grant = AllowedForwardTarget::new("echo", target, vec![a.node_id().to_hex()]);
+        let mut config = local_config(signal);
+        config.transfer = Some(TransferService::new(store, root.join("receive")));
+        config.allowed_forward_targets = vec![grant.clone()];
+        let (owner_handle, mut owner_events) = spawn(owner.clone(), config).unwrap();
+        let (a_handle, mut a_events) = spawn(a.clone(), local_config(signal)).unwrap();
+        let (b_handle, mut b_events) = spawn(b.clone(), local_config(signal)).unwrap();
+        wait_signal_online(&mut owner_events).await;
+        wait_signal_online(&mut a_events).await;
+        wait_signal_online(&mut b_events).await;
+        a_handle.connect_peer(owner.node_id()).unwrap();
+        b_handle.connect_peer(owner.node_id()).unwrap();
+        wait_connected(&mut a_events, &[owner.node_id()]).await;
+        wait_connected(&mut b_events, &[owner.node_id()]).await;
+        let a_connection = inspect(&a_handle).await.remove(&owner.node_id()).unwrap().1;
+        let b_connection = inspect(&b_handle).await.remove(&owner.node_id()).unwrap().1;
+        async fn open(
+            connection: &quinn::Connection,
+            target: SocketAddr,
+        ) -> (quinn::SendStream, quinn::RecvStream, Message) {
+            let (mut send, mut recv) = connection.open_bi().await.unwrap();
+            protocol::write(
+                &mut send,
+                &Frame {
+                    request_id: 0,
+                    message: Message::TunnelOpen { target },
+                },
+            )
+            .await
+            .unwrap();
+            let message = time::timeout(Duration::from_secs(2), protocol::read(&mut recv))
+                .await
+                .unwrap()
+                .unwrap()
+                .message;
+            (send, recv, message)
+        }
+        let (mut established_send, mut established_recv, message) =
+            open(&a_connection, target).await;
+        assert_eq!(message, Message::TunnelReady);
+        assert!(matches!(
+            open(&b_connection, target).await.2,
+            Message::TunnelError { .. }
+        ));
+        let mut disabled = grant.clone();
+        disabled.enabled = false;
+        owner_handle.restrict_forward_targets(&[disabled]);
+        assert!(matches!(
+            open(&a_connection, target).await.2,
+            Message::TunnelError { .. }
+        ));
+        // Revocation does not kill already established streams.
+        established_send.write_all(b"kept").await.unwrap();
+        let mut echoed = [0; 4];
+        established_recv.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"kept");
+        owner_handle
+            .update_tunnel_settings(vec![grant.clone()], Vec::new())
+            .unwrap();
+        assert_eq!(open(&a_connection, target).await.2, Message::TunnelReady);
+        owner_handle.restrict_forward_targets(&[]);
+        let mut unsaved = super::super::config::SettingsDraft::defaults(Some(root.join("receive")));
+        unsaved.signal_host = "127.0.0.1".into();
+        unsaved.signal_port = signal.port().to_string();
+        unsaved.allowed_forward_targets = vec![grant.clone()];
+        assert!(unsaved.save_atomic(&root.join("receive")).is_err());
+        assert!(matches!(
+            open(&a_connection, target).await.2,
+            Message::TunnelError { .. }
+        ));
+        // Unsaved re-enable cannot restore grants revoked from the applied configuration.
+        owner_handle.restrict_forward_targets(&[grant]);
+        assert!(matches!(
+            open(&a_connection, target).await.2,
+            Message::TunnelError { .. }
+        ));
+        drop((a_handle, b_handle, owner_handle));
+        echo_task.abort();
+        server.abort();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn auto_started_bound_peer_tunnel_is_independent_and_reports_real_errors() {
         let (signal, server) = start_local_server().await;
@@ -2520,14 +2842,14 @@ mod tests {
         let mut config_a = local_config(signal);
         config_a.tunnel_rules = vec![auto_rule.clone(), conflict_rule.clone()];
         let mut config_b = local_config(signal);
-        config_b.allowed_forward_targets = vec![target];
+        config_b.allowed_forward_targets = vec![super::super::config::AllowedForwardTarget::new(
+            "echo",
+            target,
+            vec![identity_a.node_id().to_hex()],
+        )];
         let (handle_a, mut events_a) = spawn(identity_a.clone(), config_a).unwrap();
         let (handle_b, mut events_b) = spawn(identity_b.clone(), config_b).unwrap();
 
-        assert_eq!(
-            wait_tunnel_state(&mut events_a, &auto_rule.id).await,
-            TunnelRuntimeState::Running
-        );
         let conflict_state = wait_tunnel_state(&mut events_a, &conflict_rule.id).await;
         let TunnelRuntimeState::Error(conflict_detail) = conflict_state else {
             panic!("occupied local port should fail this rule independently");
@@ -2537,7 +2859,10 @@ mod tests {
             conflict_detail.contains("Address already in use") || conflict_detail.contains("10048"),
             "{conflict_detail}"
         );
-        wait_connected(&mut events_a, &[identity_b.node_id()]).await;
+        assert_eq!(
+            wait_tunnel_state(&mut events_a, &auto_rule.id).await,
+            TunnelRuntimeState::Running
+        );
         wait_connected(&mut events_b, &[identity_a.node_id()]).await;
 
         let mut local = tokio::net::TcpStream::connect(auto_rule.listen)
@@ -2550,6 +2875,16 @@ mod tests {
         local.shutdown().await.unwrap();
         let mut tail = Vec::new();
         local.read_to_end(&mut tail).await.unwrap();
+
+        inspect(&handle_a)
+            .await
+            .get(&identity_b.node_id())
+            .unwrap()
+            .1
+            .close(0u32.into(), b"test reconnect");
+        wait_specific_tunnel_state(&mut events_a, &auto_rule.id, TunnelRuntimeState::Starting)
+            .await;
+        wait_specific_tunnel_state(&mut events_a, &auto_rule.id, TunnelRuntimeState::Running).await;
 
         handle_b
             .update_tunnel_settings(Vec::new(), Vec::new())
@@ -2592,6 +2927,38 @@ mod tests {
             wait_tunnel_state(&mut events_a, &auto_rule.id).await,
             TunnelRuntimeState::Stopped
         );
+
+        assert!(
+            tokio::net::TcpStream::connect(auto_rule.listen)
+                .await
+                .is_err()
+        );
+        for delete in [false, true] {
+            handle_a
+                .update_tunnel_settings(Vec::new(), vec![auto_rule.clone()])
+                .unwrap();
+            wait_specific_tunnel_state(&mut events_a, &auto_rule.id, TunnelRuntimeState::Running)
+                .await;
+            time::timeout(
+                Duration::from_secs(2),
+                handle_a.revoke_tunnel_rule(auto_rule.id.clone(), delete),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(
+                tokio::net::TcpStream::connect(auto_rule.listen)
+                    .await
+                    .is_err(),
+                "acknowledged revoke must release listener"
+            );
+            let rebound = TcpListener::bind(auto_rule.listen)
+                .await
+                .expect("local port must be reusable");
+            drop(rebound);
+            wait_specific_tunnel_state(&mut events_a, &auto_rule.id, TunnelRuntimeState::Stopped)
+                .await;
+        }
 
         handle_a.shutdown();
         handle_b.shutdown();

@@ -665,6 +665,7 @@ pub async fn bridge_tcp(tcp: TcpStream, send: SendStream, recv: RecvStream) -> R
 
 /// Run one local listener over an already authenticated peer session.
 /// The accepted TCP connections and their QUIC streams are owned by this task.
+/// Local connections are rejected promptly while the authenticated peer is unavailable.
 pub async fn forward_on_authenticated_session<F, Fut>(
     listener: TcpListener,
     target: SocketAddr,
@@ -709,30 +710,19 @@ where
                 continue;
             }
         };
-        let mut connection_updates = connections.clone();
-        let mut child_shutdown = shutdown.clone();
+        let connection = connections
+            .borrow()
+            .clone()
+            .filter(|connection| connection.close_reason().is_none());
+        let Some(connection) = connection else {
+            let _ = errors.send("对端尚未建立认证连接，本地 TCP 已关闭；连接就绪后请重试".into());
+            drop(tcp);
+            continue;
+        };
         let errors = errors.clone();
         let open_stream = Arc::clone(&open_stream);
         tasks.spawn(async move {
             let _permit = permit;
-            let connection = loop {
-                if *child_shutdown.borrow() {
-                    return;
-                }
-                if let Some(connection) = connection_updates.borrow().clone()
-                    && connection.close_reason().is_none()
-                {
-                    break connection;
-                }
-                tokio::select! {
-                    changed = child_shutdown.changed() => {
-                        if changed.is_err() || *child_shutdown.borrow() { return; }
-                    }
-                    changed = connection_updates.changed() => {
-                        if changed.is_err() { return; }
-                    }
-                }
-            };
             if let Err(error) = open_stream(tcp, connection, target).await {
                 let _ = errors.send(error.to_string());
                 debug!(%from, %target, error = %error, "本机转发连接失败");
@@ -1043,7 +1033,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticated_desktop_forwarders_stop_independently_and_drain_waiting_tcp() {
+    async fn authenticated_desktop_forwarders_stop_independently_and_release_listeners() {
         let listener_one = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address_one = listener_one.local_addr().unwrap();
         let listener_two = TcpListener::bind("127.0.0.1:0").await.unwrap();
