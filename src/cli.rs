@@ -173,6 +173,15 @@ pub enum Command {
         /// SQLite mapping database; back up this file to preserve short device IDs
         #[arg(long, default_value = "signal-device-ids.sqlite3", value_name = "PATH")]
         short_id_db: std::path::PathBuf,
+        /// Maximum durable IDs ever allocated (existing identities can still reconnect)
+        #[arg(long, default_value_t = 1_000_000)]
+        max_device_ids: u32,
+        /// Global new identity allocations per minute (persisted across restarts)
+        #[arg(long, default_value_t = 120)]
+        new_device_ids_per_minute: u32,
+        /// New identity allocations per source IP per minute
+        #[arg(long, default_value_t = 10)]
+        new_device_ids_per_ip_per_minute: u32,
     },
 
     /// 家里那台：等对端连上来，提供端口转发和收文件

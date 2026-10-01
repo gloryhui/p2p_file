@@ -14,7 +14,14 @@ use std::{
 
 pub const FIRST_SHORT_ID: u32 = 100_000_000;
 pub const LAST_SHORT_ID: u32 = 999_999_999;
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
+pub const ALLOCATION_WINDOW_SECONDS: i64 = 60;
+
+#[derive(Clone, Copy)]
+pub struct AllocationLimits {
+    pub max_mappings: u32,
+    pub per_window: u32,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize)]
 pub struct ShortId(u32);
@@ -112,12 +119,42 @@ impl ShortIdStore {
             INSERT INTO short_id_sequence(id,next_id) VALUES(1,100000000);
             PRAGMA user_version=1;").map_err(db_error)?;
         }
+        if version < 2 {
+            migration
+                .execute_batch(
+                    "CREATE TABLE short_id_allocation_budget (
+                id INTEGER PRIMARY KEY CHECK(id=1), window_started INTEGER NOT NULL,
+                allocations INTEGER NOT NULL CHECK(allocations>=0)
+            );
+            INSERT INTO short_id_allocation_budget VALUES(1,0,0);
+            PRAGMA user_version=2;",
+                )
+                .map_err(db_error)?;
+        }
         migration.commit().map_err(db_error)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
     }
+    #[cfg(test)]
     pub fn register(&self, identity: NodeId) -> Result<ShortId> {
+        self.register_with_limits(
+            identity,
+            AllocationLimits {
+                max_mappings: u32::MAX,
+                per_window: u32::MAX,
+            },
+            || Ok(()),
+        )
+    }
+    /// Existing identities bypass allocation budgets. New mapping, sequence and durable
+    /// budget changes commit together under the same SQLite write transaction.
+    pub fn register_with_limits(
+        &self,
+        identity: NodeId,
+        limits: AllocationLimits,
+        admit_source: impl FnOnce() -> Result<()>,
+    ) -> Result<ShortId> {
         let mut connection = self
             .connection
             .lock()
@@ -158,6 +195,32 @@ impl ShortIdStore {
         if next > LAST_SHORT_ID {
             return Err(db_error("9 位设备 ID 号池已耗尽"));
         }
+        if next - FIRST_SHORT_ID >= limits.max_mappings {
+            return Err(db_error("持久设备映射已达资源上限"));
+        }
+        let (started, allocations): (i64, u32) = transaction
+            .query_row(
+                "SELECT window_started,allocations FROM short_id_allocation_budget WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(db_error)?;
+        // A backwards clock does not reset the persisted window and enable fresh bursts.
+        let (started, allocations) = if now.saturating_sub(started) >= ALLOCATION_WINDOW_SECONDS {
+            (now, 0)
+        } else {
+            (started, allocations)
+        };
+        if allocations >= limits.per_window {
+            return Err(db_error("新设备号码分配暂时受限，请稍后重试"));
+        }
+        admit_source()?;
+        transaction
+            .execute(
+                "UPDATE short_id_allocation_budget SET window_started=?1,allocations=?2 WHERE id=1",
+                params![started, allocations + 1],
+            )
+            .map_err(db_error)?;
         let id = ShortId::new(next)?;
         transaction.execute("INSERT INTO device_id_mapping(device_identity,short_id,created_at,last_seen_at) VALUES(?1,?2,?3,?3)", params![identity,next,now]).map_err(db_error)?;
         transaction
@@ -207,6 +270,15 @@ mod tests {
                 .get::<_, u32>(0))
                 .unwrap(),
             FIRST_SHORT_ID
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT allocations FROM short_id_allocation_budget",
+                [],
+                |r| r.get::<_, u32>(0)
+            )
+            .unwrap(),
+            0
         );
         db.execute_batch("DROP TRIGGER fail_mapping").unwrap();
         drop(db);
@@ -334,6 +406,15 @@ mod tests {
                     .unwrap(),
                 0
             );
+            assert_eq!(
+                db.query_row(
+                    "SELECT allocations FROM short_id_allocation_budget",
+                    [],
+                    |r| r.get::<_, u32>(0)
+                )
+                .unwrap(),
+                0
+            );
             db.execute_batch(
                 "DROP TRIGGER fail_sequence; UPDATE short_id_sequence SET next_id=999999999;",
             )
@@ -363,6 +444,160 @@ mod tests {
         assert!(ShortIdStore::open(Some(&p)).is_err());
         std::fs::remove_file(p).unwrap();
     }
+    #[test]
+    fn allocation_budgets_survive_restart_bypass_reconnect_and_cap_persistent_growth() {
+        let p = path();
+        let a = Identity::generate().node_id();
+        let b = Identity::generate().node_id();
+        let limits = AllocationLimits {
+            max_mappings: 2,
+            per_window: 1,
+        };
+        let store = ShortIdStore::open(Some(&p)).unwrap();
+        let first = store.register_with_limits(a, limits, || Ok(())).unwrap();
+        assert!(store.register_with_limits(b, limits, || Ok(())).is_err());
+        drop(store);
+        let store = ShortIdStore::open(Some(&p)).unwrap();
+        assert_eq!(
+            store
+                .register_with_limits(a, limits, || panic!("reconnect consumed allocation"))
+                .unwrap(),
+            first
+        );
+        assert!(store.register_with_limits(b, limits, || Ok(())).is_err());
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute("UPDATE short_id_allocation_budget SET window_started=0", [])
+            .unwrap();
+        assert_eq!(
+            store
+                .register_with_limits(b, limits, || Ok(()))
+                .unwrap()
+                .value(),
+            FIRST_SHORT_ID + 1
+        );
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute("UPDATE short_id_allocation_budget SET window_started=0", [])
+            .unwrap();
+        assert!(
+            store
+                .register_with_limits(Identity::generate().node_id(), limits, || Ok(()))
+                .unwrap_err()
+                .to_string()
+                .contains("资源上限")
+        );
+        let db = store.connection.lock().unwrap();
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM device_id_mapping", [], |r| r
+                .get::<_, u32>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            db.query_row("SELECT next_id FROM short_id_sequence", [], |r| r
+                .get::<_, u32>(0))
+                .unwrap(),
+            FIRST_SHORT_ID + 2
+        );
+        drop(db);
+        drop(store);
+        std::fs::remove_file(p).unwrap();
+    }
+
+    #[test]
+    fn schema_one_migrates_without_changing_existing_ids() {
+        let p = path();
+        let a = Identity::generate().node_id();
+        let store = ShortIdStore::open(Some(&p)).unwrap();
+        let id = store.register(a).unwrap();
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TABLE short_id_allocation_budget; PRAGMA user_version=1;")
+            .unwrap();
+        drop(store);
+        let store = ShortIdStore::open(Some(&p)).unwrap();
+        assert_eq!(
+            store
+                .register_with_limits(
+                    a,
+                    AllocationLimits {
+                        max_mappings: 0,
+                        per_window: 0
+                    },
+                    || panic!("existing mapping was charged")
+                )
+                .unwrap(),
+            id
+        );
+        assert_eq!(
+            store
+                .connection
+                .lock()
+                .unwrap()
+                .pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
+                .unwrap(),
+            2
+        );
+        drop(store);
+        std::fs::remove_file(p).unwrap();
+    }
+
+    #[test]
+    fn concurrent_new_mapping_admission_is_atomic_and_source_denial_does_not_consume_budget() {
+        let store = std::sync::Arc::new(ShortIdStore::open(None).unwrap());
+        let limits = AllocationLimits {
+            max_mappings: 100,
+            per_window: 5,
+        };
+        assert!(
+            store
+                .register_with_limits(Identity::generate().node_id(), limits, || Err(db_error(
+                    "source budget"
+                )))
+                .is_err()
+        );
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let workers: Vec<_> = (0..16)
+            .map(|_| {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let identity = Identity::generate().node_id();
+                    barrier.wait();
+                    store.register_with_limits(identity, limits, || Ok(()))
+                })
+            })
+            .collect();
+        let successes: Vec<_> = workers
+            .into_iter()
+            .filter_map(|t| t.join().unwrap().ok())
+            .collect();
+        assert_eq!(successes.len(), 5);
+        let db = store.connection.lock().unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT allocations FROM short_id_allocation_budget",
+                [],
+                |r| r.get::<_, u32>(0)
+            )
+            .unwrap(),
+            5
+        );
+        assert_eq!(
+            db.query_row("SELECT next_id FROM short_id_sequence", [], |r| r
+                .get::<_, u32>(0))
+                .unwrap(),
+            FIRST_SHORT_ID + 5
+        );
+    }
+
     #[test]
     fn locked_database_returns_real_error_without_allocating() {
         let p = path();

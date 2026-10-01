@@ -22,7 +22,7 @@ use crate::transport::quic::{
     QUIC_HANDSHAKE_TIMEOUT, connect as quic_connect,
 };
 
-use super::remote_auth::{AuthContext, RemoteVerifier, SecretPassword};
+use super::remote_auth::{AuthContext, RemoteAuthorization, RemoteVerifier, SecretPassword};
 use crate::discovery::short_id::ShortId;
 
 use super::network_state::{
@@ -74,6 +74,7 @@ impl DesktopSessionConfig {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TunnelRuntimeState {
+    WaitingAuthorization,
     Starting,
     Running,
     Stopped,
@@ -433,6 +434,7 @@ enum SessionInput {
         peer: NodeId,
         generation: u64,
         capabilities: u64,
+        authorization: RemoteAuthorization,
         connection: quinn::Connection,
     },
     PeerFailed {
@@ -589,6 +591,17 @@ async fn run_session(
         .cloned()
         .map(|rule| (rule.id.clone(), rule))
         .collect();
+    let mut waiting_tunnels = HashMap::new();
+    let credential_fallback = {
+        #[cfg(test)]
+        {
+            config.test_outgoing_password.is_some()
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    };
     let mut running_tunnels: HashMap<String, RunningTunnel> = HashMap::new();
     let mut restart_after_tunnel_stop = HashSet::new();
     let mut forced_tunnel_errors: HashMap<String, String> = HashMap::new();
@@ -626,6 +639,10 @@ async fn run_session(
             rule,
             local_node,
             &connections,
+            &peers,
+            &credentials,
+            credential_fallback,
+            &mut waiting_tunnels,
             &peer_capabilities,
             &mut peer_connection_updates,
             &mut running_tunnels,
@@ -686,9 +703,12 @@ async fn run_session(
         // settings, and listener startup remain available while a peer is unavailable.
         if let Wake::Command(Some(command)) = &wake
             && let Some(peer) = command.business_peer()
-            && !connections
-                .get(&peer)
-                .is_some_and(|(_, connection)| connection.close_reason().is_none())
+            && (!peers
+                .state(peer)
+                .is_some_and(PeerLifecycle::outbound_authorized)
+                || !connections
+                    .get(&peer)
+                    .is_some_and(|(_, connection)| connection.close_reason().is_none()))
         {
             let _ = events
                 .send(SessionEvent::Diagnostic(
@@ -907,7 +927,40 @@ async fn run_session(
                         .await;
                     continue;
                 }
+                let same_credential = credentials.get(&peer) == Some(&password);
+                #[cfg(test)]
+                let same_credential = same_credential
+                    || (!credentials.contains_key(&peer)
+                        && config.test_outgoing_password.as_ref() == Some(&password));
+                let reuse_authorized = same_credential
+                    && peers.state(peer).is_some_and(|state| {
+                        (state.is_active() && !state.is_connected())
+                            || (state.outbound_authorized()
+                                && connections
+                                    .get(&peer)
+                                    .is_some_and(|(_, c)| c.close_reason().is_none()))
+                    });
                 credentials.insert(peer, password);
+                if !reuse_authorized {
+                    // Explicit credentials upgrade rights on a fresh transport; never copy
+                    // the previous generation's authorization into a new exchange.
+                    if let Some((generation, connection)) = connections.remove(&peer) {
+                        connection.close(0u32.into(), b"new explicit remote credential");
+                        peer_capabilities.remove(&peer);
+                        if let Some(updates) = peer_connection_updates.get(&peer) {
+                            updates.send_replace(None);
+                        }
+                        peers.transition(peer, generation, PeerLifecycle::Disconnected);
+                        emit_peer_state(&events, peer, generation, PeerLifecycle::Disconnected)
+                            .await;
+                    }
+                    if peers.state(peer).is_some_and(PeerLifecycle::is_active)
+                        && let Some(generation) = peers.generation(peer)
+                    {
+                        pending_inbound.remove(&(peer, generation));
+                        peers.transition(peer, generation, PeerLifecycle::Disconnected);
+                    }
+                }
                 let _ = command_tx.try_send(SessionCommand::ConnectPeer(peer));
             }
             Wake::Command(Some(SessionCommand::ConnectShort { short_id, password })) => {
@@ -966,7 +1019,7 @@ async fn run_session(
                     BeginPeerAttempt::AlreadyActive(_) => {
                         // An explicit Connect can discover a restarted peer before Quinn's
                         // old connection idle timeout. Unchanged candidates preserve it.
-                        if peers.state(peer) == Some(&PeerLifecycle::Connected)
+                        if peers.state(peer).is_some_and(PeerLifecycle::is_connected)
                             && let Some(client) = signal.as_ref()
                         {
                             let message = if client.request_lookup(peer).await.is_ok() {
@@ -1089,6 +1142,10 @@ async fn run_session(
                     rule,
                     local_node,
                     &connections,
+                    &peers,
+                    &credentials,
+                    credential_fallback,
+                    &mut waiting_tunnels,
                     &peer_capabilities,
                     &mut peer_connection_updates,
                     &mut running_tunnels,
@@ -1099,6 +1156,7 @@ async fn run_session(
                 .await;
             }
             Wake::Command(Some(SessionCommand::StopTunnel(rule_id))) => {
+                waiting_tunnels.remove(&rule_id);
                 restart_after_tunnel_stop.remove(&rule_id);
                 if let Some(running) = running_tunnels.get(&rule_id) {
                     running.shutdown.send_replace(true);
@@ -1116,6 +1174,7 @@ async fn run_session(
                 delete,
                 done,
             })) => {
+                waiting_tunnels.remove(&rule_id);
                 if delete {
                     tunnel_rules.remove(&rule_id);
                 } else if let Some(rule) = tunnel_rules.get_mut(&rule_id) {
@@ -1153,6 +1212,20 @@ async fn run_session(
                     shutdown.send_replace(true);
                 }
                 tunnel_rules = next_rules;
+                let cancelled = waiting_tunnels
+                    .iter()
+                    .filter(|(id, waiting)| tunnel_rules.get(*id) != Some(*waiting))
+                    .map(|(id, _)| id.clone())
+                    .collect::<Vec<_>>();
+                for id in cancelled {
+                    waiting_tunnels.remove(&id);
+                    let _ = events
+                        .send(SessionEvent::TunnelState {
+                            rule_id: id,
+                            state: TunnelRuntimeState::Stopped,
+                        })
+                        .await;
+                }
                 let auto_start = tunnel_rules
                     .values()
                     .filter(|rule| rule.enabled && rule.auto_start)
@@ -1165,6 +1238,10 @@ async fn run_session(
                         rule,
                         local_node,
                         &connections,
+                        &peers,
+                        &credentials,
+                        credential_fallback,
+                        &mut waiting_tunnels,
                         &peer_capabilities,
                         &mut peer_connection_updates,
                         &mut running_tunnels,
@@ -1200,7 +1277,9 @@ async fn run_session(
                     token,
                 } => {
                     let canonical = canonical_candidates(&candidates);
-                    if peers.state(node_id) == Some(&PeerLifecycle::Connected)
+                    if peers
+                        .state(node_id)
+                        .is_some_and(PeerLifecycle::is_connected)
                         && peer_candidates
                             .get(&node_id)
                             .is_some_and(|(generation, old)| {
@@ -1213,7 +1292,9 @@ async fn run_session(
                             ))
                             .await;
                     }
-                    if peers.state(node_id) == Some(&PeerLifecycle::Connected)
+                    if peers
+                        .state(node_id)
+                        .is_some_and(PeerLifecycle::is_connected)
                         && (connections
                             .get(&node_id)
                             .is_some_and(|(_, connection)| connection.close_reason().is_some())
@@ -1439,16 +1520,17 @@ async fn run_session(
                 peer,
                 generation,
                 capabilities,
+                authorization,
                 connection,
             })) => {
                 pending_inbound.remove(&(peer, generation));
                 if !peers.is_current(peer, generation)
-                    || peers.state(peer) == Some(&PeerLifecycle::Connected)
+                    || peers.state(peer).is_some_and(PeerLifecycle::is_connected)
                 {
                     connection.close(0u32.into(), b"duplicate or stale peer generation");
                     continue;
                 }
-                if !peers.transition(peer, generation, PeerLifecycle::Connected) {
+                if !peers.transition(peer, generation, PeerLifecycle::Connected(authorization)) {
                     connection.close(0u32.into(), b"stale peer generation");
                     continue;
                 }
@@ -1474,11 +1556,46 @@ async fn run_session(
                     .entry(peer)
                     .or_insert_with(|| watch::channel(None).0)
                     .send_replace(
-                        (capabilities & super::protocol::CAP_TCP_TUNNEL != 0)
+                        (authorization.outbound_authorized
+                            && capabilities & super::protocol::CAP_TCP_TUNNEL != 0)
                             .then(|| connection.clone()),
                     );
-                emit_peer_state(&events, peer, generation, PeerLifecycle::Connected).await;
+                emit_peer_state(
+                    &events,
+                    peer,
+                    generation,
+                    PeerLifecycle::Connected(authorization),
+                )
+                .await;
                 emit_lifecycle(&events, NetworkLifecycle::Connected { peer }).await;
+                if authorization.outbound_authorized {
+                    let ready = waiting_tunnels
+                        .keys()
+                        .filter_map(|id| tunnel_rules.get(id))
+                        .filter(|r| {
+                            r.enabled && NodeId::from_hex(&r.peer_node_id).ok() == Some(peer)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for rule in ready {
+                        start_tunnel_rule(
+                            rule,
+                            local_node,
+                            &connections,
+                            &peers,
+                            &credentials,
+                            credential_fallback,
+                            &mut waiting_tunnels,
+                            &peer_capabilities,
+                            &mut peer_connection_updates,
+                            &mut running_tunnels,
+                            &mut tunnel_tasks,
+                            &command_tx,
+                            &events,
+                        )
+                        .await;
+                    }
+                }
                 if let Some(service) = config.transfer.clone() {
                     let transfer_connection = connection.clone();
                     let transfer_events = events.clone();
@@ -1489,6 +1606,7 @@ async fn run_session(
                                 transfer_connection,
                                 peer,
                                 local_node,
+                                authorization,
                                 allowed_forward_targets,
                             )
                             .await
@@ -1508,6 +1626,7 @@ async fn run_session(
                         if let Err(error) = super::tunnel::serve_peer(
                             tunnel_connection,
                             peer,
+                            authorization.inbound_authorized,
                             allowed_forward_targets,
                         )
                         .await
@@ -1680,6 +1799,10 @@ async fn run_session(
                         rule,
                         local_node,
                         &connections,
+                        &peers,
+                        &credentials,
+                        credential_fallback,
+                        &mut waiting_tunnels,
                         &peer_capabilities,
                         &mut peer_connection_updates,
                         &mut running_tunnels,
@@ -1698,6 +1821,12 @@ async fn run_session(
         if !session_shutdown && let Some(service) = config.transfer.as_ref() {
             let ready_connections = connections
                 .iter()
+                .filter(|(peer, (_, connection))| {
+                    peers
+                        .state(**peer)
+                        .is_some_and(PeerLifecycle::outbound_authorized)
+                        && connection.close_reason().is_none()
+                })
                 .map(|(peer, (_, connection))| (*peer, connection.clone()))
                 .collect();
             for scheduled in service.dispatch_ready(&ready_connections) {
@@ -1783,6 +1912,10 @@ async fn start_tunnel_rule(
     rule: super::config::TunnelRule,
     local_node: NodeId,
     connections: &HashMap<NodeId, (u64, quinn::Connection)>,
+    peers: &PeerRegistry,
+    credentials: &HashMap<NodeId, SecretPassword>,
+    credential_fallback: bool,
+    waiting_tunnels: &mut HashMap<String, super::config::TunnelRule>,
     peer_capabilities: &HashMap<NodeId, u64>,
     peer_connection_updates: &mut HashMap<NodeId, watch::Sender<Option<quinn::Connection>>>,
     running_tunnels: &mut HashMap<String, RunningTunnel>,
@@ -1847,6 +1980,23 @@ async fn start_tunnel_rule(
         return;
     }
 
+    let outbound_authorized = peers
+        .state(peer)
+        .is_some_and(PeerLifecycle::outbound_authorized)
+        && connections
+            .get(&peer)
+            .is_some_and(|(_, c)| c.close_reason().is_none());
+    if !outbound_authorized && !credentials.contains_key(&peer) && !credential_fallback {
+        waiting_tunnels.insert(rule_id.clone(), rule.clone());
+        let _ = events
+            .send(SessionEvent::TunnelState {
+                rule_id,
+                state: TunnelRuntimeState::WaitingAuthorization,
+            })
+            .await;
+        return;
+    }
+    waiting_tunnels.remove(&rule_id);
     let listener = match tokio::net::TcpListener::bind(rule.listen).await {
         Ok(listener) => listener,
         Err(error) => {
@@ -1862,7 +2012,7 @@ async fn start_tunnel_rule(
     let connection_updates = peer_connection_updates
         .entry(peer)
         .or_insert_with(|| watch::channel(None).0);
-    if let Some((_, connection)) = connections.get(&peer) {
+    if let Some((_, connection)) = connections.get(&peer).filter(|_| outbound_authorized) {
         connection_updates.send_replace(Some(connection.clone()));
     } else if let Err(error) = command_tx.try_send(SessionCommand::ConnectPeer(peer)) {
         let _ = events
@@ -2230,16 +2380,20 @@ async fn run_peer_attempt(
         }
         None => Err(Error::Protocol("本机远程访问密码尚未初始化".into())),
     };
-    if let Err(error) = authorization {
-        connection.close(3u32.into(), b"remote authorization failed");
-        return Err(error.to_string());
-    }
+    let authorization = match authorization {
+        Ok(authorization) => authorization,
+        Err(error) => {
+            connection.close(3u32.into(), b"remote authorization failed");
+            return Err(error.to_string());
+        }
+    };
     // No business stream handler or listener availability is published before this point.
     inputs
         .send(SessionInput::PeerConnected {
             peer,
             generation,
             capabilities,
+            authorization,
             connection,
         })
         .await
@@ -2384,7 +2538,7 @@ mod tests {
             while let Some(event) = events.recv().await {
                 match event {
                     SessionEvent::PeerState {
-                        state: PeerLifecycle::Connected,
+                        state: PeerLifecycle::Connected(_),
                         ..
                     } => panic!("unauthorized peer was published"),
                     SessionEvent::PeerState {
@@ -2475,11 +2629,12 @@ mod tests {
             ));
         let (ha, mut ea) = spawn(a.clone(), config).unwrap();
         let (hb, mut eb) = spawn(b.clone(), destination).unwrap();
+        // A restarted process has no peer password and must not bind or attempt authentication.
+        wait_specific_tunnel_state(&mut ea, &rule_id, TunnelRuntimeState::WaitingAuthorization)
+            .await;
+        assert!(tokio::net::TcpStream::connect(local).await.is_err());
         wait_signal_online(&mut ea).await;
         wait_signal_online(&mut eb).await;
-        // Auto start without an explicitly supplied credential must fail closed.
-        wait_failed(&mut ea).await;
-        wait_failed(&mut eb).await;
         assert!(inspect(&ha).await.is_empty());
         assert!(inspect(&hb).await.is_empty());
         ha.connect_peer_with_password(b.node_id(), SecretPassword::new("Wrong9".into()).unwrap())
@@ -2500,6 +2655,401 @@ mod tests {
         hb.shutdown();
         server.abort();
     }
+    async fn wait_authorization(
+        events: &mut mpsc::Receiver<SessionEvent>,
+        peer: NodeId,
+    ) -> RemoteAuthorization {
+        time::timeout(Duration::from_secs(20), async {
+            while let Some(event) = events.recv().await {
+                match event {
+                    SessionEvent::PeerState {
+                        peer: id,
+                        state: PeerLifecycle::Connected(auth),
+                        ..
+                    } if id == peer => return auth,
+                    SessionEvent::PeerState {
+                        state: PeerLifecycle::Failed(e),
+                        ..
+                    } => panic!("authorization failed: {e}"),
+                    _ => {}
+                }
+            }
+            panic!("session closed before authorization")
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn passwordless_auto_start_waits_without_binding_then_continues_after_explicit_auth() {
+        let (address, server) = start_local_server().await;
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let reserve = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = reserve.local_addr().unwrap();
+        drop(reserve);
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut rule = super::super::config::TunnelRule::new(
+            "deferred",
+            b.node_id().to_hex(),
+            local.port(),
+            target.local_addr().unwrap(),
+        );
+        rule.auto_start = true;
+        let mut ca = auth_config(address);
+        ca.tunnel_rules.push(rule.clone());
+        let mut cb = auth_config(address);
+        cb.allowed_forward_targets
+            .push(super::super::config::AllowedForwardTarget::new(
+                "target",
+                target.local_addr().unwrap(),
+                vec![a.node_id().to_hex()],
+            ));
+        let (ha, mut ea) = spawn(a.clone(), ca).unwrap();
+        let (hb, mut eb) = spawn(b.clone(), cb).unwrap();
+        wait_specific_tunnel_state(&mut ea, &rule.id, TunnelRuntimeState::WaitingAuthorization)
+            .await;
+        wait_signal_online(&mut ea).await;
+        wait_signal_online(&mut eb).await;
+        assert!(tokio::net::TcpStream::connect(local).await.is_err());
+        assert!(inspect(&ha).await.is_empty());
+        assert!(inspect(&hb).await.is_empty());
+        ha.connect_peer_with_password(b.node_id(), test_password())
+            .unwrap();
+        wait_specific_tunnel_state(&mut ea, &rule.id, TunnelRuntimeState::Running).await;
+        assert_eq!(
+            wait_authorization(&mut eb, a.node_id()).await,
+            RemoteAuthorization {
+                inbound_authorized: true,
+                outbound_authorized: false
+            }
+        );
+        let mut tcp = tokio::net::TcpStream::connect(local).await.unwrap();
+        tcp.write_all(b"request").await.unwrap();
+        let (mut destination, _) = time::timeout(Duration::from_secs(5), target.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut bytes = [0; 7];
+        destination.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"request");
+        destination.write_all(b"reply").await.unwrap();
+        let mut reply = [0; 5];
+        tcp.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"reply");
+        ha.revoke_tunnel_rule(rule.id, true).await.unwrap();
+        assert!(tokio::net::TcpStream::connect(local).await.is_err());
+        ha.shutdown();
+        hb.shutdown();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stopping_or_reconfiguring_waiting_rules_cancels_their_deferred_start() {
+        let (address, server) = start_local_server().await;
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut reservations = Vec::new();
+        let mut rules = Vec::new();
+        for name in ["active", "stop", "disable", "delete", "no-auto"] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut rule = super::super::config::TunnelRule::new(
+                name,
+                b.node_id().to_hex(),
+                listener.local_addr().unwrap().port(),
+                target.local_addr().unwrap(),
+            );
+            rule.auto_start = true;
+            rules.push(rule);
+            reservations.push(listener);
+        }
+        let mut ca = auth_config(address);
+        ca.tunnel_rules = rules.clone();
+        let (ha, mut ea) = spawn(a.clone(), ca).unwrap();
+        let (hb, mut eb) = spawn(b.clone(), auth_config(address)).unwrap();
+        for rule in &rules {
+            wait_specific_tunnel_state(&mut ea, &rule.id, TunnelRuntimeState::WaitingAuthorization)
+                .await;
+        }
+        drop(reservations);
+        wait_signal_online(&mut ea).await;
+        wait_signal_online(&mut eb).await;
+        let mut next = rules.clone();
+        next[2].enabled = false;
+        next[4].auto_start = false;
+        next.remove(3);
+        ha.update_tunnel_settings(Vec::new(), next).unwrap();
+        ha.stop_tunnel_rule(rules[1].id.clone()).unwrap();
+        assert!(inspect(&ha).await.is_empty()); // Command barrier before authentication.
+        ha.connect_peer_with_password(b.node_id(), test_password())
+            .unwrap();
+        wait_specific_tunnel_state(&mut ea, &rules[0].id, TunnelRuntimeState::Running).await;
+        for rule in &rules[1..] {
+            assert!(
+                tokio::net::TcpStream::connect(rule.listen).await.is_err(),
+                "cancelled rule {} still listening",
+                rule.name
+            );
+        }
+        ha.revoke_tunnel_rule(rules[0].id.clone(), true)
+            .await
+            .unwrap();
+        ha.shutdown();
+        hb.shutdown();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn one_way_auth_gates_commands_queue_and_remote_requests_then_both_passwords_enable_reverse_business()
+     {
+        use super::super::{
+            protocol::{self, Frame, Message},
+            task_model::{TaskDirection, TaskState},
+            task_store::TaskStore,
+            transfer::TransferService,
+        };
+        let root = std::env::temp_dir().join(format!("p2p-directional-{}", rand::random::<u128>()));
+        std::fs::create_dir_all(root.join("a-receive")).unwrap();
+        std::fs::create_dir(root.join("b-receive")).unwrap();
+        let (sa, _) = TaskStore::open(&root.join("a-state/tasks.json")).unwrap();
+        let (sb, _) = TaskStore::open(&root.join("b-state/tasks.json")).unwrap();
+        let service_a = TransferService::new(sa, root.join("a-receive"));
+        let service_b = TransferService::new(sb, root.join("b-receive"));
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let pa = SecretPassword::new("Local9A".into()).unwrap();
+        let pb = SecretPassword::new("Local9B".into()).unwrap();
+        let ta = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tb = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (address, server) = start_local_server().await;
+        let mut ca = auth_config(address);
+        ca.remote_auth = Some(RemoteVerifier::create(&pa).unwrap());
+        ca.transfer = Some(service_a.clone());
+        let mut cb = auth_config(address);
+        cb.remote_auth = Some(RemoteVerifier::create(&pb).unwrap());
+        cb.transfer = Some(service_b.clone());
+        ca.allowed_forward_targets
+            .push(super::super::config::AllowedForwardTarget::new(
+                "a",
+                ta.local_addr().unwrap(),
+                vec![b.node_id().to_hex()],
+            ));
+        cb.allowed_forward_targets
+            .push(super::super::config::AllowedForwardTarget::new(
+                "b",
+                tb.local_addr().unwrap(),
+                vec![a.node_id().to_hex()],
+            ));
+        let (ha, mut ea) = spawn(a.clone(), ca).unwrap();
+        let (hb, mut eb) = spawn(b.clone(), cb).unwrap();
+        wait_signal_online(&mut ea).await;
+        wait_signal_online(&mut eb).await;
+        ha.connect_peer_with_password(b.node_id(), pb).unwrap();
+        assert_eq!(
+            wait_authorization(&mut ea, b.node_id()).await,
+            RemoteAuthorization {
+                inbound_authorized: false,
+                outbound_authorized: true
+            }
+        );
+        assert_eq!(
+            wait_authorization(&mut eb, a.node_id()).await,
+            RemoteAuthorization {
+                inbound_authorized: true,
+                outbound_authorized: false
+            }
+        );
+        let conn_a = inspect(&ha).await[&b.node_id()].1.clone();
+        let conn_b = inspect(&hb).await[&a.node_id()].1.clone();
+        // Reject forged peer requests despite an authenticated, live QUIC transport.
+        let (mut send, mut recv) = conn_b.open_bi().await.unwrap();
+        protocol::write(
+            &mut send,
+            &Frame {
+                request_id: 0,
+                message: Message::TunnelOpen {
+                    target: ta.local_addr().unwrap(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            time::timeout(Duration::from_secs(5), protocol::read(&mut recv))
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            time::timeout(Duration::from_millis(100), ta.accept())
+                .await
+                .is_err()
+        );
+        let source_b = root.join("reverse.bin");
+        std::fs::write(&source_b, b"reverse").unwrap();
+        hb.send_file(a.node_id(), source_b.clone()).unwrap();
+        hb.start_speed(
+            a.node_id(),
+            super::super::config::SpeedtestDirection::Upload,
+            30,
+        )
+        .unwrap();
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    eb.recv().await,
+                    Some(SessionEvent::SpeedRequestEnded { .. })
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            service_b
+                .snapshot()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.direction() != TaskDirection::Send)
+        );
+        // Restored/prepared queue entries also obey the outgoing gate.
+        let queued = service_b.select_file(a.node_id(), source_b).await.unwrap();
+        time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            service_b.task(queued.clone()).await.unwrap().state(),
+            TaskState::Queued
+        );
+        assert_eq!(
+            std::fs::read_dir(root.join("a-receive")).unwrap().count(),
+            0
+        );
+        let source_a = root.join("forward.bin");
+        std::fs::write(&source_a, b"forward").unwrap();
+        ha.send_file(b.node_id(), source_a).unwrap();
+        time::timeout(Duration::from_secs(10), async {
+            while !service_a
+                .snapshot()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.direction() == TaskDirection::Send && r.state() == TaskState::Completed)
+            {
+                time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(root.join("b-receive/forward.bin")).unwrap(),
+            b"forward"
+        );
+        time::timeout(Duration::from_secs(5), async {
+            while !(service_a.set_test_speed_duration(b.node_id(), Duration::from_millis(100))
+                && service_b.set_test_speed_duration(a.node_id(), Duration::from_millis(100)))
+            {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        ha.start_speed(
+            b.node_id(),
+            super::super::config::SpeedtestDirection::Both,
+            30,
+        )
+        .unwrap();
+        time::timeout(Duration::from_secs(15), async {
+            let mut phases = 0;
+            while phases < 2 {
+                if let Some(SessionEvent::SpeedPhaseCompleted { snapshot, .. }) = ea.recv().await {
+                    assert!(snapshot.bytes > 0);
+                    phases += 1;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let (mut send_a, mut recv_a) = conn_a.open_bi().await.unwrap();
+        protocol::write(
+            &mut send_a,
+            &Frame {
+                request_id: 0,
+                message: Message::TunnelOpen {
+                    target: tb.local_addr().unwrap(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            protocol::read(&mut recv_a).await.unwrap().message,
+            Message::TunnelReady
+        ));
+        drop(tb.accept().await.unwrap());
+        drop((send_a, recv_a));
+        // B separately proves A's password; A proves its current-process B credential again.
+        hb.connect_peer_with_password(a.node_id(), pa).unwrap();
+        assert_eq!(
+            wait_authorization(&mut ea, b.node_id()).await,
+            RemoteAuthorization::BOTH
+        );
+        assert_eq!(
+            wait_authorization(&mut eb, a.node_id()).await,
+            RemoteAuthorization::BOTH
+        );
+        assert_ne!(
+            inspect(&hb).await[&a.node_id()].1.stable_id(),
+            conn_b.stable_id()
+        );
+        time::timeout(Duration::from_secs(10), async {
+            while service_b.task(queued.clone()).await.unwrap().state() != TaskState::Completed {
+                time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(root.join("a-receive/reverse.bin")).unwrap(),
+            b"reverse"
+        );
+        let new_b = inspect(&hb).await[&a.node_id()].1.clone();
+        let (mut send, mut recv) = new_b.open_bi().await.unwrap();
+        protocol::write(
+            &mut send,
+            &Frame {
+                request_id: 0,
+                message: Message::TunnelOpen {
+                    target: ta.local_addr().unwrap(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            protocol::read(&mut recv).await.unwrap().message,
+            Message::TunnelReady
+        ));
+        drop(ta.accept().await.unwrap());
+        drop((send, recv));
+        ha.shutdown();
+        hb.shutdown();
+        drop((ha, hb, service_a, service_b));
+        server.abort();
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                if std::fs::remove_dir_all(&root).is_ok() {
+                    break;
+                }
+                time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn short_id_connect_authenticates_then_rotation_revokes_and_old_password_fails() {
         let (address, server) = start_local_server().await;
@@ -2645,7 +3195,7 @@ mod tests {
                 }
                 if let SessionEvent::PeerState {
                     peer,
-                    state: PeerLifecycle::Connected,
+                    state: PeerLifecycle::Connected(_),
                     ..
                 } = event
                 {

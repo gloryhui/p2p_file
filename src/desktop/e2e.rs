@@ -2,7 +2,7 @@
 //! desktop has no RPC, environment switch, fault injector or alternate network loop.
 use super::{
     config::{self, DesktopConfig, SettingsDraft},
-    network_state::{NetworkLifecycle, PeerLifecycle},
+    network_state::NetworkLifecycle,
     session::{self, DesktopSessionConfig, DesktopSessionHandle, SessionEvent},
     task_model::TaskId,
     task_store::TaskStore,
@@ -54,6 +54,10 @@ fn start(
         ..Default::default()
     };
     conf.remote_auth = draft.remote_auth.clone();
+    // These file/recovery fixtures exercise bidirectional sessions. Both actors
+    // explicitly hold the test peer password and prove it on every new transport.
+    conf.test_outgoing_password =
+        Some(super::remote_auth::SecretPassword::new("Test9Pass".into()).unwrap());
     conf.transfer = Some(service);
     session::spawn(identity, conf).unwrap()
 }
@@ -100,7 +104,7 @@ fn actor(root: PathBuf) {
                                 peer,
                                 (
                                     generation,
-                                    if matches!(state, PeerLifecycle::Connected) {
+                                    if state.outbound_authorized() {
                                         "Connected".into()
                                     } else {
                                         format!("{state:?}")

@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use super::remote_auth::RemoteAuthorization;
 use crate::identity::NodeId;
 
 pub const MAX_PEERS: usize = 16;
@@ -52,7 +53,7 @@ impl NetworkLifecycle {
             Self::PeerPending { peer } => format!("等待对端 {} 上线", peer.short()),
             Self::Punching { peer } => format!("正在连接对端 {}", peer.short()),
             Self::Authenticating { peer } => format!("正在认证对端 {}", peer.short()),
-            Self::Connected { peer } => format!("远程访问已授权 {}", peer.short()),
+            Self::Connected { peer } => format!("设备会话已连接 {}", peer.short()),
             Self::Disconnected { peer, detail } => match peer {
                 Some(peer) => format!("对端 {} 已断开：{detail}", peer.short()),
                 None => format!("网络已断开：{detail}"),
@@ -69,12 +70,18 @@ pub enum PeerLifecycle {
     Authenticating,
     Negotiating,
     RemoteAuthPending,
-    Connected,
+    Connected(RemoteAuthorization),
     Disconnected,
     Failed(String),
 }
 
 impl PeerLifecycle {
+    pub fn is_connected(&self) -> bool {
+        matches!(self, Self::Connected(_))
+    }
+    pub fn outbound_authorized(&self) -> bool {
+        matches!(self, Self::Connected(auth) if auth.outbound_authorized)
+    }
     fn is_pending(&self) -> bool {
         matches!(
             self,
@@ -87,7 +94,7 @@ impl PeerLifecycle {
     }
 
     pub(super) fn is_active(&self) -> bool {
-        self.is_pending() || matches!(self, Self::Connected)
+        self.is_pending() || self.is_connected()
     }
 
     fn is_terminal(&self) -> bool {
@@ -207,7 +214,7 @@ impl PeerRegistry {
     pub fn connected_count(&self) -> usize {
         self.peers
             .values()
-            .filter(|record| record.state == PeerLifecycle::Connected)
+            .filter(|record| record.state.is_connected())
             .count()
     }
 
@@ -263,7 +270,11 @@ mod tests {
             peers.begin_attempt(peer_b),
             BeginPeerAttempt::AlreadyActive(generation_b)
         );
-        assert!(peers.transition(peer_b, generation_b, PeerLifecycle::Connected));
+        assert!(peers.transition(
+            peer_b,
+            generation_b,
+            PeerLifecycle::Connected(RemoteAuthorization::BOTH)
+        ));
         assert_eq!(peers.connected_count(), 1);
 
         let BeginPeerAttempt::Started(generation_c) = peers.begin_attempt(peer_c) else {
@@ -316,7 +327,11 @@ mod tests {
             vec![(peer, generation)]
         );
         assert!(peers.transition(peer, generation, PeerLifecycle::Failed("offline".into())));
-        assert!(!peers.transition(peer, generation, PeerLifecycle::Connected));
+        assert!(!peers.transition(
+            peer,
+            generation,
+            PeerLifecycle::Connected(RemoteAuthorization::BOTH)
+        ));
         let BeginPeerAttempt::Started(new_generation) = peers.begin_attempt(peer) else {
             panic!()
         };

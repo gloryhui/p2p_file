@@ -1176,6 +1176,15 @@ impl TransferService {
             .ok_or_else(|| disk::failure("测速连接已断开"))?
             .cancel(id)
     }
+    #[cfg(test)]
+    pub(super) fn set_test_speed_duration(&self, peer: NodeId, duration: Duration) -> bool {
+        if let Some(speed) = self.speed_peers.lock().unwrap().get(&peer) {
+            speed.set_test_duration(duration);
+            true
+        } else {
+            false
+        }
+    }
     #[allow(dead_code)] // T010 presentation.
     pub fn speed_snapshots(&self) -> HashMap<NodeId, super::speed::SpeedSnapshot> {
         self.speed_peers
@@ -1193,8 +1202,14 @@ impl TransferService {
         local: NodeId,
     ) -> Result<()> {
         let (_, allowed_forward_targets) = tokio::sync::watch::channel(Vec::new());
-        self.serve_peer_with_speed_and_targets(connection, peer, local, allowed_forward_targets)
-            .await
+        self.serve_peer_with_speed_and_targets(
+            connection,
+            peer,
+            local,
+            super::remote_auth::RemoteAuthorization::BOTH,
+            allowed_forward_targets,
+        )
+        .await
     }
 
     pub async fn serve_peer_with_speed_and_targets(
@@ -1202,6 +1217,7 @@ impl TransferService {
         connection: Connection,
         peer: NodeId,
         local: NodeId,
+        authorization: super::remote_auth::RemoteAuthorization,
         allowed_forward_targets: watch::Receiver<Vec<super::config::AllowedForwardTarget>>,
     ) -> Result<()> {
         let speed = super::speed::SpeedPeer::new(
@@ -1234,21 +1250,34 @@ impl TransferService {
             peer,
             speed: speed.clone(),
         };
-        self.serve_peer_inner(connection, peer, Some(speed), allowed_forward_targets)
-            .await
+        self.serve_peer_inner(
+            connection,
+            peer,
+            Some(speed),
+            authorization,
+            allowed_forward_targets,
+        )
+        .await
     }
     /// Test convenience; production always enables negotiated speed business.
     #[cfg(test)]
     pub async fn serve_peer(&self, connection: Connection, peer: NodeId) -> Result<()> {
         let (_, allowed_forward_targets) = watch::channel(Vec::new());
-        self.serve_peer_inner(connection, peer, None, allowed_forward_targets)
-            .await
+        self.serve_peer_inner(
+            connection,
+            peer,
+            None,
+            super::remote_auth::RemoteAuthorization::BOTH,
+            allowed_forward_targets,
+        )
+        .await
     }
     async fn serve_peer_inner(
         &self,
         connection: Connection,
         peer: NodeId,
         speed: Option<super::speed::SpeedPeer>,
+        authorization: super::remote_auth::RemoteAuthorization,
         allowed_forward_targets: watch::Receiver<Vec<super::config::AllowedForwardTarget>>,
     ) -> Result<()> {
         let mut streams = JoinSet::new();
@@ -1262,7 +1291,7 @@ impl TransferService {
             tokio::select! {
                 accepted=connection.accept_bi()=> {
                     let (mut send,mut recv)=match accepted { Ok(streams)=>streams, Err(_)=>break };
-                    if streams.len()>=8 {let _=send.reset(4u32.into());let _=recv.stop(4u32.into());continue;}
+                    if !authorization.inbound_authorized || streams.len()>=8 {let _=send.reset(4u32.into());let _=recv.stop(4u32.into());continue;}
                     let service=self.clone();let connection=connection.clone();let speed=speed.clone();let allowed_forward_targets=allowed_forward_targets.clone();
                     streams.spawn(async move {
                         let buffered=tokio::time::timeout(Duration::from_secs(5),service.frame_budget.read(&mut recv,None)).await.map_err(|_|disk::failure("文件流首帧超时"))??;
@@ -1276,6 +1305,9 @@ impl TransferService {
                             Message::Speed(_)=> { let speed=speed.ok_or_else(||disk::failure("对端不支持测速执行"))?;drop(_lease);speed.serve_control(send,recv,first).await },
                             Message::Offer{..} => service.receive_offer(send,recv,peer,super::frame_budget::BufferedFrame{frame:first,_lease}).await,
                             Message::ResumeTask{task_id} if first.request_id==1 => {
+                                // This recovery path initiates a new Offer stream, so it also
+                                // needs the local outgoing right; it is not a stream reply.
+                                if !authorization.outbound_authorized { let _=send.reset(3u32.into()); let _=recv.stop(3u32.into()); return Err(disk::failure("出站文件访问尚未授权")); }
                                 let id=task_id.clone();let lookup=id.clone();
                                 let checked=service.read_store(move|store|disk::bound_task(store,peer,&lookup)).await;
                                 if !matches!(checked, Ok(ref record) if record.direction()==TaskDirection::Send && can_continue(record)) {

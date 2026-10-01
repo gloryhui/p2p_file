@@ -63,7 +63,19 @@ async fn run(cli: Cli) -> Result<()> {
         Command::SignalServer {
             listen,
             short_id_db,
-        } => cmd_signal_server(listen, short_id_db).await,
+            max_device_ids,
+            new_device_ids_per_minute,
+            new_device_ids_per_ip_per_minute,
+        } => {
+            cmd_signal_server(
+                listen,
+                short_id_db,
+                max_device_ids,
+                new_device_ids_per_minute,
+                new_device_ids_per_ip_per_minute,
+            )
+            .await
+        }
         Command::Serve {
             direct,
             allow,
@@ -390,10 +402,19 @@ async fn close_endpoint(endpoint: &quinn::Endpoint) {
     let _ = tokio::time::timeout(Duration::from_secs(3), endpoint.wait_idle()).await;
 }
 
-async fn cmd_signal_server(listen: SocketAddr, short_id_db: std::path::PathBuf) -> Result<()> {
+async fn cmd_signal_server(
+    listen: SocketAddr,
+    short_id_db: std::path::PathBuf,
+    max_device_ids: u32,
+    new_device_ids_per_minute: u32,
+    new_device_ids_per_ip_per_minute: u32,
+) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let config = SignalServerConfig {
         short_id_database: Some(short_id_db),
+        max_short_id_mappings: max_device_ids,
+        short_id_allocations_per_minute: new_device_ids_per_minute,
+        short_id_allocations_per_ip_per_minute: new_device_ids_per_ip_per_minute,
         ..SignalServerConfig::default()
     };
     println!("信令服务器监听 {listen}");

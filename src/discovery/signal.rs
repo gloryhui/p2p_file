@@ -30,7 +30,7 @@
 //! 身份最终仍由 QUIC 之上的应用层握手确认；信令认证是为了让服务器自己的
 //! 在线表不被随意污染（冒名、幽灵节点、内存耗尽）。
 
-use super::short_id::{ShortId, ShortIdStore};
+use super::short_id::{ALLOCATION_WINDOW_SECONDS, AllocationLimits, ShortId, ShortIdStore};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -99,6 +99,10 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 pub struct SignalServerConfig {
     /// Persistent by default. None explicitly opts into an ephemeral embedded/test registry.
     pub short_id_database: Option<PathBuf>,
+    /// New durable mappings only; reconnects do not consume these budgets.
+    pub max_short_id_mappings: u32,
+    pub short_id_allocations_per_minute: u32,
+    pub short_id_allocations_per_ip_per_minute: u32,
     pub short_lookups_per_connection: u32,
     pub short_lookups_per_ip: u32,
     pub max_short_lookup_misses: u32,
@@ -134,6 +138,9 @@ impl Default for SignalServerConfig {
     fn default() -> Self {
         Self {
             short_id_database: Some(PathBuf::from("signal-device-ids.sqlite3")),
+            max_short_id_mappings: 1_000_000,
+            short_id_allocations_per_minute: 120,
+            short_id_allocations_per_ip_per_minute: 10,
             short_lookups_per_connection: 5,
             short_lookups_per_ip: 20,
             max_short_lookup_misses: 3,
@@ -447,10 +454,16 @@ impl LookupWindow {
         }
     }
     fn expired(&self) -> bool {
-        self.started.elapsed() >= SHORT_LOOKUP_WINDOW
+        self.expired_after(SHORT_LOOKUP_WINDOW)
+    }
+    fn expired_after(&self, window: Duration) -> bool {
+        self.started.elapsed() >= window
     }
     fn take(&mut self, limit: u32, misses: u32) -> bool {
-        if self.expired() {
+        self.take_in_window(limit, misses, SHORT_LOOKUP_WINDOW)
+    }
+    fn take_in_window(&mut self, limit: u32, misses: u32, window: Duration) -> bool {
+        if self.expired_after(window) {
             *self = Self::new();
         }
         if self.requests >= limit || self.misses >= misses {
@@ -465,24 +478,53 @@ impl LookupWindow {
 struct ShortIdResources {
     store: Arc<ShortIdStore>,
     pending: Arc<Semaphore>,
+    allocation_ips: Arc<std::sync::Mutex<HashMap<IpAddr, LookupWindow>>>,
+    allocation_limits: AllocationLimits,
+    per_ip_allocations: u32,
 }
 impl ShortIdResources {
     fn new(config: &SignalServerConfig) -> Result<Self> {
         Ok(Self {
             store: Arc::new(ShortIdStore::open(config.short_id_database.as_deref())?),
             pending: Arc::new(Semaphore::new(config.max_pending_lookups)),
+            allocation_ips: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            allocation_limits: AllocationLimits {
+                max_mappings: config.max_short_id_mappings,
+                per_window: config.short_id_allocations_per_minute,
+            },
+            per_ip_allocations: config.short_id_allocations_per_ip_per_minute,
         })
     }
-    async fn register(&self, node: NodeId) -> Result<ShortId> {
+    async fn register(&self, node: NodeId, ip: IpAddr) -> Result<ShortId> {
         let permit = self
             .pending
             .clone()
             .try_acquire_owned()
             .map_err(|_| Error::Discovery("短 ID 数据库请求达到上限".into()))?;
         let store = self.store.clone();
+        let ips = self.allocation_ips.clone();
+        let limits = self.allocation_limits;
+        let per_ip = self.per_ip_allocations;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            store.register(node)
+            store.register_with_limits(node, limits, || {
+                let window = Duration::from_secs(ALLOCATION_WINDOW_SECONDS as u64);
+                let mut ips = ips
+                    .lock()
+                    .map_err(|_| Error::Discovery("发号预算不可用".into()))?;
+                ips.retain(|_, bucket| !bucket.expired_after(window));
+                if !ips.contains_key(&ip) && ips.len() >= MAX_SHORT_LOOKUP_IPS {
+                    return Err(Error::Discovery("新设备分配暂时受限".into()));
+                }
+                if !ips
+                    .entry(ip)
+                    .or_insert_with(LookupWindow::new)
+                    .take_in_window(per_ip, u32::MAX, window)
+                {
+                    return Err(Error::Discovery("新设备分配暂时受限".into()));
+                }
+                Ok(())
+            })
         })
         .await
         .map_err(|_| Error::Discovery("短 ID 数据库任务失败".into()))?
@@ -951,7 +993,7 @@ async fn handle_signal_client(
                     }
                 }
                 // Private-key possession has been proved. Only now may SQLite allocate an ID.
-                let short_id = match short_ids.register(node_id).await {
+                let short_id = match short_ids.register(node_id, remote_ip).await {
                     Ok(id) => id,
                     Err(error) => {
                         reject(&outbox, error.to_string());
@@ -1909,6 +1951,112 @@ mod tests {
         }
         assert!(!registry.take_short_lookup("192.0.2.1".parse().unwrap(), &config));
     }
+    #[tokio::test]
+    async fn identity_churn_is_limited_after_disconnect_but_existing_identity_can_reconnect() {
+        let (address, registry) = spawn_signal_server_with(SignalServerConfig {
+            short_id_allocations_per_ip_per_minute: 2,
+            ..SignalServerConfig::for_tests()
+        })
+        .await;
+        let known = Identity::generate();
+        for identity in [&known, &Identity::generate()] {
+            let client = SignalingClient::connect_desktop_with_events(
+                &address.to_string(),
+                identity,
+                vec![],
+            )
+            .await
+            .unwrap();
+            drop(client);
+            wait_for_registry(&registry, |r| r.peers.is_empty()).await;
+        }
+        for _ in 0..8 {
+            assert!(
+                SignalingClient::connect_desktop_with_events(
+                    &address.to_string(),
+                    &Identity::generate(),
+                    vec![]
+                )
+                .await
+                .is_err()
+            );
+        }
+        let reconnected =
+            SignalingClient::connect_desktop_with_events(&address.to_string(), &known, vec![])
+                .await
+                .unwrap();
+        assert_eq!(reconnected.short_id().unwrap().value(), 100_000_000);
+    }
+
+    #[tokio::test]
+    async fn global_new_id_budget_covers_multiple_ips_and_source_table_stays_bounded() {
+        let resources = ShortIdResources::new(&SignalServerConfig {
+            short_id_allocations_per_minute: 2,
+            short_id_allocations_per_ip_per_minute: 1,
+            ..SignalServerConfig::for_tests()
+        })
+        .unwrap();
+        let a = Identity::generate().node_id();
+        let ip_a = "192.0.2.1".parse().unwrap();
+        let first = resources.register(a, ip_a).await.unwrap();
+        assert!(
+            resources
+                .register(Identity::generate().node_id(), ip_a)
+                .await
+                .is_err()
+        );
+        resources
+            .register(Identity::generate().node_id(), "192.0.2.2".parse().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            resources
+                .register(Identity::generate().node_id(), "192.0.2.3".parse().unwrap())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            resources
+                .register(a, "192.0.2.3".parse().unwrap())
+                .await
+                .unwrap(),
+            first
+        );
+        assert_eq!(resources.allocation_ips.lock().unwrap().len(), 2);
+        let full = ShortIdResources::new(&SignalServerConfig {
+            short_id_allocations_per_minute: u32::MAX,
+            ..SignalServerConfig::for_tests()
+        })
+        .unwrap();
+        let id = full.register(a, ip_a).await.unwrap();
+        {
+            let mut ips = full.allocation_ips.lock().unwrap();
+            ips.clear();
+            for n in 0..MAX_SHORT_LOOKUP_IPS {
+                ips.insert(
+                    IpAddr::V6(std::net::Ipv6Addr::from(n as u128)),
+                    LookupWindow::new(),
+                );
+            }
+        }
+        assert!(
+            full.register(Identity::generate().node_id(), "192.0.2.4".parse().unwrap())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            full.allocation_ips.lock().unwrap().len(),
+            MAX_SHORT_LOOKUP_IPS
+        );
+        // Existing mappings do not need a new source bucket even when its table is full.
+        assert_eq!(
+            full.register(a, "192.0.2.4".parse().unwrap())
+                .await
+                .unwrap(),
+            id
+        );
+    }
+
     #[tokio::test]
     async fn full_online_registry_does_not_keep_consuming_durable_ids() {
         let (address, registry) = spawn_signal_server_with(SignalServerConfig {

@@ -1220,10 +1220,11 @@ impl DesktopShell {
             self.set_status("请先输入对端设备 ID 和密码并连接", cx);
             return None;
         };
-        if !matches!(
-            self.peer_states.get(&peer),
-            Some(network_state::PeerLifecycle::Connected)
-        ) {
+        if !self
+            .peer_states
+            .get(&peer)
+            .is_some_and(network_state::PeerLifecycle::outbound_authorized)
+        {
             self.set_status("请先连接并等待远程访问授权完成", cx);
             return None;
         }
@@ -1328,10 +1329,11 @@ impl DesktopShell {
             .ok_or("请先保存信令配置，启动网络会话".to_owned())
             .and_then(|s| {
                 if resume {
-                    if !matches!(
-                        self.peer_states.get(&row.peer),
-                        Some(network_state::PeerLifecycle::Connected)
-                    ) {
+                    if !self
+                        .peer_states
+                        .get(&row.peer)
+                        .is_some_and(network_state::PeerLifecycle::outbound_authorized)
+                    {
                         let password =
                             SecretPassword::new(self.peer_password.read(cx).content.to_string())
                                 .map_err(|e| e.to_string())?;
@@ -2070,7 +2072,11 @@ impl DesktopShell {
         }
         let running = matches!(
             self.tunnel_states.get(&id),
-            Some(session::TunnelRuntimeState::Starting | session::TunnelRuntimeState::Running)
+            Some(
+                session::TunnelRuntimeState::WaitingAuthorization
+                    | session::TunnelRuntimeState::Starting
+                    | session::TunnelRuntimeState::Running
+            )
         );
         let Some(session) = self.network_session.as_ref() else {
             let detail = "请先保存信令地址并启动网络会话".to_owned();
@@ -2158,7 +2164,7 @@ impl DesktopShell {
                                         }
                                         shell.peer_generations.insert(peer, generation);
                                         shell.peer_states.insert(peer, state.clone());
-                                        if matches!(state,network_state::PeerLifecycle::Connected) {
+                                        if state.outbound_authorized() {
                                             if let Some(ids)=shell.pending_resumes.remove(&peer) {
                                                 for id in ids {if let Some(session)=&shell.network_session && let Err(e)=session.resume_task(peer,id){shell.set_status(e,cx);}}
                                             }
@@ -2177,9 +2183,7 @@ impl DesktopShell {
                                                 "正在协商桌面版本与能力".to_owned()
                                             }
                                             network_state::PeerLifecycle::RemoteAuthPending => { "身份已认证，等待远程密码授权".to_owned() }
-                                            network_state::PeerLifecycle::Connected => {
-                                                "远程访问已授权".to_owned()
-                                            }
+                                            network_state::PeerLifecycle::Connected(auth) => auth.label().to_owned(),
                                             network_state::PeerLifecycle::Disconnected => {
                                                 "连接已断开".to_owned()
                                             }
@@ -2941,7 +2945,9 @@ impl DesktopShell {
         let peer_is_active = self
             .selected_peer(cx)
             .and_then(|peer| self.peer_states.get(&peer))
-            .is_some_and(network_state::PeerLifecycle::is_active);
+            .is_some_and(|state| {
+                state.is_active() && (!state.is_connected() || state.outbound_authorized())
+            });
         let peer_is_valid = peer_is_valid
             || ShortId::normalize(self.peer_id.read(cx).content.trim())
                 .is_ok_and(|id| self.local_short_id != Some(id));
@@ -2959,8 +2965,8 @@ impl DesktopShell {
     fn header_status(&self, cx: &Context<Self>) -> (String, ui_components::StatusTone) {
         if let Some(peer) = self.selected_peer(cx) {
             match self.peer_states.get(&peer) {
-                Some(network_state::PeerLifecycle::Connected) => {
-                    return ("已连接".into(), ui_components::StatusTone::Success);
+                Some(network_state::PeerLifecycle::Connected(auth)) => {
+                    return (auth.label().into(), ui_components::StatusTone::Success);
                 }
                 Some(network_state::PeerLifecycle::PeerPending) => {
                     return ("等待对端".into(), ui_components::StatusTone::Info);
@@ -2987,11 +2993,7 @@ impl DesktopShell {
             }
         }
 
-        if self
-            .peer_states
-            .values()
-            .any(|state| matches!(state, network_state::PeerLifecycle::Connected))
-        {
+        if self.peer_states.values().any(|state| state.is_connected()) {
             ("设备已连接".into(), ui_components::StatusTone::Success)
         } else if self.network_status.starts_with("信令在线") {
             ("信令在线".into(), ui_components::StatusTone::Success)
@@ -3109,10 +3111,9 @@ impl DesktopShell {
             .map(|id| id.display())
             .unwrap_or_else(|| "等待信令分配设备 ID".to_owned());
         let connected = self.selected_peer(cx).is_some_and(|peer| {
-            matches!(
-                self.peer_states.get(&peer),
-                Some(network_state::PeerLifecycle::Connected)
-            )
+            self.peer_states
+                .get(&peer)
+                .is_some_and(network_state::PeerLifecycle::outbound_authorized)
         });
 
         let local = div()
@@ -3225,10 +3226,9 @@ impl DesktopShell {
 
     fn transfer_card(&mut self, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
         let connected = self.selected_peer(cx).is_some_and(|peer| {
-            matches!(
-                self.peer_states.get(&peer),
-                Some(network_state::PeerLifecycle::Connected)
-            )
+            self.peer_states
+                .get(&peer)
+                .is_some_and(network_state::PeerLifecycle::outbound_authorized)
         });
         let speed_running = self
             .speed_views
@@ -3442,10 +3442,9 @@ impl DesktopShell {
         let running = running_view.is_some();
         let waiting = self.speed_request_until.is_some() && !running;
         let can_start = self.selected_peer(cx).is_some_and(|peer| {
-            matches!(
-                self.peer_states.get(&peer),
-                Some(network_state::PeerLifecycle::Connected)
-            )
+            self.peer_states
+                .get(&peer)
+                .is_some_and(network_state::PeerLifecycle::outbound_authorized)
         }) && self.transfer_service.is_some()
             && !running
             && !waiting;
@@ -3989,9 +3988,14 @@ impl DesktopShell {
                 .unwrap_or(session::TunnelRuntimeState::Stopped);
             let running = matches!(
                 runtime,
-                session::TunnelRuntimeState::Starting | session::TunnelRuntimeState::Running
+                session::TunnelRuntimeState::WaitingAuthorization
+                    | session::TunnelRuntimeState::Starting
+                    | session::TunnelRuntimeState::Running
             );
             let (runtime_label, runtime_color) = match &runtime {
+                session::TunnelRuntimeState::WaitingAuthorization => {
+                    ("等待输入对端密码 / 授权", ui_theme::WARNING)
+                }
                 session::TunnelRuntimeState::Starting => ("等待认证连接", ui_theme::WARNING),
                 session::TunnelRuntimeState::Running => ("运行中", ui_theme::SUCCESS),
                 session::TunnelRuntimeState::Stopped => ("已停止", ui_theme::TEXT_SECONDARY),

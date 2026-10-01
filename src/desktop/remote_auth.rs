@@ -34,7 +34,7 @@ fn random<const N: usize>() -> Result<[u8; N]> {
     Ok(bytes)
 }
 
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Eq, PartialEq, Zeroize, ZeroizeOnDrop)]
 pub struct SecretPassword(String);
 impl fmt::Debug for SecretPassword {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -195,6 +195,30 @@ fn verify(
         .is_ok()
 }
 
+/// Rights belong to the authenticated transport and expire with it. Stream replies
+/// (including download data and TCP replies) remain part of the authorized request.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RemoteAuthorization {
+    pub inbound_authorized: bool,
+    pub outbound_authorized: bool,
+}
+impl RemoteAuthorization {
+    #[cfg(test)]
+    pub const BOTH: Self = Self {
+        inbound_authorized: true,
+        outbound_authorized: true,
+    };
+
+    pub fn label(self) -> &'static str {
+        match (self.inbound_authorized, self.outbound_authorized) {
+            (true, true) => "双向访问已授权",
+            (true, false) => "已允许对端访问；本机访问尚未授权",
+            (false, true) => "本机访问对端已授权；对端访问未授权",
+            (false, false) => "等待密码授权",
+        }
+    }
+}
+
 struct Failures {
     count: u32,
     seen: tokio::time::Instant,
@@ -212,7 +236,6 @@ impl FailureTable {
             .0
             .get(&peer)
             .is_some_and(|f| f.blocked_until > tokio::time::Instant::now())
-            || (!self.0.contains_key(&peer) && self.0.len() >= MAX_FAILURE_PEERS)
         {
             Err(invalid())
         } else {
@@ -222,7 +245,11 @@ impl FailureTable {
     fn failed(&mut self, peer: NodeId) -> Duration {
         self.prune();
         if !self.0.contains_key(&peer) && self.0.len() >= MAX_FAILURE_PEERS {
-            return Duration::from_secs(60);
+            // Expired entries were pruned first. Evict the least recently failed
+            // identity rather than turning capacity into a global authentication ban.
+            if let Some(oldest) = self.0.iter().min_by_key(|(_, f)| f.seen).map(|(id, _)| *id) {
+                self.0.remove(&oldest);
+            }
         }
         let now = tokio::time::Instant::now();
         let f = self.0.entry(peer).or_insert(Failures {
@@ -257,8 +284,8 @@ impl Default for AuthContext {
 }
 impl AuthContext {
     /// Both directions exchange challenges because QUIC dialer order is unrelated to user intent.
-    /// A session is authorized by a verified incoming proof or an explicitly submitted outgoing
-    /// password accepted and confirmed with the peer verifier key. A bare Result(true) never grants authorization.
+    /// Return independent incoming and outgoing request rights. Neither right implies the other.
+    /// A bare Result(true) never grants authorization.
     #[allow(clippy::too_many_arguments)]
     pub async fn authorize(
         &self,
@@ -269,7 +296,7 @@ impl AuthContext {
         verifier: RemoteVerifier,
         password: Option<SecretPassword>,
         capabilities: u64,
-    ) -> Result<()> {
+    ) -> Result<RemoteAuthorization> {
         if capabilities & super::protocol::CAP_REMOTE_AUTH == 0 {
             return Err(Error::Protocol(
                 "对端不支持远程访问认证，请升级客户端".into(),
@@ -282,9 +309,14 @@ impl AuthContext {
         )
         .await;
         match result {
-            Ok(Ok(())) => {
-                self.failures.lock().await.0.remove(&peer);
-                Ok(())
+            Ok(Ok((authorization, failed_inbound))) => {
+                if authorization.inbound_authorized {
+                    self.failures.lock().await.0.remove(&peer);
+                } else if failed_inbound {
+                    let delay = self.failures.lock().await.failed(peer);
+                    tokio::time::sleep(delay).await;
+                }
+                Ok(authorization)
             }
             _ => {
                 let delay = self.failures.lock().await.failed(peer);
@@ -303,7 +335,7 @@ impl AuthContext {
         peer: NodeId,
         verifier: RemoteVerifier,
         password: Option<SecretPassword>,
-    ) -> Result<()> {
+    ) -> Result<(RemoteAuthorization, bool)> {
         let binding = ChannelBinding::from_connection(connection)?;
         let challenge = Challenge::new(&verifier)?;
         let (mut send, mut recv) = if initiator {
@@ -404,7 +436,13 @@ impl AuthContext {
                     .is_ok()
                 });
         if accepted || confirmed {
-            Ok(())
+            Ok((
+                RemoteAuthorization {
+                    inbound_authorized: accepted,
+                    outbound_authorized: confirmed,
+                },
+                incoming.is_some() && !accepted,
+            ))
         } else {
             Err(invalid())
         }
@@ -490,12 +528,155 @@ mod tests {
                     super::super::protocol::LOCAL_CAPABILITIES
                 )
             );
-            assert!(left.is_ok());
-            assert!(right.is_ok());
-            assert!(ca.failures.lock().await.0.is_empty());
-            assert!(sa.failures.lock().await.0.is_empty());
+            assert_eq!(
+                left.unwrap(),
+                RemoteAuthorization {
+                    inbound_authorized: !prover_is_dialer,
+                    outbound_authorized: prover_is_dialer
+                }
+            );
+            assert_eq!(
+                right.unwrap(),
+                RemoteAuthorization {
+                    inbound_authorized: prover_is_dialer,
+                    outbound_authorized: !prover_is_dialer
+                }
+            );
+            assert_eq!(ca.failures.lock().await.0.is_empty(), !prover_is_dialer);
+            assert_eq!(sa.failures.lock().await.0.is_empty(), prover_is_dialer);
         }
     }
+    #[tokio::test]
+    async fn both_directions_require_independent_password_proofs() {
+        let pa = SecretPassword::new("Local9A".into()).unwrap();
+        let pb = SecretPassword::new("Local9B".into()).unwrap();
+        let va = RemoteVerifier::create(&pa).unwrap();
+        let vb = RemoteVerifier::create(&pb).unwrap();
+        let a = crate::identity::Identity::generate().node_id();
+        let b = crate::identity::Identity::generate().node_id();
+        let (_ce, _se, c, s) = pair().await;
+        let left = AuthContext::default();
+        let right = AuthContext::default();
+        let (ca, cb) = tokio::join!(
+            left.authorize(
+                &c,
+                true,
+                a,
+                b,
+                va,
+                Some(pb),
+                super::super::protocol::LOCAL_CAPABILITIES
+            ),
+            right.authorize(
+                &s,
+                false,
+                b,
+                a,
+                vb,
+                Some(pa),
+                super::super::protocol::LOCAL_CAPABILITIES
+            ),
+        );
+        assert_eq!(ca.unwrap(), RemoteAuthorization::BOTH);
+        assert_eq!(cb.unwrap(), RemoteAuthorization::BOTH);
+    }
+
+    #[tokio::test]
+    async fn successful_outgoing_confirmation_does_not_clear_wrong_incoming_proof_failures() {
+        let pa = SecretPassword::new("Local9A".into()).unwrap();
+        let pb = SecretPassword::new("Local9B".into()).unwrap();
+        let wrong = SecretPassword::new("Wrong9A".into()).unwrap();
+        let va = RemoteVerifier::create(&pa).unwrap();
+        let vb = RemoteVerifier::create(&pb).unwrap();
+        let a = crate::identity::Identity::generate().node_id();
+        let b = crate::identity::Identity::generate().node_id();
+        let left = AuthContext::default();
+        let right = AuthContext::default();
+        for count in 1..=3 {
+            let (_ce, _se, c, s) = pair().await;
+            let (ca, cb) = tokio::join!(
+                left.authorize(
+                    &c,
+                    true,
+                    a,
+                    b,
+                    va.clone(),
+                    Some(pb.clone()),
+                    super::super::protocol::LOCAL_CAPABILITIES
+                ),
+                right.authorize(
+                    &s,
+                    false,
+                    b,
+                    a,
+                    vb.clone(),
+                    Some(wrong.clone()),
+                    super::super::protocol::LOCAL_CAPABILITIES
+                ),
+            );
+            assert_eq!(
+                ca.unwrap(),
+                RemoteAuthorization {
+                    inbound_authorized: false,
+                    outbound_authorized: true
+                }
+            );
+            assert_eq!(
+                cb.unwrap(),
+                RemoteAuthorization {
+                    inbound_authorized: true,
+                    outbound_authorized: false
+                }
+            );
+            assert_eq!(left.failures.lock().await.0[&b].count, count);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_failure_table_does_not_block_a_new_correctly_authenticating_peer() {
+        let context = AuthContext::default();
+        for _ in 0..MAX_FAILURE_PEERS {
+            context
+                .failures
+                .lock()
+                .await
+                .failed(crate::identity::Identity::generate().node_id());
+        }
+        assert_eq!(context.failures.lock().await.0.len(), MAX_FAILURE_PEERS);
+        let password = SecretPassword::new("Normal9".into()).unwrap();
+        let verifier = RemoteVerifier::create(&password).unwrap();
+        let a = crate::identity::Identity::generate().node_id();
+        let b = crate::identity::Identity::generate().node_id();
+        let (_ce, _se, c, s) = pair().await;
+        let other = AuthContext::default();
+        let (ca, cb) = tokio::join!(
+            other.authorize(
+                &c,
+                true,
+                a,
+                b,
+                verifier.clone(),
+                Some(password),
+                super::super::protocol::LOCAL_CAPABILITIES
+            ),
+            context.authorize(
+                &s,
+                false,
+                b,
+                a,
+                verifier,
+                None,
+                super::super::protocol::LOCAL_CAPABILITIES
+            ),
+        );
+        assert!(ca.unwrap().outbound_authorized);
+        assert!(cb.unwrap().inbound_authorized);
+        assert!(context.failures.lock().await.0.len() <= MAX_FAILURE_PEERS);
+        context.failures.lock().await.failed(a);
+        assert_eq!(context.failures.lock().await.0.len(), MAX_FAILURE_PEERS);
+        assert!(context.failures.lock().await.0.contains_key(&a));
+    }
+
     #[tokio::test]
     async fn wrong_or_absent_password_and_old_capability_never_authorize() {
         let password = SecretPassword::new("A9b8C7".into()).unwrap();
@@ -765,7 +946,7 @@ mod tests {
         assert!(
             table
                 .check(NodeId::from_hex(&"ff".repeat(16)).unwrap())
-                .is_err()
+                .is_ok()
         );
         tokio::time::advance(FAILURE_TTL).await;
         assert!(table.check(a).is_ok());
