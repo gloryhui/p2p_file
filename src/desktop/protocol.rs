@@ -23,8 +23,10 @@ pub const CAP_SPEED_OWNERSHIP: u64 = 8;
 pub const CAP_FILE_TRANSFER: u64 = 16;
 pub const CAP_DIRECTORY_TRANSFER: u64 = 32;
 pub const CAP_SPEED_EXECUTION: u64 = 64;
+pub const CAP_TCP_TUNNEL: u64 = 128;
 pub const REQUIRED_CAPABILITIES: u64 =
     15 | CAP_FILE_TRANSFER | CAP_DIRECTORY_TRANSFER | CAP_SPEED_EXECUTION;
+pub const LOCAL_CAPABILITIES: u64 = REQUIRED_CAPABILITIES | CAP_TCP_TUNNEL;
 pub const MAX_FRAME_BYTES: u32 = 4 * 1024 * 1024;
 pub const MAX_CHUNKS: usize = 65_536;
 pub const MAX_TASKS_PER_PEER: usize = 128;
@@ -172,12 +174,19 @@ pub enum Message {
         task_id: TaskId,
         index: u32,
     },
+    TunnelOpen {
+        target: std::net::SocketAddr,
+    },
+    TunnelReady,
+    TunnelError {
+        reason: String,
+    },
 }
 
 impl Message {
     fn task_id(&self) -> Option<&TaskId> {
         match self {
-            Self::Hello { .. } | Self::Ready => None,
+            Self::Hello { .. } | Self::Ready | Self::TunnelReady | Self::TunnelOpen { .. } => None,
             Self::Speed(control) => Some(control.test_id()),
             Self::Offer { task_id, .. }
             | Self::Resume { task_id, .. }
@@ -189,6 +198,7 @@ impl Message {
             | Self::RequestChunk { task_id, .. }
             | Self::Chunk { task_id, .. }
             | Self::ChunkAck { task_id, .. } => Some(task_id),
+            Self::TunnelError { .. } => None,
         }
     }
 
@@ -209,6 +219,16 @@ impl Message {
             Self::Completed {
                 receipt_version, ..
             } if *receipt_version != 1 => Err(invalid("不支持的完成回执版本")),
+            Self::TunnelOpen { target }
+                if target.port() == 0
+                    || target.ip().is_unspecified()
+                    || target.ip().is_multicast() =>
+            {
+                Err(invalid("隧道目标必须是具体 IP 和 1..65535 端口"))
+            }
+            Self::TunnelError { reason } if reason.len() > 2048 => {
+                Err(invalid("隧道错误信息超出长度上限"))
+            }
             _ => Ok(()),
         }
     }
@@ -270,26 +290,29 @@ pub async fn write<W: AsyncWrite + Unpin>(writer: &mut W, frame: &Frame) -> Resu
 async fn exchange<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     send: &mut S,
     recv: &mut R,
-) -> Result<()> {
+) -> Result<u64> {
     write(
         send,
         &Frame {
             request_id: 0,
             message: Message::Hello {
                 version: VERSION,
-                capabilities: REQUIRED_CAPABILITIES,
+                capabilities: LOCAL_CAPABILITIES,
             },
         },
     )
     .await?;
-    match read(recv).await?.message {
+    let capabilities = match read(recv).await?.message {
         Message::Hello {
             version,
             capabilities,
         } if version == VERSION
-            && capabilities & REQUIRED_CAPABILITIES == REQUIRED_CAPABILITIES => {}
+            && capabilities & REQUIRED_CAPABILITIES == REQUIRED_CAPABILITIES =>
+        {
+            capabilities
+        }
         _ => return Err(invalid("桌面版本或能力不兼容")),
-    }
+    };
     write(
         send,
         &Frame {
@@ -301,11 +324,11 @@ async fn exchange<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     if read(recv).await?.message != Message::Ready {
         return Err(invalid("桌面能力确认顺序错误"));
     }
-    Ok(())
+    Ok(capabilities)
 }
 
 /// Must only be called after the existing identity/channel-binding handshake.
-pub async fn negotiate(connection: &quinn::Connection, initiator: bool) -> Result<()> {
+pub async fn negotiate(connection: &quinn::Connection, initiator: bool) -> Result<u64> {
     let result = tokio::time::timeout(NEGOTIATION_TIMEOUT, async {
         let (mut send, mut recv) = if initiator {
             connection.open_bi().await
@@ -313,14 +336,14 @@ pub async fn negotiate(connection: &quinn::Connection, initiator: bool) -> Resul
             connection.accept_bi().await
         }
         .map_err(|_| invalid("桌面能力流不可用"))?;
-        exchange(&mut send, &mut recv).await?;
+        let capabilities = exchange(&mut send, &mut recv).await?;
         send.finish()
             .map_err(|_| invalid("桌面能力确认流关闭失败"))?;
-        Ok::<(), Error>(())
+        Ok::<u64, Error>(capabilities)
     })
     .await;
     match result {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(capabilities)) => Ok(capabilities),
         _ => {
             connection.close(3u32.into(), b"desktop protocol incompatible");
             Err(invalid("桌面版本或能力不兼容，或协商超时"))
@@ -973,8 +996,8 @@ mod tests {
         let (mut ar, mut aw) = split(a);
         let (mut br, mut bw) = split(b);
         let (a, b) = tokio::join!(exchange(&mut aw, &mut ar), exchange(&mut bw, &mut br));
-        a.unwrap();
-        b.unwrap();
+        assert_eq!(a.unwrap(), LOCAL_CAPABILITIES);
+        assert_eq!(b.unwrap(), LOCAL_CAPABILITIES);
     }
 
     #[tokio::test]
@@ -1429,7 +1452,7 @@ mod tests {
                     hello.message,
                     Message::Hello {
                         version: 1,
-                        capabilities: 127
+                        capabilities: LOCAL_CAPABILITIES
                     }
                 );
                 write(
@@ -1448,5 +1471,72 @@ mod tests {
             let (result, ()) = tokio::join!(negotiate, peer);
             assert!(result.unwrap_err().to_string().contains("能力不兼容"));
         }
+    }
+
+    #[tokio::test]
+    async fn required_only_peer_remains_compatible_without_tcp_tunnel_capability() {
+        let (new, mut old_io) = tokio::io::duplex(4096);
+        let (mut recv, mut send) = tokio::io::split(new);
+        let exchange = exchange(&mut send, &mut recv);
+        let old_peer = async {
+            let hello = read(&mut old_io).await.unwrap();
+            assert_eq!(
+                hello.message,
+                Message::Hello {
+                    version: VERSION,
+                    capabilities: LOCAL_CAPABILITIES,
+                }
+            );
+            write(
+                &mut old_io,
+                &Frame {
+                    request_id: 0,
+                    message: Message::Hello {
+                        version: VERSION,
+                        capabilities: REQUIRED_CAPABILITIES,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(read(&mut old_io).await.unwrap().message, Message::Ready);
+            write(
+                &mut old_io,
+                &Frame {
+                    request_id: 0,
+                    message: Message::Ready,
+                },
+            )
+            .await
+            .unwrap();
+        };
+        let (capabilities, ()) = tokio::join!(exchange, old_peer);
+        assert_eq!(capabilities.unwrap(), REQUIRED_CAPABILITIES);
+    }
+
+    #[test]
+    fn tunnel_frames_are_append_only_and_validate_literal_targets() {
+        let open = Frame {
+            request_id: 0,
+            message: Message::TunnelOpen {
+                target: "192.168.1.10:22".parse().unwrap(),
+            },
+        };
+        assert_eq!(Frame::decode(&open.encode().unwrap()).unwrap(), open);
+        let ready = Frame {
+            request_id: 0,
+            message: Message::TunnelReady,
+        };
+        assert_eq!(Frame::decode(&ready.encode().unwrap()).unwrap(), ready);
+        assert!(
+            Frame {
+                request_id: 0,
+                message: Message::TunnelOpen {
+                    target: "0.0.0.0:22".parse().unwrap(),
+                },
+            }
+            .encode()
+            .is_err()
+        );
     }
 }

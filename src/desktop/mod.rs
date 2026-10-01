@@ -33,15 +33,19 @@ mod task_recovery;
 mod task_store;
 mod transfer;
 mod transfer_files;
+mod tunnel;
 mod ui;
 mod ui_model;
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
-use std::{ops::Range, path::PathBuf};
+use std::{net::SocketAddr, ops::Range, path::PathBuf};
 
 use crate::identity::{Identity, NodeId};
-use config::{AppPaths, ConfigError, DesktopConfig, SettingsDraft, SpeedtestDirection};
+use config::{
+    AllowedForwardTarget, AppPaths, ConfigError, DesktopConfig, SettingsDraft, SpeedtestDirection,
+    TunnelRule,
+};
 use instance_lock::InstanceLock;
 use task_store::TaskStore;
 use ui::{components as ui_components, theme as ui_theme};
@@ -905,6 +909,16 @@ struct DesktopShell {
     concurrency_input: Entity<TextField>,
     signal_host: Entity<TextField>,
     signal_port: Entity<TextField>,
+    allowed_name: Entity<TextField>,
+    allowed_target: Entity<TextField>,
+    allowed_peers: Entity<TextField>,
+    pending_tunnel_changes: std::collections::HashSet<String>,
+    tunnel_name: Entity<TextField>,
+    tunnel_peer: Entity<TextField>,
+    tunnel_listen: Entity<TextField>,
+    tunnel_target: Entity<TextField>,
+    editing_allowed_id: Option<String>,
+    editing_tunnel_id: Option<String>,
     selected_files: Vec<PathBuf>,
     selected_folder: Option<PathBuf>,
     settings: SettingsDraft,
@@ -923,6 +937,8 @@ struct DesktopShell {
     network_epoch: u64,
     peer_generations: HashMap<NodeId, u64>,
     peer_states: HashMap<NodeId, network_state::PeerLifecycle>,
+    tunnel_states: HashMap<String, session::TunnelRuntimeState>,
+    tunnel_last_errors: HashMap<String, String>,
     task_rows: Vec<ui_model::ListRow>,
     expanded_groups: HashSet<task_model::TaskId>,
     selected_task: Option<task_model::TaskId>,
@@ -999,6 +1015,13 @@ impl DesktopShell {
             vec![
                 self.signal_host.clone(),
                 self.signal_port.clone(),
+                self.allowed_name.clone(),
+                self.allowed_target.clone(),
+                self.allowed_peers.clone(),
+                self.tunnel_name.clone(),
+                self.tunnel_peer.clone(),
+                self.tunnel_listen.clone(),
+                self.tunnel_target.clone(),
                 self.peer_id.clone(),
             ]
         } else {
@@ -1619,6 +1642,370 @@ impl DesktopShell {
         cx.notify();
     }
 
+    fn set_text_field(field: &Entity<TextField>, value: impl Into<String>, cx: &mut Context<Self>) {
+        let value = value.into();
+        field.update(cx, |field, cx| {
+            field.content = value.into();
+            field.selected_range = field.content.len()..field.content.len();
+            cx.notify();
+        });
+    }
+
+    fn field_text(field: &Entity<TextField>, cx: &Context<Self>) -> String {
+        field.read(cx).content.to_string()
+    }
+
+    fn note_forward_settings_changed(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = &self.network_session {
+            session.restrict_forward_targets(&self.settings.allowed_forward_targets);
+        }
+        self.config_note = "端口转发列表有未保存改动；撤销/停用已作用于当前会话，新增授权需“保存并应用”。保存失败不会恢复撤销权限。".into();
+        self.set_status("端口转发配置尚未保存", cx);
+    }
+
+    fn cancel_allowed_edit(&mut self, cx: &mut Context<Self>) {
+        self.editing_allowed_id = None;
+        Self::set_text_field(&self.allowed_name, "", cx);
+        Self::set_text_field(&self.allowed_target, "", cx);
+        Self::set_text_field(&self.allowed_peers, "", cx);
+        cx.notify();
+    }
+
+    fn edit_allowed_target(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(entry) = self
+            .settings
+            .allowed_forward_targets
+            .iter()
+            .find(|entry| entry.id == id)
+        else {
+            return;
+        };
+        let name = entry.name.clone();
+        let target = entry.target.to_string();
+        let peers = entry.allowed_peers.join(", ");
+        self.editing_allowed_id = Some(id);
+        Self::set_text_field(&self.allowed_name, name, cx);
+        Self::set_text_field(&self.allowed_target, target, cx);
+        Self::set_text_field(&self.allowed_peers, peers, cx);
+        cx.notify();
+    }
+
+    fn save_allowed_target(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.is_saving_settings || !self.pending_tunnel_changes.is_empty() {
+            return;
+        }
+        let name = Self::field_text(&self.allowed_name, cx).trim().to_owned();
+        let target = match Self::field_text(&self.allowed_target, cx)
+            .trim()
+            .parse::<SocketAddr>()
+        {
+            Ok(target)
+                if target.port() != 0
+                    && !target.ip().is_unspecified()
+                    && !target.ip().is_multicast() =>
+            {
+                target
+            }
+            _ => {
+                self.set_status("目标地址必须是具体 IP:端口，端口范围为 1..65535", cx);
+                return;
+            }
+        };
+        if name.is_empty() || name.chars().any(char::is_control) {
+            self.set_status("请输入有效的服务名称", cx);
+            return;
+        }
+        let peers = Self::field_text(&self.allowed_peers, cx);
+        let peers = peers
+            .split(|ch: char| ch == ',' || ch.is_whitespace())
+            .filter(|peer| !peer.is_empty())
+            .map(|peer| NodeId::from_hex(peer).map(|peer| peer.to_hex()))
+            .collect::<Result<Vec<_>, _>>();
+        let peers = match peers {
+            Ok(peers)
+                if !peers.is_empty()
+                    && peers.iter().collect::<std::collections::HashSet<_>>().len()
+                        == peers.len() =>
+            {
+                peers
+            }
+            _ => {
+                self.set_status(
+                    "请输入不重复的授权设备完整 Node ID，以逗号或空格分隔；空列表不授权任何设备",
+                    cx,
+                );
+                return;
+            }
+        };
+        let editing_id = self.editing_allowed_id.clone();
+        if self.settings.allowed_forward_targets.iter().any(|entry| {
+            entry.enabled
+                && entry.target == target
+                && editing_id.as_deref() != Some(entry.id.as_str())
+        }) {
+            self.set_status(format!("已启用的允许目标重复：{target}"), cx);
+            return;
+        }
+        if let Some(id) = editing_id {
+            if let Some(entry) = self
+                .settings
+                .allowed_forward_targets
+                .iter_mut()
+                .find(|entry| entry.id == id)
+            {
+                entry.name = name;
+                entry.target = target;
+                entry.allowed_peers = peers;
+            }
+        } else {
+            self.settings
+                .allowed_forward_targets
+                .push(AllowedForwardTarget::new(name, target, peers));
+        }
+        self.cancel_allowed_edit(cx);
+        self.note_forward_settings_changed(cx);
+    }
+
+    fn toggle_allowed_target(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.is_saving_settings || !self.pending_tunnel_changes.is_empty() {
+            return;
+        }
+        if let Some(entry) = self
+            .settings
+            .allowed_forward_targets
+            .iter_mut()
+            .find(|entry| entry.id == id)
+        {
+            entry.enabled = !entry.enabled;
+            self.note_forward_settings_changed(cx);
+        }
+    }
+
+    fn delete_allowed_target(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.is_saving_settings || !self.pending_tunnel_changes.is_empty() {
+            return;
+        }
+        self.settings
+            .allowed_forward_targets
+            .retain(|entry| entry.id != id);
+        if self.editing_allowed_id.as_deref() == Some(id.as_str()) {
+            self.cancel_allowed_edit(cx);
+        }
+        self.note_forward_settings_changed(cx);
+    }
+
+    fn cancel_tunnel_edit(&mut self, cx: &mut Context<Self>) {
+        self.editing_tunnel_id = None;
+        Self::set_text_field(&self.tunnel_name, "", cx);
+        Self::set_text_field(&self.tunnel_peer, "", cx);
+        Self::set_text_field(&self.tunnel_listen, "127.0.0.1:", cx);
+        Self::set_text_field(&self.tunnel_target, "", cx);
+        cx.notify();
+    }
+
+    fn edit_tunnel_rule(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(rule) = self.settings.tunnel_rules.iter().find(|rule| rule.id == id) else {
+            return;
+        };
+        let name = rule.name.clone();
+        let peer = rule.peer_node_id.clone();
+        let listen = rule.listen.to_string();
+        let target = rule.target.to_string();
+        self.editing_tunnel_id = Some(id);
+        Self::set_text_field(&self.tunnel_name, name, cx);
+        Self::set_text_field(&self.tunnel_peer, peer, cx);
+        Self::set_text_field(&self.tunnel_listen, listen, cx);
+        Self::set_text_field(&self.tunnel_target, target, cx);
+        cx.notify();
+    }
+
+    fn save_tunnel_rule(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.is_saving_settings || !self.pending_tunnel_changes.is_empty() {
+            return;
+        }
+        let name = Self::field_text(&self.tunnel_name, cx).trim().to_owned();
+        if name.is_empty() || name.chars().any(char::is_control) {
+            self.set_status("请输入有效的转发规则名称", cx);
+            return;
+        }
+        let peer = match NodeId::from_hex(Self::field_text(&self.tunnel_peer, cx).trim()) {
+            Ok(peer)
+                if self
+                    .identity
+                    .as_ref()
+                    .is_none_or(|identity| identity.node_id() != peer) =>
+            {
+                peer.to_hex()
+            }
+            Ok(_) => {
+                self.set_status("本机转发规则不能绑定本机 Node ID", cx);
+                return;
+            }
+            Err(error) => {
+                self.set_status(format!("对端 Node ID 无效：{error}"), cx);
+                return;
+            }
+        };
+        let listen = match Self::field_text(&self.tunnel_listen, cx)
+            .trim()
+            .parse::<SocketAddr>()
+        {
+            Ok(listen) if listen.ip().is_loopback() && listen.port() != 0 => listen,
+            _ => {
+                self.set_status("本机监听地址必须是 127.0.0.1:端口 或 [::1]:端口", cx);
+                return;
+            }
+        };
+        let target = match Self::field_text(&self.tunnel_target, cx)
+            .trim()
+            .parse::<SocketAddr>()
+        {
+            Ok(target)
+                if target.port() != 0
+                    && !target.ip().is_unspecified()
+                    && !target.ip().is_multicast() =>
+            {
+                target
+            }
+            _ => {
+                self.set_status("远端目标必须是具体 IP:端口，端口范围为 1..65535", cx);
+                return;
+            }
+        };
+        if let Some(id) = self.editing_tunnel_id.clone() {
+            if let Some(rule) = self
+                .settings
+                .tunnel_rules
+                .iter_mut()
+                .find(|rule| rule.id == id)
+            {
+                rule.name = name;
+                rule.peer_node_id = peer;
+                rule.listen = listen;
+                rule.target = target;
+            }
+        } else {
+            let mut rule = TunnelRule::new(name, peer, listen.port(), target);
+            rule.listen = listen;
+            self.settings.tunnel_rules.push(rule);
+        }
+        self.cancel_tunnel_edit(cx);
+        self.note_forward_settings_changed(cx);
+    }
+
+    fn revoke_tunnel_from_settings(&mut self, id: String, delete: bool, cx: &mut Context<Self>) {
+        if self.is_saving_settings || !self.pending_tunnel_changes.insert(id.clone()) {
+            return;
+        }
+        let session = self
+            .network_session
+            .clone()
+            .filter(|session| session.is_running());
+        self.set_status("正在关闭本机监听…", cx);
+        cx.spawn(async move |shell, cx| {
+            let result = if let Some(session) = session {
+                session.revoke_tunnel_rule(id.clone(), delete).await
+            } else {
+                Ok(())
+            };
+            let _ = shell.update(cx, |shell, cx| {
+                shell.pending_tunnel_changes.remove(&id);
+                match result {
+                    Ok(()) => {
+                        if delete {
+                            shell.settings.tunnel_rules.retain(|rule| rule.id != id);
+                            if shell.editing_tunnel_id.as_deref() == Some(id.as_str()) {
+                                shell.cancel_tunnel_edit(cx);
+                            }
+                        } else if let Some(rule) = shell
+                            .settings
+                            .tunnel_rules
+                            .iter_mut()
+                            .find(|rule| rule.id == id)
+                        {
+                            rule.enabled = false;
+                        }
+                        shell
+                            .tunnel_states
+                            .insert(id, session::TunnelRuntimeState::Stopped);
+                        shell.note_forward_settings_changed(cx);
+                    }
+                    Err(error) => {
+                        shell.set_status(format!("未完成停用/删除：{error}；规则仍保留"), cx)
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn toggle_tunnel_enabled(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.is_saving_settings || self.pending_tunnel_changes.contains(&id) {
+            return;
+        }
+        if self
+            .settings
+            .tunnel_rules
+            .iter()
+            .any(|rule| rule.id == id && rule.enabled)
+        {
+            self.revoke_tunnel_from_settings(id, false, cx);
+        } else if let Some(rule) = self
+            .settings
+            .tunnel_rules
+            .iter_mut()
+            .find(|rule| rule.id == id)
+        {
+            rule.enabled = true;
+            self.note_forward_settings_changed(cx);
+        }
+    }
+
+    fn toggle_tunnel_auto_start(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.is_saving_settings || !self.pending_tunnel_changes.is_empty() {
+            return;
+        }
+        if let Some(rule) = self
+            .settings
+            .tunnel_rules
+            .iter_mut()
+            .find(|rule| rule.id == id)
+        {
+            rule.auto_start = !rule.auto_start;
+            self.note_forward_settings_changed(cx);
+        }
+    }
+
+    fn delete_tunnel_rule(&mut self, id: String, cx: &mut Context<Self>) {
+        self.revoke_tunnel_from_settings(id, true, cx);
+    }
+
+    fn toggle_tunnel_runtime(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.pending_tunnel_changes.contains(&id) {
+            return;
+        }
+        let running = matches!(
+            self.tunnel_states.get(&id),
+            Some(session::TunnelRuntimeState::Starting | session::TunnelRuntimeState::Running)
+        );
+        let Some(session) = self.network_session.as_ref() else {
+            let detail = "请先保存信令地址并启动网络会话".to_owned();
+            self.tunnel_last_errors.insert(id.clone(), detail.clone());
+            self.tunnel_states
+                .insert(id, session::TunnelRuntimeState::Error(detail.clone()));
+            self.set_status(detail, cx);
+            return;
+        };
+        let result = if running {
+            session.stop_tunnel_rule(id)
+        } else {
+            session.start_tunnel_rule(id)
+        };
+        if let Err(error) = result {
+            self.set_status(error, cx);
+        }
+    }
+
     fn start_network_session(
         &mut self,
         mut config: session::DesktopSessionConfig,
@@ -1630,12 +2017,15 @@ impl DesktopShell {
             return false;
         };
         config.transfer = self.transfer_service.clone();
+        config.allowed_forward_targets = self.settings.enabled_forward_targets();
+        config.tunnel_rules = self.settings.tunnel_rules.clone();
         match session::spawn(identity, config) {
             Ok((handle, mut session_events)) => {
                 self.network_epoch = self.network_epoch.wrapping_add(1);
                 let network_epoch = self.network_epoch;
                 self.peer_generations.clear();
                 self.peer_states.clear();
+                self.tunnel_states.clear();
                 self.pending_resumes.clear();
                 self.network_session = Some(handle);
                 self.network_status = "正在准备 UDP 并连接信令".into();
@@ -1745,6 +2135,24 @@ impl DesktopShell {
                                     session::SessionEvent::Diagnostic(detail) => {
                                         if detail != "信令心跳已确认" {shell.set_status(detail, cx);}
                                     }
+                                    session::SessionEvent::TunnelState { rule_id, state } => {
+                                        if let session::TunnelRuntimeState::Error(detail) = &state {
+                                            shell.tunnel_last_errors.insert(rule_id.clone(), detail.clone());
+                                        } else if matches!(
+                                            &state,
+                                            session::TunnelRuntimeState::Starting
+                                                | session::TunnelRuntimeState::Running
+                                        ) {
+                                            shell.tunnel_last_errors.remove(&rule_id);
+                                        }
+                                        shell.tunnel_states.insert(rule_id, state);
+                                        cx.notify();
+                                    }
+                                    session::SessionEvent::TunnelError { rule_id, detail } => {
+                                        shell.tunnel_last_errors.insert(rule_id, detail.clone());
+                                        shell.set_status(detail, cx);
+                                        cx.notify();
+                                    }
                                 }
                             })
                             .is_err()
@@ -1811,7 +2219,7 @@ impl DesktopShell {
     }
     fn sync_concurrency_input(&mut self, value: u8, cx: &mut Context<Self>) {
         let value_text = value.to_string();
-        if self.concurrency_input.read(cx).content.to_string() != value_text {
+        if self.concurrency_input.read(cx).content.as_ref() != value_text.as_str() {
             self.concurrency_input.update(cx, |input, cx| {
                 input.content = value_text.into();
                 let cursor = input.content.len();
@@ -1943,6 +2351,10 @@ impl DesktopShell {
         self.persist_settings(cx);
     }
     fn persist_settings(&mut self, cx: &mut Context<Self>) {
+        if !self.pending_tunnel_changes.is_empty() {
+            self.set_status("请等待本机监听关闭后再保存", cx);
+            return;
+        }
         if !self.can_save_settings || self.is_saving_settings {
             self.set_status("当前配置不可保存；请检查配置诊断信息", cx);
             return;
@@ -1973,7 +2385,7 @@ impl DesktopShell {
                         Ok(()) => {
                             shell.settings = saved_draft;
                             shell.applied_receive_root = saved_receive_root.clone();
-                            shell.config_note = "设置已保存；接收目录写能力检查通过。".into();
+                            shell.config_note = "设置已保存；端口转发配置已应用。".into();
                             if let (Some(service), Some(root)) =
                                 (&shell.transfer_service, &saved_receive_root)
                             {
@@ -1991,6 +2403,16 @@ impl DesktopShell {
                                 .as_ref()
                                 .filter(|session| session.is_running())
                             {
+                                if let Err(error) = session.update_tunnel_settings(
+                                    shell.settings.enabled_forward_targets(),
+                                    shell.settings.tunnel_rules.clone(),
+                                ) {
+                                    shell.set_status(
+                                        format!("设置已保存；端口转发应用失败：{error}"),
+                                        cx,
+                                    );
+                                    return;
+                                }
                                 if !signal_changed {
                                     shell.set_status("设置已保存；现有任务和连接继续运行", cx);
                                     return;
@@ -2012,12 +2434,20 @@ impl DesktopShell {
                             }
                             if !started {
                                 shell.network_session = None;
-                                let config = session::DesktopSessionConfig::new(signal_server);
+                                let mut config = session::DesktopSessionConfig::new(signal_server);
+                                config.allowed_forward_targets =
+                                    shell.settings.enabled_forward_targets();
+                                config.tunnel_rules = shell.settings.tunnel_rules.clone();
                                 shell.start_network_session(config, cx);
                             }
                         }
                         Err(error) => {
-                            shell.set_status(format!("设置未保存：{error}"), cx);
+                            shell.set_status(
+                                format!(
+                                    "设置未保存：{error}；新增授权未应用，已执行的撤销/停用保持生效"
+                                ),
+                                cx,
+                            );
                         }
                     }
                 })
@@ -3144,6 +3574,428 @@ impl DesktopShell {
         result
     }
 
+    fn port_forward_settings(&self, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
+        let editing_allowed = self.editing_allowed_id.is_some();
+        let mut allowed_rows = div()
+            .h(px(150.))
+            .id("allowed-forward-targets")
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_1();
+        if self.settings.allowed_forward_targets.is_empty() {
+            allowed_rows = allowed_rows.child(
+                div()
+                    .py(px(10.))
+                    .text_xs()
+                    .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                    .child("还没有允许远端访问的服务"),
+            );
+        }
+        for entry in &self.settings.allowed_forward_targets {
+            let id = entry.id.clone();
+            let edit_id = id.clone();
+            let delete_id = id.clone();
+            let enabled = entry.enabled;
+            let mut row = div()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px(px(8.))
+                .py(px(6.))
+                .rounded_md()
+                .bg(rgb(ui_theme::SURFACE_SUBTLE))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(rgb(ui_theme::TEXT))
+                                .truncate()
+                                .child(entry.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                                .child(format!(
+                                    "{} · 授权 {} 台设备{}",
+                                    entry.target,
+                                    entry.allowed_peers.len(),
+                                    if entry.allowed_peers.is_empty() {
+                                        "（拒绝所有 peer）"
+                                    } else {
+                                        ""
+                                    }
+                                )),
+                        ),
+                )
+                .child(
+                    div()
+                        .w(px(48.))
+                        .text_xs()
+                        .text_color(rgb(if enabled {
+                            ui_theme::SUCCESS
+                        } else {
+                            ui_theme::TEXT_SECONDARY
+                        }))
+                        .child(if enabled { "已启用" } else { "已停用" }),
+                );
+            row = row
+                .child(
+                    ui_components::secondary_button(
+                        if enabled { "停用" } else { "启用" },
+                        !self.is_saving_settings,
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |shell, _: &MouseUpEvent, _, cx| {
+                            shell.toggle_allowed_target(id.clone(), cx)
+                        }),
+                    ),
+                )
+                .child(
+                    ui_components::secondary_button("编辑", !self.is_saving_settings).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |shell, _: &MouseUpEvent, _, cx| {
+                            shell.edit_allowed_target(edit_id.clone(), cx)
+                        }),
+                    ),
+                )
+                .child(
+                    ui_components::secondary_button("删除", !self.is_saving_settings).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |shell, _: &MouseUpEvent, _, cx| {
+                            shell.delete_allowed_target(delete_id.clone(), cx)
+                        }),
+                    ),
+                );
+            if self.is_saving_settings {
+                row = row.opacity(0.55);
+            }
+            allowed_rows = allowed_rows.child(row);
+        }
+
+        let allowed_actions = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                ui_components::primary_button(
+                    if editing_allowed {
+                        "保存服务到列表"
+                    } else {
+                        "+ 添加允许服务"
+                    },
+                    !self.is_saving_settings,
+                )
+                .on_mouse_up(MouseButton::Left, cx.listener(Self::save_allowed_target)),
+            )
+            .when(editing_allowed, |row| {
+                row.child(
+                    ui_components::secondary_button("取消编辑", !self.is_saving_settings)
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|shell, _: &MouseUpEvent, _, cx| {
+                                shell.cancel_allowed_edit(cx)
+                            }),
+                        ),
+                )
+            });
+
+        let mut tunnel_rows = div()
+            .h(px(220.))
+            .id("local-tunnel-rules")
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_1();
+        if self.settings.tunnel_rules.is_empty() {
+            tunnel_rows = tunnel_rows.child(
+                div()
+                    .py(px(10.))
+                    .text_xs()
+                    .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                    .child("还没有本机转发规则"),
+            );
+        }
+        for rule in &self.settings.tunnel_rules {
+            let id = rule.id.clone();
+            let enable_id = id.clone();
+            let auto_id = id.clone();
+            let edit_id = id.clone();
+            let delete_id = id.clone();
+            let runtime = self
+                .tunnel_states
+                .get(&id)
+                .cloned()
+                .unwrap_or(session::TunnelRuntimeState::Stopped);
+            let running = matches!(
+                runtime,
+                session::TunnelRuntimeState::Starting | session::TunnelRuntimeState::Running
+            );
+            let (runtime_label, runtime_color) = match &runtime {
+                session::TunnelRuntimeState::Starting => ("等待认证连接", ui_theme::WARNING),
+                session::TunnelRuntimeState::Running => ("运行中", ui_theme::SUCCESS),
+                session::TunnelRuntimeState::Stopped => ("已停止", ui_theme::TEXT_SECONDARY),
+                session::TunnelRuntimeState::Error(_) => ("错误", ui_theme::DANGER),
+            };
+            let peer_label = NodeId::from_hex(&rule.peer_node_id)
+                .map(|peer| peer.short())
+                .unwrap_or_else(|_| rule.peer_node_id.clone());
+            let mut row = div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .p(px(9.))
+                .rounded_md()
+                .bg(rgb(ui_theme::SURFACE_SUBTLE))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_sm()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(rgb(ui_theme::TEXT))
+                                .truncate()
+                                .child(rule.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(runtime_color))
+                                .child(runtime_label),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                        .child(format!(
+                            "本机 {}  →  设备 {}  →  {}",
+                            rule.listen, peer_label, rule.target
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            ui_components::primary_button(
+                                if running {
+                                    "停止"
+                                } else if matches!(runtime, session::TunnelRuntimeState::Error(_)) {
+                                    "重新启动"
+                                } else {
+                                    "启动"
+                                },
+                                !self.is_saving_settings && (running || rule.enabled),
+                            )
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |shell, _: &MouseUpEvent, _, cx| {
+                                    shell.toggle_tunnel_runtime(id.clone(), cx)
+                                }),
+                            ),
+                        )
+                        .child(
+                            ui_components::secondary_button(
+                                if rule.enabled { "停用" } else { "启用" },
+                                !self.is_saving_settings,
+                            )
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |shell, _: &MouseUpEvent, _, cx| {
+                                    shell.toggle_tunnel_enabled(enable_id.clone(), cx)
+                                }),
+                            ),
+                        )
+                        .child(
+                            ui_components::secondary_button(
+                                if rule.auto_start {
+                                    "关闭自动启动"
+                                } else {
+                                    "自动启动"
+                                },
+                                !self.is_saving_settings,
+                            )
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |shell, _: &MouseUpEvent, _, cx| {
+                                    shell.toggle_tunnel_auto_start(auto_id.clone(), cx)
+                                }),
+                            ),
+                        )
+                        .child(
+                            ui_components::secondary_button("编辑", !self.is_saving_settings)
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |shell, _: &MouseUpEvent, _, cx| {
+                                        shell.edit_tunnel_rule(edit_id.clone(), cx)
+                                    }),
+                                ),
+                        )
+                        .child(
+                            ui_components::secondary_button("删除", !self.is_saving_settings)
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |shell, _: &MouseUpEvent, _, cx| {
+                                        shell.delete_tunnel_rule(delete_id.clone(), cx)
+                                    }),
+                                ),
+                        ),
+                );
+            if let Some(detail) = self.tunnel_last_errors.get(&rule.id) {
+                row = row.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(ui_theme::DANGER))
+                        .child(format!("最近错误：{detail}")),
+                );
+            }
+            tunnel_rows = tunnel_rows.child(row);
+        }
+
+        let editing_tunnel = self.editing_tunnel_id.is_some();
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .border_t_1()
+            .border_color(rgb(ui_theme::BORDER))
+            .pt(px(12.))
+            .child(ui_components::section_header(
+                "↔",
+                "端口转发",
+                "通过已认证的 P2P 连接访问另一台设备上的 TCP 服务",
+            ))
+            .child(ui_components::field_label("允许远端访问的服务"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(ui_theme::WARNING))
+                    .child("仅明确授权的设备可通过本机访问此目标；空设备列表拒绝所有 peer。停用/删除立即撤销新连接权限。"),
+            )
+            .child(allowed_rows)
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(ui_components::field_label("名称"))
+                            .child(Self::text_field_frame(&self.allowed_name, window, cx)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(ui_components::field_label("目标 IP:端口"))
+                            .child(Self::text_field_frame(&self.allowed_target, window, cx)),
+                    ),
+            )
+            .child(div().flex().flex_col().gap_1()
+                .child(ui_components::field_label("授权设备完整 Node ID（逗号分隔）"))
+                .child(Self::text_field_frame(&self.allowed_peers, window, cx)))
+            .child(allowed_actions)
+            .child(ui_components::field_label("本机转发规则"))
+            .child(tunnel_rows)
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(170.))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(ui_components::field_label("名称"))
+                            .child(Self::text_field_frame(&self.tunnel_name, window, cx)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(220.))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(ui_components::field_label("对端设备 ID"))
+                            .child(Self::text_field_frame(&self.tunnel_peer, window, cx)),
+                    )
+                    .child(
+                        div()
+                            .w(px(160.))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(ui_components::field_label("本机监听地址"))
+                            .child(Self::text_field_frame(&self.tunnel_listen, window, cx)),
+                    )
+                    .child(
+                        div()
+                            .w(px(180.))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(ui_components::field_label("远端目标 IP:端口"))
+                            .child(Self::text_field_frame(&self.tunnel_target, window, cx)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        ui_components::primary_button(
+                            if editing_tunnel {
+                                "保存规则到列表"
+                            } else {
+                                "+ 添加转发规则"
+                            },
+                            !self.is_saving_settings,
+                        )
+                        .on_mouse_up(MouseButton::Left, cx.listener(Self::save_tunnel_rule)),
+                    )
+                    .when(editing_tunnel, |row| {
+                        row.child(
+                            ui_components::secondary_button("取消编辑", !self.is_saving_settings)
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|shell, _: &MouseUpEvent, _, cx| {
+                                        shell.cancel_tunnel_edit(cx)
+                                    }),
+                                ),
+                        )
+                    }),
+            )
+    }
+
     fn advanced_network_card(&self, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
         let host = self.signal_host.read(cx).content.to_string();
         let port = self.signal_port.read(cx).content.to_string();
@@ -3204,6 +4056,7 @@ impl DesktopShell {
                                 .child(Self::text_field_frame(&self.signal_port, window, cx)),
                         ),
                 )
+                .child(self.port_forward_settings(window, cx))
                 .child(
                     div()
                         .flex()
@@ -3466,6 +4319,18 @@ pub fn run() {
                     field.content = initial_port.into();
                     field
                 });
+                let allowed_name = cx.new(|cx| TextField::new(cx, "例如：SSH"));
+                let allowed_target = cx.new(|cx| TextField::new(cx, "127.0.0.1:22"));
+                let allowed_peers =
+                    cx.new(|cx| TextField::new(cx, "明确授权的设备 ID，空列表拒绝所有设备"));
+                let tunnel_name = cx.new(|cx| TextField::new(cx, "例如：家里 SSH"));
+                let tunnel_peer = cx.new(|cx| TextField::new(cx, "完整的对端 Node ID"));
+                let tunnel_listen = cx.new(|cx| {
+                    let mut field = TextField::new(cx, "127.0.0.1:2222");
+                    field.content = "127.0.0.1:2222".into();
+                    field
+                });
+                let tunnel_target = cx.new(|cx| TextField::new(cx, "127.0.0.1:22"));
                 cx.new(|cx| {
                     cx.observe(
                         &concurrency_input,
@@ -3485,6 +4350,16 @@ pub fn run() {
                         concurrency_input,
                         signal_host,
                         signal_port,
+                        allowed_name,
+                        allowed_target,
+                        allowed_peers,
+                        pending_tunnel_changes: std::collections::HashSet::new(),
+                        tunnel_name,
+                        tunnel_peer,
+                        tunnel_listen,
+                        tunnel_target,
+                        editing_allowed_id: None,
+                        editing_tunnel_id: None,
                         selected_files: Vec::new(),
                         selected_folder: None,
                         settings,
@@ -3503,6 +4378,8 @@ pub fn run() {
                         network_epoch: 0,
                         peer_generations: HashMap::new(),
                         peer_states: HashMap::new(),
+                        tunnel_states: HashMap::new(),
+                        tunnel_last_errors: HashMap::new(),
                         task_rows: Vec::new(),
                         expanded_groups: HashSet::new(),
                         selected_task: None,
