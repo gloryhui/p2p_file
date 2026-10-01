@@ -17,7 +17,7 @@ CLI 长 NodeId、文件/测速协议，以及 `allowed_peers + forwards` 边界�
 ## SQLite 与信令兼容性
 
 ```sh
-p2p-file signal-server --listen 0.0.0.0:7000 --short-id-db /var/lib/p2p-file/device-ids.sqlite3
+p2p_file signal-server --listen 0.0.0.0:7000 --short-id-db /var/lib/p2p-file/device-ids.sqlite3
 ```
 
 默认数据库为工作目录的 `signal-device-ids.sqlite3`。生产部署应指定稳定的绝对路径，
@@ -67,7 +67,8 @@ Unix 目录 0700、配置文件 0600；Windows 使用用户 AppData 目录继承
 首次密码显示一次，之后默认隐藏，可显式显示/复制；修改或重新生成在后台派生并
 持久化。重启后无法从派生密钥恢复密码，UI 明示需输入新密码或重新生成。
 保存失败不会更新 runtime；保存成功后撤销已有连接和待认证任务、清空已有凭据，
-等待 session 确认，再报告成功。应用失败则关闭网络会话，使用新配置重启。
+等待 session 确认，再报告成功。密码轮换保留信令注册，避免重注册窗口影响立即重连。
+应用失败则关闭网络会话，使用新配置重启。
 
 ## 认证协议
 

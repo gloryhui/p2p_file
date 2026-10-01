@@ -544,7 +544,7 @@ impl TextField {
             return Some(self.content.len());
         }
         mouse_index_for_layout(
-            &self.content,
+            &self.displayed_content(),
             &line.text,
             line.closest_index_for_x(position.x - bounds.left()),
         )
@@ -2350,6 +2350,9 @@ impl DesktopShell {
                         shell.local_password.update(cx, |field, cx| {
                             field.content = password.expose().to_owned().into();
                             field.revealed = false;
+                            field.marked_range = None;
+                            field.selection_reversed = false;
+                            field.is_selecting = false;
                             field.selected_range = field.content.len()..field.content.len();
                             field.last_layout = None;
                             cx.notify();
@@ -4282,6 +4285,37 @@ impl DesktopShell {
                 .child(
                     div()
                         .flex()
+                        .flex_col()
+                        .gap_1()
+                        .text_xs()
+                        .child(format!(
+                            "真实设备身份（Node ID）：{}",
+                            self.identity_id.as_deref().unwrap_or("身份不可用")
+                        ))
+                        .child(
+                            ui_components::secondary_button(
+                                "复制真实 Node ID",
+                                self.identity_id.is_some(),
+                            )
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|shell, _, _, cx| {
+                                    if let Some(identity) = &shell.identity_id {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            identity.clone(),
+                                        ));
+                                        shell.set_status(
+                                            "已复制真实 Node ID；转发授权按此身份绑定",
+                                            cx,
+                                        );
+                                    }
+                                }),
+                            ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
                         .gap_3()
                         .child(
                             div()
@@ -4706,6 +4740,16 @@ mod tests {
         assert_eq!(password_display(value, true), value);
         assert_eq!(password_display(value, false).len(), value.len());
         assert_eq!(password_display("", false), "");
+        let hidden = password_display(value, false);
+        assert_eq!(mouse_index_for_layout(&hidden, &hidden, 3), Some(3));
+        assert_eq!(
+            mouse_index_for_layout(&hidden, &hidden, 99),
+            Some(value.len())
+        );
+        assert_eq!(
+            mouse_index_for_layout(&password_display("A9", false), &hidden, 3),
+            None
+        );
     }
     #[test]
     fn concurrency_input_only_accepts_single_values_from_one_to_three() {

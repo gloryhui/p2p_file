@@ -1010,7 +1010,10 @@ async fn run_session(
                 }
                 short_queries.clear();
                 peer_candidates.clear();
-                signal_generation = signal_generation.wrapping_add(1);
+                let signal_changed = auth_updated.is_none();
+                if signal_changed {
+                    signal_generation = signal_generation.wrapping_add(1);
+                }
                 // An explicit server change supersedes this generation's attempts
                 // and authenticated peers. An involuntary outage below preserves them.
                 for (_, (_, connection)) in connections.drain() {
@@ -1038,27 +1041,36 @@ async fn run_session(
                     let _ = command_tx.try_send(SessionCommand::ConnectPeer(peer));
                 }
                 for (peer, generation) in peers.active_peers() {
-                    let state = PeerLifecycle::Failed("网络配置已更改，请重新连接".into());
+                    let state = PeerLifecycle::Failed(
+                        if signal_changed {
+                            "网络配置已更改，请重新连接"
+                        } else {
+                            "远程密码已更改，会话授权已撤销，请重新连接"
+                        }
+                        .into(),
+                    );
                     if peers.transition(peer, generation, state.clone()) {
                         emit_peer_state(&events, peer, generation, state).await;
                     }
                 }
-                signal = None;
-                reconnect_sleep = None;
-                reconnect_attempt = 0;
-                if let Some(task) = connect_task.take() {
-                    task.abort();
+                if signal_changed {
+                    signal = None;
+                    reconnect_sleep = None;
+                    reconnect_attempt = 0;
+                    if let Some(task) = connect_task.take() {
+                        task.abort();
+                    }
+                    emit_lifecycle(&events, NetworkLifecycle::ConnectingSignal).await;
+                    start_signal_connect(
+                        &identity,
+                        &signal_server,
+                        &network.local_candidates,
+                        signal_generation,
+                        input_tx.clone(),
+                        &mut connect_task,
+                        &mut session_tasks,
+                    );
                 }
-                emit_lifecycle(&events, NetworkLifecycle::ConnectingSignal).await;
-                start_signal_connect(
-                    &identity,
-                    &signal_server,
-                    &network.local_candidates,
-                    signal_generation,
-                    input_tx.clone(),
-                    &mut connect_task,
-                    &mut session_tasks,
-                );
                 if let Some(done) = auth_updated {
                     let _ = done.send(());
                 }
@@ -1202,14 +1214,17 @@ async fn run_session(
                             .await;
                     }
                     if peers.state(node_id) == Some(&PeerLifecycle::Connected)
-                        && peer_candidates
+                        && (connections
                             .get(&node_id)
-                            .is_some_and(|(generation, old)| {
-                                peers.is_current(node_id, *generation) && *old != canonical
-                            })
+                            .is_some_and(|(_, connection)| connection.close_reason().is_some())
+                            || peer_candidates
+                                .get(&node_id)
+                                .is_some_and(|(generation, old)| {
+                                    peers.is_current(node_id, *generation) && *old != canonical
+                                }))
                         && !network.reachable_candidates(&candidates).is_empty()
                     {
-                        // Registered identity now advertises a different socket mapping.
+                        // Changed mapping or a closed transport whose callback is still queued.
                         // Retire only this generation; new Punch/QUIC/identity/capability
                         // checks remain mandatory. Old closure callbacks are fenced.
                         if let Some((generation, connection)) = connections.remove(&node_id) {
@@ -3065,8 +3080,27 @@ mod tests {
         wanted: TunnelRuntimeState,
     ) {
         let expected = format!("expected {wanted:?} for {id}");
-        time::timeout(Duration::from_secs(8), async {
+        // Reconnect now includes an Argon2id job; use the healthy peer establishment
+        // budget, and still fail immediately on a terminal protocol/runtime error.
+        time::timeout(Duration::from_secs(20), async {
             while let Some(event) = events.recv().await {
+                if wanted == TunnelRuntimeState::Running {
+                    if let SessionEvent::PeerState {
+                        state: PeerLifecycle::Failed(ref detail),
+                        ..
+                    } = event
+                    {
+                        panic!("tunnel peer failed while waiting for Running: {detail}");
+                    }
+                    if let SessionEvent::TunnelState {
+                        ref rule_id,
+                        state: TunnelRuntimeState::Error(ref detail),
+                    } = event
+                        && rule_id == id
+                    {
+                        panic!("tunnel failed while waiting for Running: {detail}");
+                    }
+                }
                 if let SessionEvent::TunnelState { rule_id, state } = event
                     && rule_id == id
                     && state == wanted

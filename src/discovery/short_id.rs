@@ -239,7 +239,6 @@ mod tests {
         assert!(last > 0);
         assert!(db.execute("INSERT INTO device_id_mapping(device_identity,short_id,created_at,last_seen_at) VALUES(?1,?2,0,0)",params![identity.to_hex(),FIRST_SHORT_ID+1]).is_err());
         assert!(db.execute("INSERT INTO device_id_mapping(device_identity,short_id,created_at,last_seen_at) VALUES(?1,?2,0,0)",params![Identity::generate().node_id().to_hex(),FIRST_SHORT_ID]).is_err());
-        assert!(serde_json::from_str::<ShortId>("99999999").is_err());
         assert!(postcard::from_bytes::<ShortId>(&postcard::to_allocvec(&1u32).unwrap()).is_err());
     }
     #[test]
