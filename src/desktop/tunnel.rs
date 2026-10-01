@@ -103,6 +103,7 @@ pub(super) async fn serve_open(
 pub(super) async fn serve_peer(
     connection: Connection,
     peer: NodeId,
+    inbound_authorized: bool,
     allowed_updates: watch::Receiver<Vec<super::config::AllowedForwardTarget>>,
 ) -> Result<()> {
     let mut streams = JoinSet::new();
@@ -113,6 +114,12 @@ pub(super) async fn serve_peer(
                     Ok(streams) => streams,
                     Err(_) => break,
                 };
+                if !inbound_authorized {
+                    let mut send = send;
+                    let _ = send.reset(3u32.into());
+                    let _ = recv.stop(3u32.into());
+                    continue;
+                }
                 if streams.len() >= STREAM_LIMIT {
                     let mut send = send;
                     let _ = protocol::write(
@@ -293,7 +300,7 @@ mod tests {
         let grant =
             super::super::config::AllowedForwardTarget::new("echo", target, vec![peer.to_hex()]);
         let (updates, grants) = watch::channel(vec![grant]);
-        let service = tokio::spawn(serve_peer(server_conn.clone(), peer, grants));
+        let service = tokio::spawn(serve_peer(server_conn.clone(), peer, true, grants));
         let (mut send, mut recv) = client_conn.open_bi().await.unwrap();
         let frame = Frame {
             request_id: 0,

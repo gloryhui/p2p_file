@@ -919,7 +919,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    use crate::discovery::signal::run_signal_server_on;
+    use crate::discovery::signal::{SignalServerConfig, run_signal_server_on_with};
     use crate::nat::punch::PunchConfig;
     use crate::net::{DirectConfig, establish};
 
@@ -936,7 +936,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let _ = run_signal_server_on(listener).await;
+            let _ = run_signal_server_on_with(listener, SignalServerConfig::for_tests()).await;
         });
         addr
     }

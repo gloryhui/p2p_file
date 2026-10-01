@@ -47,3 +47,7 @@ target/
 .idea/
 .vscode/
 *.code-workspace
+
+# ---- 本机信令地址数据库 ----
+/signal-device-ids.sqlite3
+/signal-device-ids.sqlite3-*

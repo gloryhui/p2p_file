@@ -154,6 +154,14 @@ $BIN push --signal $SIGNAL --peer $HOME_ID ./大文件.mkv
 
 ### 原生桌面（GPUI）
 
+桌面连接使用信令分配的 9 位顺序设备 ID（如 `100 000 123`）和对端远程访问密码。
+首次启动在设置页显示随机生成的密码，复制保存后可隐藏；密码只保存 Argon2id
+派生密钥，重启后不能回显，仍可修改或重新生成。双方身份与当前 QUIC/TLS binding
+验证完成后，还须通过密码认证才开放文件、测速和 TCP Tunnel。
+信令服务器需升级并持久保存 `--short-id-db` 数据库；CLI 长 NodeId 流程继续可用。
+协议、迁移与安全边界见 [远程访问认证](docs/REMOTE_AUTH.md)。
+
+
 ```bash
 cargo run --locked --features gui --bin p2p-desktop
 ```

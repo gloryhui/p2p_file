@@ -2,7 +2,7 @@
 //! desktop has no RPC, environment switch, fault injector or alternate network loop.
 use super::{
     config::{self, DesktopConfig, SettingsDraft},
-    network_state::{NetworkLifecycle, PeerLifecycle},
+    network_state::NetworkLifecycle,
     session::{self, DesktopSessionConfig, DesktopSessionHandle, SessionEvent},
     task_model::TaskId,
     task_store::TaskStore,
@@ -53,6 +53,11 @@ fn start(
         include_loopback: true,
         ..Default::default()
     };
+    conf.remote_auth = draft.remote_auth.clone();
+    // These file/recovery fixtures exercise bidirectional sessions. Both actors
+    // explicitly hold the test peer password and prove it on every new transport.
+    conf.test_outgoing_password =
+        Some(super::remote_auth::SecretPassword::new("Test9Pass".into()).unwrap());
     conf.transfer = Some(service);
     session::spawn(identity, conf).unwrap()
 }
@@ -99,7 +104,7 @@ fn actor(root: PathBuf) {
                                 peer,
                                 (
                                     generation,
-                                    if matches!(state, PeerLifecycle::Connected) {
+                                    if state.outbound_authorized() {
                                         "Connected".into()
                                     } else {
                                         format!("{state:?}")
@@ -127,6 +132,14 @@ fn actor(root: PathBuf) {
         let result: Result<Value, String> = (|| match command {
             "configure" => {
                 let addr: SocketAddr = str_field(&v, "signal").parse().unwrap();
+                if draft.remote_auth.is_none() {
+                    draft.remote_auth = Some(
+                        super::remote_auth::RemoteVerifier::create(
+                            &super::remote_auth::SecretPassword::new("Test9Pass".into()).unwrap(),
+                        )
+                        .unwrap(),
+                    );
+                }
                 draft.signal_host = addr.ip().to_string();
                 draft.signal_port = addr.port().to_string();
                 draft
@@ -414,7 +427,7 @@ impl Server {
                     tx.send(listener.local_addr().unwrap()).unwrap();
                     let job = tokio::spawn(crate::discovery::signal::run_signal_server_on_with(
                         listener,
-                        Default::default(),
+                        crate::discovery::signal::SignalServerConfig::for_tests(),
                     ));
                     let _ = stopped.await;
                     job.abort();

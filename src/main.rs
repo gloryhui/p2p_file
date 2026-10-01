@@ -9,7 +9,7 @@ use std::time::Duration;
 use clap::Parser;
 
 use p2p_file::cli::{Cli, Command, DirectOpts};
-use p2p_file::discovery::signal::run_signal_server;
+use p2p_file::discovery::signal::{SignalServerConfig, run_signal_server_on_with};
 use p2p_file::discovery::{LanDiscovery, parse_announcement};
 use p2p_file::error::{Error, Result};
 use p2p_file::identity::Identity;
@@ -60,7 +60,22 @@ async fn run(cli: Cli) -> Result<()> {
             chunk_size,
         } => cmd_send(&key_file, file, peer, chunk_size).await,
 
-        Command::SignalServer { listen } => cmd_signal_server(listen).await,
+        Command::SignalServer {
+            listen,
+            short_id_db,
+            max_device_ids,
+            new_device_ids_per_minute,
+            new_device_ids_per_ip_per_minute,
+        } => {
+            cmd_signal_server(
+                listen,
+                short_id_db,
+                max_device_ids,
+                new_device_ids_per_minute,
+                new_device_ids_per_ip_per_minute,
+            )
+            .await
+        }
         Command::Serve {
             direct,
             allow,
@@ -387,14 +402,28 @@ async fn close_endpoint(endpoint: &quinn::Endpoint) {
     let _ = tokio::time::timeout(Duration::from_secs(3), endpoint.wait_idle()).await;
 }
 
-async fn cmd_signal_server(listen: SocketAddr) -> Result<()> {
+async fn cmd_signal_server(
+    listen: SocketAddr,
+    short_id_db: std::path::PathBuf,
+    max_device_ids: u32,
+    new_device_ids_per_minute: u32,
+    new_device_ids_per_ip_per_minute: u32,
+) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(listen).await?;
+    let config = SignalServerConfig {
+        short_id_database: Some(short_id_db),
+        max_short_id_mappings: max_device_ids,
+        short_id_allocations_per_minute: new_device_ids_per_minute,
+        short_id_allocations_per_ip_per_minute: new_device_ids_per_ip_per_minute,
+        ..SignalServerConfig::default()
+    };
     println!("信令服务器监听 {listen}");
     println!("它只负责让双方交换候选地址，业务数据一个字节都不经过这里。");
     println!("记得在云主机安全组里放通这个 TCP 端口。");
     println!("按 Ctrl-C 退出。");
 
     tokio::select! {
-        result = run_signal_server(listen) => result,
+        result = run_signal_server_on_with(listener, config) => result,
         _ = shutdown_signal() => {
             println!("\n收到中断信号，退出。");
             Ok(())

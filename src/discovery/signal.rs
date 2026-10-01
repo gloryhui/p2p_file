@@ -30,8 +30,10 @@
 //! 身份最终仍由 QUIC 之上的应用层握手确认；信令认证是为了让服务器自己的
 //! 在线表不被随意污染（冒名、幽灵节点、内存耗尽）。
 
+use super::short_id::{ALLOCATION_WINDOW_SECONDS, AllocationLimits, ShortId, ShortIdStore};
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{Mutex, Semaphore, mpsc, watch};
 
 use crate::error::{Error, Result};
 use crate::identity::{
@@ -59,6 +61,11 @@ pub const DEFAULT_SIGNAL_PORT: u16 = 7000;
 /// 两者不兼容：新版服务器收到 v1 的 `Register` 会在握手阶段明确拒绝，
 /// 新版客户端也会拒绝 v1 服务器的应答，不会静默降级到无认证路径。
 pub const SIGNAL_PROTOCOL_VERSION: u32 = 2;
+/// Opt-in extension; legacy v2 wire/signatures stay unchanged.
+pub const SHORT_ID_PROTOCOL_VERSION: u32 = 3;
+const SHORT_LOOKUP_WINDOW: Duration = Duration::from_secs(10);
+const MAX_SHORT_LOOKUP_IPS: usize = 1024;
+const SHORT_LOOKUP_UNAVAILABLE: &str = "设备查询不可用或请求过多，请稍后重试";
 
 /// 注册 challenge 长度（256 bit）。
 pub const CHALLENGE_LEN: usize = 32;
@@ -90,6 +97,15 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// 默认值面向公网部署；测试用更小的值来快速验证边界行为。
 #[derive(Clone, Debug)]
 pub struct SignalServerConfig {
+    /// Persistent by default. None explicitly opts into an ephemeral embedded/test registry.
+    pub short_id_database: Option<PathBuf>,
+    /// New durable mappings only; reconnects do not consume these budgets.
+    pub max_short_id_mappings: u32,
+    pub short_id_allocations_per_minute: u32,
+    pub short_id_allocations_per_ip_per_minute: u32,
+    pub short_lookups_per_connection: u32,
+    pub short_lookups_per_ip: u32,
+    pub max_short_lookup_misses: u32,
     /// 单节点候选地址上限。
     pub max_candidates: usize,
     /// 在线节点总数上限。
@@ -121,6 +137,13 @@ pub struct SignalServerConfig {
 impl Default for SignalServerConfig {
     fn default() -> Self {
         Self {
+            short_id_database: Some(PathBuf::from("signal-device-ids.sqlite3")),
+            max_short_id_mappings: 1_000_000,
+            short_id_allocations_per_minute: 120,
+            short_id_allocations_per_ip_per_minute: 10,
+            short_lookups_per_connection: 5,
+            short_lookups_per_ip: 20,
+            max_short_lookup_misses: 3,
             max_candidates: MAX_CANDIDATES,
             max_registered_peers: MAX_REGISTERED_PEERS,
             max_waiter_entries: MAX_WAITER_ENTRIES,
@@ -131,6 +154,16 @@ impl Default for SignalServerConfig {
             idle_timeout: Duration::from_secs(180),
             write_timeout: Duration::from_secs(30),
             challenge_ttl: Duration::from_secs(10),
+        }
+    }
+}
+
+#[cfg(test)]
+impl SignalServerConfig {
+    pub(crate) fn for_tests() -> Self {
+        Self {
+            short_id_database: None,
+            ..Self::default()
         }
     }
 }
@@ -281,6 +314,16 @@ pub enum SignalMessage {
         protocol_version: u32,
         challenge: [u8; CHALLENGE_LEN],
     },
+    RegisteredShort {
+        short_id: ShortId,
+    },
+    LookupShort {
+        short_id: ShortId,
+    },
+    ShortResolved {
+        short_id: ShortId,
+        node_id: Option<NodeId>,
+    },
 }
 
 impl SignalMessage {
@@ -299,6 +342,9 @@ impl SignalMessage {
             Self::RegisterChallenge { .. } => "RegisterChallenge",
             Self::Register { .. } => "Register",
             Self::Registered => "Registered",
+            Self::RegisteredShort { .. } => "RegisteredShort",
+            Self::LookupShort { .. } => "LookupShort",
+            Self::ShortResolved { .. } => "ShortResolved",
             Self::Lookup { .. } => "Lookup",
             Self::PeerCandidates { .. } => "PeerCandidates",
             Self::PeerPending { .. } => "PeerPending",
@@ -343,12 +389,14 @@ pub fn register_payload(
 /// 一次成功登记的所有权凭证。
 #[derive(Clone, Copy, Debug)]
 struct ActiveRegistration {
+    protocol_version: u32,
     node_id: NodeId,
     connection_id: u64,
 }
 
 /// 正在等待 `Register` 的注册。
 struct PendingRegistration {
+    protocol_version: u32,
     node_id: NodeId,
     public_key: [u8; 32],
     challenge: [u8; CHALLENGE_LEN],
@@ -379,6 +427,7 @@ struct WaiterKey {
 /// 内存里的在线表。进程重启即清空——客户端会重新登记。
 #[derive(Default)]
 struct Registry {
+    short_lookup_ips: HashMap<IpAddr, LookupWindow>,
     peers: HashMap<NodeId, PeerRecord>,
     /// 谁在等谁上线：`waiters[target] = { (requester, connection_id), ... }`。
     waiters: HashMap<NodeId, HashSet<WaiterKey>>,
@@ -390,7 +439,125 @@ struct Registry {
     pending_by_connection: HashMap<WaiterKey, HashSet<NodeId>>,
 }
 
+#[derive(Debug)]
+struct LookupWindow {
+    started: tokio::time::Instant,
+    requests: u32,
+    misses: u32,
+}
+impl LookupWindow {
+    fn new() -> Self {
+        Self {
+            started: tokio::time::Instant::now(),
+            requests: 0,
+            misses: 0,
+        }
+    }
+    fn expired(&self) -> bool {
+        self.expired_after(SHORT_LOOKUP_WINDOW)
+    }
+    fn expired_after(&self, window: Duration) -> bool {
+        self.started.elapsed() >= window
+    }
+    fn take(&mut self, limit: u32, misses: u32) -> bool {
+        self.take_in_window(limit, misses, SHORT_LOOKUP_WINDOW)
+    }
+    fn take_in_window(&mut self, limit: u32, misses: u32, window: Duration) -> bool {
+        if self.expired_after(window) {
+            *self = Self::new();
+        }
+        if self.requests >= limit || self.misses >= misses {
+            return false;
+        }
+        self.requests += 1;
+        true
+    }
+}
+
+#[derive(Clone)]
+struct ShortIdResources {
+    store: Arc<ShortIdStore>,
+    pending: Arc<Semaphore>,
+    allocation_ips: Arc<std::sync::Mutex<HashMap<IpAddr, LookupWindow>>>,
+    allocation_limits: AllocationLimits,
+    per_ip_allocations: u32,
+}
+impl ShortIdResources {
+    fn new(config: &SignalServerConfig) -> Result<Self> {
+        Ok(Self {
+            store: Arc::new(ShortIdStore::open(config.short_id_database.as_deref())?),
+            pending: Arc::new(Semaphore::new(config.max_pending_lookups)),
+            allocation_ips: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            allocation_limits: AllocationLimits {
+                max_mappings: config.max_short_id_mappings,
+                per_window: config.short_id_allocations_per_minute,
+            },
+            per_ip_allocations: config.short_id_allocations_per_ip_per_minute,
+        })
+    }
+    async fn register(&self, node: NodeId, ip: IpAddr) -> Result<ShortId> {
+        let permit = self
+            .pending
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::Discovery("短 ID 数据库请求达到上限".into()))?;
+        let store = self.store.clone();
+        let ips = self.allocation_ips.clone();
+        let limits = self.allocation_limits;
+        let per_ip = self.per_ip_allocations;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            store.register_with_limits(node, limits, || {
+                let window = Duration::from_secs(ALLOCATION_WINDOW_SECONDS as u64);
+                let mut ips = ips
+                    .lock()
+                    .map_err(|_| Error::Discovery("发号预算不可用".into()))?;
+                ips.retain(|_, bucket| !bucket.expired_after(window));
+                if !ips.contains_key(&ip) && ips.len() >= MAX_SHORT_LOOKUP_IPS {
+                    return Err(Error::Discovery("新设备分配暂时受限".into()));
+                }
+                if !ips
+                    .entry(ip)
+                    .or_insert_with(LookupWindow::new)
+                    .take_in_window(per_ip, u32::MAX, window)
+                {
+                    return Err(Error::Discovery("新设备分配暂时受限".into()));
+                }
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|_| Error::Discovery("短 ID 数据库任务失败".into()))?
+    }
+    async fn lookup(&self, id: ShortId) -> Result<Option<NodeId>> {
+        let permit = self
+            .pending
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::Discovery(SHORT_LOOKUP_UNAVAILABLE.into()))?;
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            store.lookup(id)
+        })
+        .await
+        .map_err(|_| Error::Discovery(SHORT_LOOKUP_UNAVAILABLE.into()))?
+    }
+}
+
 impl Registry {
+    fn take_short_lookup(&mut self, ip: IpAddr, config: &SignalServerConfig) -> bool {
+        self.short_lookup_ips.retain(|_, window| !window.expired());
+        if !self.short_lookup_ips.contains_key(&ip)
+            && self.short_lookup_ips.len() >= MAX_SHORT_LOOKUP_IPS
+        {
+            return false;
+        }
+        self.short_lookup_ips
+            .entry(ip)
+            .or_insert_with(LookupWindow::new)
+            .take(config.short_lookups_per_ip, u32::MAX)
+    }
     /// waiter 条目总数（所有集合的大小之和）。
     fn waiter_entries(&self) -> usize {
         self.waiters.values().map(HashSet::len).sum()
@@ -532,7 +699,14 @@ impl Registry {
 /// 跑信令服务器，永不返回（除非出错）。
 pub async fn run_signal_server(listen: SocketAddr) -> Result<()> {
     let listener = TcpListener::bind(listen).await?;
-    run_signal_server_on_with(listener, SignalServerConfig::default()).await
+    run_signal_server_on_with(
+        listener,
+        SignalServerConfig {
+            short_id_database: Some(PathBuf::from("signal-device-ids.sqlite3")),
+            ..SignalServerConfig::default()
+        },
+    )
+    .await
 }
 
 /// 在**已经绑好**的监听器上跑信令服务器（默认配置）。
@@ -551,6 +725,7 @@ pub async fn run_signal_server_on_with(
     tracing::info!(%local, "信令服务器已启动，等待节点接入（只牵线，不过数据）");
 
     let registry = Arc::new(Mutex::new(Registry::default()));
+    let short_ids = ShortIdResources::new(&config)?;
     let config = Arc::new(config);
 
     // 连接所有权凭证：单调递增，保证「旧连接断开」不会误删「新连接」的记录。
@@ -579,8 +754,11 @@ pub async fn run_signal_server_on_with(
 
         let registry = Arc::clone(&registry);
         let config = Arc::clone(&config);
+        let short_ids = short_ids.clone();
         clients.spawn(async move {
-            if let Err(err) = handle_signal_client(stream, registry, connection_id, config).await {
+            if let Err(err) =
+                handle_signal_client(stream, registry, connection_id, config, short_ids).await
+            {
                 tracing::debug!(%remote, error = %err, "信令连接结束");
             }
         });
@@ -612,7 +790,10 @@ async fn handle_signal_client(
     registry: Arc<Mutex<Registry>>,
     connection_id: u64,
     config: Arc<SignalServerConfig>,
+    short_ids: ShortIdResources,
 ) -> Result<()> {
+    let remote_ip = stream.peer_addr()?.ip();
+    let mut short_window = LookupWindow::new();
     // 信令消息都很小，别让 Nagle 拖慢牵线。
     let _ = stream.set_nodelay(true);
     let (read_half, write_half) = stream.into_split();
@@ -685,12 +866,11 @@ async fn handle_signal_client(
                     reject(&outbox, "本连接已经开始或完成注册，不能重复 RegisterHello");
                     break "重复 RegisterHello";
                 }
-                if protocol_version != SIGNAL_PROTOCOL_VERSION {
+                if ![SIGNAL_PROTOCOL_VERSION, SHORT_ID_PROTOCOL_VERSION].contains(&protocol_version)
+                {
                     reject(
                         &outbox,
-                        format!(
-                            "信令协议版本不兼容：本机 {SIGNAL_PROTOCOL_VERSION}，对端 {protocol_version}"
-                        ),
+                        format!("信令协议版本不兼容：支持 2/3，对端 {protocol_version}"),
                     );
                     break "信令协议版本不兼容";
                 }
@@ -712,13 +892,14 @@ async fn handle_signal_client(
                 if !send_or_close(
                     &outbox,
                     SignalMessage::RegisterChallenge {
-                        protocol_version: SIGNAL_PROTOCOL_VERSION,
+                        protocol_version,
                         challenge,
                     },
                 ) {
                     break "待写队列已满";
                 }
                 pending = Some(PendingRegistration {
+                    protocol_version,
                     node_id,
                     public_key,
                     challenge,
@@ -799,6 +980,26 @@ async fn handle_signal_client(
                     break "注册签名校验失败";
                 }
 
+                // Reject exhausted online capacity before consuming durable address space.
+                // The insertion below still rechecks capacity after the asynchronous DB job.
+                {
+                    let reg = registry.lock().await;
+                    if !reg.peers.contains_key(&node_id)
+                        && reg.peers.len() >= config.max_registered_peers
+                    {
+                        drop(reg);
+                        reject(&outbox, "服务器在线表已满");
+                        break "在线表已满";
+                    }
+                }
+                // Private-key possession has been proved. Only now may SQLite allocate an ID.
+                let short_id = match short_ids.register(node_id, remote_ip).await {
+                    Ok(id) => id,
+                    Err(error) => {
+                        reject(&outbox, error.to_string());
+                        break "短 ID 持久化失败";
+                    }
+                };
                 // 认证通过，才允许写进在线表。
                 let (live_waiters, replaced_close) = {
                     let mut reg = registry.lock().await;
@@ -830,6 +1031,7 @@ async fn handle_signal_client(
                 };
 
                 active = Some(ActiveRegistration {
+                    protocol_version: pending_registration.protocol_version,
                     node_id,
                     connection_id,
                 });
@@ -841,7 +1043,13 @@ async fn handle_signal_client(
                     "节点登记（已通过私钥挑战认证）"
                 );
 
-                if !send_or_close(&outbox, SignalMessage::Registered) {
+                let registered =
+                    if pending_registration.protocol_version == SHORT_ID_PROTOCOL_VERSION {
+                        SignalMessage::RegisteredShort { short_id }
+                    } else {
+                        SignalMessage::Registered
+                    };
+                if !send_or_close(&outbox, registered) {
                     break "待写队列已满";
                 }
 
@@ -857,6 +1065,43 @@ async fn handle_signal_client(
                 }
             }
 
+            SignalMessage::LookupShort { short_id } => {
+                let Some(registration) = active else {
+                    reject(&outbox, SHORT_LOOKUP_UNAVAILABLE);
+                    break "未注册短 ID 查询";
+                };
+                let owner = registry
+                    .lock()
+                    .await
+                    .peers
+                    .get(&registration.node_id)
+                    .is_some_and(|record| record.connection_id == connection_id);
+                if !owner || registration.protocol_version != SHORT_ID_PROTOCOL_VERSION {
+                    reject(&outbox, SHORT_LOOKUP_UNAVAILABLE);
+                    break "短 ID 查询身份/版本无效";
+                }
+                let allowed = short_window.take(
+                    config.short_lookups_per_connection,
+                    config.max_short_lookup_misses,
+                ) && registry.lock().await.take_short_lookup(remote_ip, &config);
+                let node_id = if allowed && ShortId::new(short_id.value()).is_ok() {
+                    match short_ids.lookup(short_id).await {
+                        Ok(node) => node,
+                        Err(error) => {
+                            tracing::warn!(%error, "短 ID 查询失败");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                if node_id.is_none() {
+                    short_window.misses = short_window.misses.saturating_add(1);
+                }
+                if !send_or_close(&outbox, SignalMessage::ShortResolved { short_id, node_id }) {
+                    break "待写队列已满";
+                }
+            }
             SignalMessage::Lookup { node_id: target } => {
                 let Some(registration) = active.as_ref() else {
                     reject(&outbox, "还没登记就想查询");
@@ -1075,6 +1320,7 @@ const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// 这样上层在跑长时间隧道、完全不碰信令时，连接也不会因为空闲被服务器摘掉。
 pub struct SignalingClient {
     node_id: NodeId,
+    short_id: Option<ShortId>,
     server: String,
     /// 出站消息：前台方法 + 心跳任务都往这里投。
     outgoing: mpsc::Sender<SignalMessage>,
@@ -1123,7 +1369,15 @@ impl SignalingClient {
         candidates: Vec<Candidate>,
         heartbeat_interval: Option<Duration>,
     ) -> Result<Self> {
-        Self::connect_with_options(server, identity, candidates, heartbeat_interval, false).await
+        Self::connect_with_options(
+            server,
+            identity,
+            candidates,
+            heartbeat_interval,
+            false,
+            SIGNAL_PROTOCOL_VERSION,
+        )
+        .await
     }
 
     /// Connect with the normal registration/heartbeat behavior while exposing Pong
@@ -1140,6 +1394,23 @@ impl SignalingClient {
             candidates,
             Some(DEFAULT_HEARTBEAT_INTERVAL),
             true,
+            SIGNAL_PROTOCOL_VERSION,
+        )
+        .await
+    }
+
+    pub async fn connect_desktop_with_events(
+        server: &str,
+        identity: &Identity,
+        candidates: Vec<Candidate>,
+    ) -> Result<Self> {
+        Self::connect_with_options(
+            server,
+            identity,
+            candidates,
+            Some(DEFAULT_HEARTBEAT_INTERVAL),
+            true,
+            SHORT_ID_PROTOCOL_VERSION,
         )
         .await
     }
@@ -1150,6 +1421,7 @@ impl SignalingClient {
         candidates: Vec<Candidate>,
         heartbeat_interval: Option<Duration>,
         forward_pongs: bool,
+        protocol_version: u32,
     ) -> Result<Self> {
         // 服务端也会拦，但客户端自己收一下，避免明知超限还去发一个大包。
         let mut candidates = candidates;
@@ -1176,9 +1448,15 @@ impl SignalingClient {
 
         // 整个注册交换（Hello → Challenge → Register → Registered）都要在
         // 超时内完成，避免服务器不回包时客户端无限等待。
-        tokio::time::timeout(
+        let short_id = tokio::time::timeout(
             Duration::from_secs(10),
-            register_session(&mut reader, &mut write_half, identity, candidates),
+            register_session(
+                &mut reader,
+                &mut write_half,
+                identity,
+                candidates,
+                protocol_version,
+            ),
         )
         .await
         .map_err(|_| Error::Discovery(format!("连接信令服务器 {server} 注册超时")))??;
@@ -1198,6 +1476,7 @@ impl SignalingClient {
 
         Ok(Self {
             node_id,
+            short_id,
             server: server.to_string(),
             outgoing,
             events,
@@ -1206,6 +1485,19 @@ impl SignalingClient {
                 reader: reader_task,
             },
         })
+    }
+
+    pub fn short_id(&self) -> Option<ShortId> {
+        self.short_id
+    }
+
+    pub async fn request_short_lookup(&self, short_id: ShortId) -> Result<()> {
+        if self.short_id.is_none() {
+            return Err(Error::Discovery("信令服务器/客户端不支持短设备 ID".into()));
+        }
+        self.outgoing
+            .try_send(SignalMessage::LookupShort { short_id })
+            .map_err(|_| Error::Discovery(SHORT_LOOKUP_UNAVAILABLE.into()))
     }
 
     pub fn node_id(&self) -> NodeId {
@@ -1454,12 +1746,13 @@ async fn register_session(
     writer: &mut OwnedWriteHalf,
     identity: &Identity,
     candidates: Vec<Candidate>,
-) -> Result<()> {
+    protocol_version: u32,
+) -> Result<Option<ShortId>> {
     let node_id = identity.node_id();
     let public_key = identity.public_key_bytes();
 
     let hello = SignalMessage::RegisterHello {
-        protocol_version: SIGNAL_PROTOCOL_VERSION,
+        protocol_version,
         node_id,
         public_key,
     };
@@ -1470,12 +1763,12 @@ async fn register_session(
         .ok_or_else(|| Error::Discovery("信令服务器在 challenge 之前就关闭了连接".into()))?;
     let challenge = match SignalMessage::decode(&reply)? {
         SignalMessage::RegisterChallenge {
-            protocol_version,
+            protocol_version: remote_version,
             challenge,
         } => {
-            if protocol_version != SIGNAL_PROTOCOL_VERSION {
+            if remote_version != protocol_version {
                 return Err(Error::Discovery(format!(
-                    "信令协议版本不兼容：本机 {SIGNAL_PROTOCOL_VERSION}，对端 {protocol_version}"
+                    "信令协议版本不兼容：本机 {protocol_version}，对端 {remote_version}"
                 )));
             }
             challenge
@@ -1504,7 +1797,12 @@ async fn register_session(
         .await?
         .ok_or_else(|| Error::Discovery("信令服务器在确认前就关闭了连接".into()))?;
     match SignalMessage::decode(&reply)? {
-        SignalMessage::Registered => Ok(()),
+        SignalMessage::Registered if protocol_version == SIGNAL_PROTOCOL_VERSION => Ok(None),
+        SignalMessage::RegisteredShort { short_id }
+            if protocol_version == SHORT_ID_PROTOCOL_VERSION =>
+        {
+            Ok(Some(ShortId::new(short_id.value())?))
+        }
         SignalMessage::Error { reason } => Err(Error::Discovery(format!("登记被拒绝: {reason}"))),
         other => Err(Error::Discovery(format!(
             "登记后收到意外消息 {}",
@@ -1526,13 +1824,298 @@ impl std::fmt::Debug for SignalingClient {
 mod tests {
     use super::*;
 
+    async fn short_reply(client: &mut SignalingClient) -> Option<NodeId> {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let SignalMessage::ShortResolved { node_id, .. } =
+                    client.next_event().await.unwrap()
+                {
+                    return node_id;
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn short_ids_are_sequential_stable_and_query_resolves_real_identity() {
+        let path =
+            std::env::temp_dir().join(format!("p2p-signal-{:032x}.sqlite", rand::random::<u128>()));
+        let config = SignalServerConfig {
+            short_id_database: Some(path.clone()),
+            ..SignalServerConfig::for_tests()
+        };
+        let (address, _) = spawn_signal_server_with(config.clone()).await;
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let mut first =
+            SignalingClient::connect_desktop_with_events(&address.to_string(), &a, vec![])
+                .await
+                .unwrap();
+        let second = SignalingClient::connect_desktop_with_events(&address.to_string(), &b, vec![])
+            .await
+            .unwrap();
+        assert_eq!(first.short_id().unwrap().value(), 100_000_000);
+        assert_eq!(second.short_id().unwrap().value(), 100_000_001);
+        first
+            .request_short_lookup(second.short_id().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(short_reply(&mut first).await, Some(b.node_id()));
+        drop((first, second));
+        // A new server owner with a fresh online registry uses the durable mapping.
+        let (restarted, _) = spawn_signal_server_with(config).await;
+        let again =
+            SignalingClient::connect_desktop_with_events(&restarted.to_string(), &a, vec![])
+                .await
+                .unwrap();
+        assert_eq!(again.short_id().unwrap().value(), 100_000_000);
+        let renewed = SignalingClient::connect_desktop_with_events(
+            &restarted.to_string(),
+            &Identity::generate(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert_eq!(renewed.short_id().unwrap().value(), 100_000_002);
+        let legacy =
+            SignalingClient::connect(&restarted.to_string(), &Identity::generate(), vec![])
+                .await
+                .unwrap();
+        assert!(legacy.short_id().is_none());
+        assert!(
+            legacy
+                .request_short_lookup(ShortId::new(100_000_000).unwrap())
+                .await
+                .is_err()
+        );
+        drop((again, renewed, legacy));
+        // Test helper owners retain open SQLite handles until runtime teardown (Windows).
+        // File cleanup is deferred by using a temp directory outside the repository.
+    }
+    #[tokio::test]
+    async fn short_lookup_connection_ip_unknown_scan_and_pending_budgets() {
+        let config = SignalServerConfig {
+            short_lookups_per_connection: 2,
+            short_lookups_per_ip: 3,
+            max_short_lookup_misses: 1,
+            ..SignalServerConfig::for_tests()
+        };
+        let (address, _) = spawn_signal_server_with(config.clone()).await;
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let mut first =
+            SignalingClient::connect_desktop_with_events(&address.to_string(), &a, vec![])
+                .await
+                .unwrap();
+        let id = first.short_id().unwrap();
+        first
+            .request_short_lookup(ShortId::new(999_999_999).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(short_reply(&mut first).await, None);
+        first.request_short_lookup(id).await.unwrap();
+        assert_eq!(short_reply(&mut first).await, None);
+        let mut second =
+            SignalingClient::connect_desktop_with_events(&address.to_string(), &b, vec![])
+                .await
+                .unwrap();
+        for _ in 0..2 {
+            second.request_short_lookup(id).await.unwrap();
+            assert_eq!(short_reply(&mut second).await, Some(a.node_id()));
+        }
+        second.request_short_lookup(id).await.unwrap();
+        assert_eq!(short_reply(&mut second).await, None);
+        let mut third = SignalingClient::connect_desktop_with_events(
+            &address.to_string(),
+            &Identity::generate(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        third.request_short_lookup(id).await.unwrap();
+        assert_eq!(short_reply(&mut third).await, None);
+        let resources = ShortIdResources::new(&SignalServerConfig {
+            max_pending_lookups: 1,
+            ..SignalServerConfig::for_tests()
+        })
+        .unwrap();
+        let permit = resources.pending.clone().acquire_owned().await.unwrap();
+        assert!(resources.lookup(id).await.is_err());
+        drop(permit);
+        assert!(resources.lookup(id).await.is_ok());
+        let mut registry = Registry::default();
+        for n in 0..MAX_SHORT_LOOKUP_IPS {
+            let ip = IpAddr::V6(std::net::Ipv6Addr::from(n as u128));
+            assert!(registry.take_short_lookup(ip, &config));
+        }
+        assert!(!registry.take_short_lookup("192.0.2.1".parse().unwrap(), &config));
+    }
+    #[tokio::test]
+    async fn identity_churn_is_limited_after_disconnect_but_existing_identity_can_reconnect() {
+        let (address, registry) = spawn_signal_server_with(SignalServerConfig {
+            short_id_allocations_per_ip_per_minute: 2,
+            ..SignalServerConfig::for_tests()
+        })
+        .await;
+        let known = Identity::generate();
+        for identity in [&known, &Identity::generate()] {
+            let client = SignalingClient::connect_desktop_with_events(
+                &address.to_string(),
+                identity,
+                vec![],
+            )
+            .await
+            .unwrap();
+            drop(client);
+            wait_for_registry(&registry, |r| r.peers.is_empty()).await;
+        }
+        for _ in 0..8 {
+            assert!(
+                SignalingClient::connect_desktop_with_events(
+                    &address.to_string(),
+                    &Identity::generate(),
+                    vec![]
+                )
+                .await
+                .is_err()
+            );
+        }
+        let reconnected =
+            SignalingClient::connect_desktop_with_events(&address.to_string(), &known, vec![])
+                .await
+                .unwrap();
+        assert_eq!(reconnected.short_id().unwrap().value(), 100_000_000);
+    }
+
+    #[tokio::test]
+    async fn global_new_id_budget_covers_multiple_ips_and_source_table_stays_bounded() {
+        let resources = ShortIdResources::new(&SignalServerConfig {
+            short_id_allocations_per_minute: 2,
+            short_id_allocations_per_ip_per_minute: 1,
+            ..SignalServerConfig::for_tests()
+        })
+        .unwrap();
+        let a = Identity::generate().node_id();
+        let ip_a = "192.0.2.1".parse().unwrap();
+        let first = resources.register(a, ip_a).await.unwrap();
+        assert!(
+            resources
+                .register(Identity::generate().node_id(), ip_a)
+                .await
+                .is_err()
+        );
+        resources
+            .register(Identity::generate().node_id(), "192.0.2.2".parse().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            resources
+                .register(Identity::generate().node_id(), "192.0.2.3".parse().unwrap())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            resources
+                .register(a, "192.0.2.3".parse().unwrap())
+                .await
+                .unwrap(),
+            first
+        );
+        assert_eq!(resources.allocation_ips.lock().unwrap().len(), 2);
+        let full = ShortIdResources::new(&SignalServerConfig {
+            short_id_allocations_per_minute: u32::MAX,
+            ..SignalServerConfig::for_tests()
+        })
+        .unwrap();
+        let id = full.register(a, ip_a).await.unwrap();
+        {
+            let mut ips = full.allocation_ips.lock().unwrap();
+            ips.clear();
+            for n in 0..MAX_SHORT_LOOKUP_IPS {
+                ips.insert(
+                    IpAddr::V6(std::net::Ipv6Addr::from(n as u128)),
+                    LookupWindow::new(),
+                );
+            }
+        }
+        assert!(
+            full.register(Identity::generate().node_id(), "192.0.2.4".parse().unwrap())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            full.allocation_ips.lock().unwrap().len(),
+            MAX_SHORT_LOOKUP_IPS
+        );
+        // Existing mappings do not need a new source bucket even when its table is full.
+        assert_eq!(
+            full.register(a, "192.0.2.4".parse().unwrap())
+                .await
+                .unwrap(),
+            id
+        );
+    }
+
+    #[tokio::test]
+    async fn full_online_registry_does_not_keep_consuming_durable_ids() {
+        let (address, registry) = spawn_signal_server_with(SignalServerConfig {
+            max_registered_peers: 1,
+            ..SignalServerConfig::for_tests()
+        })
+        .await;
+        let first = SignalingClient::connect_desktop_with_events(
+            &address.to_string(),
+            &Identity::generate(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert!(
+            SignalingClient::connect_desktop_with_events(
+                &address.to_string(),
+                &Identity::generate(),
+                vec![]
+            )
+            .await
+            .is_err()
+        );
+        drop(first);
+        wait_for_registry(&registry, |r| r.peers.is_empty()).await;
+        let next = SignalingClient::connect_desktop_with_events(
+            &address.to_string(),
+            &Identity::generate(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert_eq!(next.short_id().unwrap().value(), 100_000_001);
+    }
+    #[tokio::test]
+    async fn forged_registration_cannot_consume_a_short_id() {
+        let (address, _) = spawn_signal_server_with(SignalServerConfig::for_tests()).await;
+        let identity = Identity::generate();
+        let attacker = Identity::generate();
+        let mut raw = Raw::connect(address).await;
+        let challenge = raw.hello(&identity).await;
+        assert!(matches!(
+            raw.register_with(&identity, &attacker, &challenge, vec![])
+                .await,
+            Some(SignalMessage::Error { .. })
+        ));
+        let valid =
+            SignalingClient::connect_desktop_with_events(&address.to_string(), &identity, vec![])
+                .await
+                .unwrap();
+        assert_eq!(valid.short_id().unwrap().value(), 100_000_000);
+    }
     fn candidate(kind: CandidateKind, addr: &str) -> Candidate {
         Candidate::new(kind, addr.parse().unwrap())
     }
 
     /// 起一个真的信令服务器，返回它的地址。
     async fn spawn_signal_server() -> SocketAddr {
-        spawn_signal_server_with(SignalServerConfig::default())
+        spawn_signal_server_with(SignalServerConfig::for_tests())
             .await
             .0
     }
@@ -1545,6 +2128,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let registry = Arc::new(Mutex::new(Registry::default()));
         let shared = Arc::clone(&registry);
+        let short_ids = ShortIdResources::new(&config).unwrap();
         let config = Arc::new(config);
         let mut next_connection_id = 1u64;
         tokio::spawn(async move {
@@ -1554,13 +2138,16 @@ mod tests {
                 };
                 let registry = Arc::clone(&shared);
                 let config = Arc::clone(&config);
+                let short_ids = short_ids.clone();
                 let connection_id = next_connection_id;
                 next_connection_id = next_connection_id.wrapping_add(1);
                 if next_connection_id == 0 {
                     next_connection_id = 1;
                 }
                 tokio::spawn(async move {
-                    let _ = handle_signal_client(stream, registry, connection_id, config).await;
+                    let _ =
+                        handle_signal_client(stream, registry, connection_id, config, short_ids)
+                            .await;
                 });
             }
         });
@@ -2190,7 +2777,7 @@ mod tests {
 
     #[tokio::test]
     async fn 节点_id_与公钥不匹配时注册被拒绝() {
-        let (addr, registry) = spawn_signal_server_with(SignalServerConfig::default()).await;
+        let (addr, registry) = spawn_signal_server_with(SignalServerConfig::for_tests()).await;
         let alice = Identity::generate();
         let mallory = Identity::generate();
 
@@ -2220,7 +2807,7 @@ mod tests {
 
     #[tokio::test]
     async fn 签名不是对应私钥时注册被拒绝() {
-        let (addr, registry) = spawn_signal_server_with(SignalServerConfig::default()).await;
+        let (addr, registry) = spawn_signal_server_with(SignalServerConfig::for_tests()).await;
         let mallory = Identity::generate();
         let impostor = Identity::generate();
 
@@ -2249,7 +2836,7 @@ mod tests {
 
     #[tokio::test]
     async fn 重放上一连接的注册签名会被拒绝() {
-        let (addr, registry) = spawn_signal_server_with(SignalServerConfig::default()).await;
+        let (addr, registry) = spawn_signal_server_with(SignalServerConfig::for_tests()).await;
         let bob = Identity::generate();
         let candidates = vec![candidate(CandidateKind::Host, "192.168.1.7:9000")];
 
@@ -2293,7 +2880,7 @@ mod tests {
 
     #[tokio::test]
     async fn 篡改候选地址会导致签名校验失败() {
-        let (addr, registry) = spawn_signal_server_with(SignalServerConfig::default()).await;
+        let (addr, registry) = spawn_signal_server_with(SignalServerConfig::for_tests()).await;
         let alice = Identity::generate();
 
         let mut raw = Raw::connect(addr).await;
@@ -2326,7 +2913,7 @@ mod tests {
 
     #[tokio::test]
     async fn 同一连接不能重复注册或切换身份() {
-        let (addr, registry) = spawn_signal_server_with(SignalServerConfig::default()).await;
+        let (addr, registry) = spawn_signal_server_with(SignalServerConfig::for_tests()).await;
         let alice = Identity::generate();
         let bob = Identity::generate();
 
@@ -2366,7 +2953,7 @@ mod tests {
 
     #[tokio::test]
     async fn 旧连接断开不会删除新连接() {
-        let (addr, registry) = spawn_signal_server_with(SignalServerConfig::default()).await;
+        let (addr, registry) = spawn_signal_server_with(SignalServerConfig::for_tests()).await;
         let alice = Identity::generate();
         let old_candidates = vec![candidate(CandidateKind::Host, "192.168.1.1:9000")];
         let new_candidates = vec![candidate(CandidateKind::Host, "192.168.1.1:9100")];
@@ -2602,7 +3189,7 @@ mod tests {
     async fn lookup_会去重且每连接有上限() {
         let config = SignalServerConfig {
             max_pending_lookups: 2,
-            ..SignalServerConfig::default()
+            ..SignalServerConfig::for_tests()
         };
         let (addr, registry) = spawn_signal_server_with(config).await;
         let alice = Identity::generate();
@@ -2638,7 +3225,7 @@ mod tests {
 
     #[tokio::test]
     async fn 候选地址超限会被拒绝() {
-        let (addr, registry) = spawn_signal_server_with(SignalServerConfig::default()).await;
+        let (addr, registry) = spawn_signal_server_with(SignalServerConfig::for_tests()).await;
         let alice = Identity::generate();
         let mut raw = Raw::connect(addr).await;
         let challenge = raw.hello(&alice).await;
@@ -2727,7 +3314,7 @@ mod tests {
     async fn 首帧超时会关闭连接() {
         let config = SignalServerConfig {
             first_frame_timeout: Duration::from_millis(150),
-            ..SignalServerConfig::default()
+            ..SignalServerConfig::for_tests()
         };
         let (addr, _) = spawn_signal_server_with(config).await;
         let mut raw = Raw::connect(addr).await;
@@ -2742,7 +3329,7 @@ mod tests {
     async fn 注册应答超时会关闭连接() {
         let config = SignalServerConfig {
             register_timeout: Duration::from_millis(150),
-            ..SignalServerConfig::default()
+            ..SignalServerConfig::for_tests()
         };
         let (addr, registry) = spawn_signal_server_with(config).await;
         let alice = Identity::generate();
@@ -2760,7 +3347,7 @@ mod tests {
     async fn 登记后长时间空闲会被断开() {
         let config = SignalServerConfig {
             idle_timeout: Duration::from_millis(150),
-            ..SignalServerConfig::default()
+            ..SignalServerConfig::for_tests()
         };
         let (addr, registry) = spawn_signal_server_with(config).await;
         let alice = Identity::generate();
@@ -2778,7 +3365,7 @@ mod tests {
     async fn 同_node_id_重连后旧连接被主动关闭() {
         // 只靠「旧连接不能再 Lookup」是不够的：旧连接还能 Ping，就能靠心跳
         // 无限续命，socket/task 无限堆积。服务器必须在登记新连接时主动踢掉旧的。
-        let (addr, registry) = spawn_signal_server_with(SignalServerConfig::default()).await;
+        let (addr, registry) = spawn_signal_server_with(SignalServerConfig::for_tests()).await;
         let alice = Identity::generate();
 
         let mut old = Raw::connect(addr).await;
@@ -2823,7 +3410,7 @@ mod tests {
         let idle = Duration::from_millis(400);
         let config = SignalServerConfig {
             idle_timeout: idle,
-            ..SignalServerConfig::default()
+            ..SignalServerConfig::for_tests()
         };
         let (addr, registry) = spawn_signal_server_with(config).await;
         let alice = Identity::generate();
@@ -2862,7 +3449,7 @@ mod tests {
         let idle = Duration::from_millis(300);
         let config = SignalServerConfig {
             idle_timeout: idle,
-            ..SignalServerConfig::default()
+            ..SignalServerConfig::for_tests()
         };
         let (addr, registry) = spawn_signal_server_with(config).await;
         let alice = Identity::generate();
@@ -2897,7 +3484,7 @@ mod tests {
         // 配额必须反映「当前真实挂起」，不能把已经配对完成的历史目标也算进去。
         let config = SignalServerConfig {
             max_pending_lookups: 1,
-            ..SignalServerConfig::default()
+            ..SignalServerConfig::for_tests()
         };
         let (addr, _registry) = spawn_signal_server_with(config).await;
         let alice = Identity::generate();
@@ -2948,7 +3535,7 @@ mod tests {
         let alice = Identity::generate();
         let mut raw = Raw::connect(addr).await;
         raw.send(&SignalMessage::RegisterHello {
-            protocol_version: SIGNAL_PROTOCOL_VERSION + 1,
+            protocol_version: SHORT_ID_PROTOCOL_VERSION + 1,
             node_id: alice.node_id(),
             public_key: alice.public_key_bytes(),
         })

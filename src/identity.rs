@@ -5,7 +5,9 @@
 //! QUIC 的 TLS 证书用自签名证书，信任链换成了「公钥 → 节点 ID」这一步。
 
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::fs::File;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 

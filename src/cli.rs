@@ -170,6 +170,18 @@ pub enum Command {
         /// 监听地址
         #[arg(long, default_value_t = SocketAddr::from(([0, 0, 0, 0], DEFAULT_SIGNAL_PORT)), value_name = "ADDR")]
         listen: SocketAddr,
+        /// SQLite mapping database; back up this file to preserve short device IDs
+        #[arg(long, default_value = "signal-device-ids.sqlite3", value_name = "PATH")]
+        short_id_db: std::path::PathBuf,
+        /// Maximum durable IDs ever allocated (existing identities can still reconnect)
+        #[arg(long, default_value_t = 1_000_000)]
+        max_device_ids: u32,
+        /// Global new identity allocations per minute (persisted across restarts)
+        #[arg(long, default_value_t = 120)]
+        new_device_ids_per_minute: u32,
+        /// New identity allocations per source IP per minute
+        #[arg(long, default_value_t = 10)]
+        new_device_ids_per_ip_per_minute: u32,
     },
 
     /// 家里那台：等对端连上来，提供端口转发和收文件
@@ -369,7 +381,7 @@ mod tests {
     fn 解析信令服务器子命令() {
         let cli = Cli::parse_from(["p2p_file", "signal-server"]);
         match cli.command {
-            Command::SignalServer { listen } => {
+            Command::SignalServer { listen, .. } => {
                 assert_eq!(listen.port(), DEFAULT_SIGNAL_PORT);
                 assert!(listen.ip().is_unspecified());
             }
@@ -378,7 +390,7 @@ mod tests {
 
         let cli = Cli::parse_from(["p2p_file", "signal-server", "--listen", "0.0.0.0:8000"]);
         match cli.command {
-            Command::SignalServer { listen } => {
+            Command::SignalServer { listen, .. } => {
                 assert_eq!(listen, "0.0.0.0:8000".parse().unwrap());
             }
             other => panic!("解析结果不对: {other:?}"),
