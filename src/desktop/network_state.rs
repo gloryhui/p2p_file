@@ -80,7 +80,7 @@ impl PeerLifecycle {
         matches!(self, Self::Connected(_))
     }
     pub fn outbound_authorized(&self) -> bool {
-        matches!(self, Self::Connected(auth) if auth.outbound_authorized)
+        matches!(self, Self::Connected(auth) if auth.outbound_authorized())
     }
     fn is_pending(&self) -> bool {
         matches!(

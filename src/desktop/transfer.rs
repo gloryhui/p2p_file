@@ -412,6 +412,43 @@ impl TransferService {
         })
         .await
     }
+    pub async fn revoke_authorization(
+        &self,
+        peer: NodeId,
+        authorization: super::remote_auth::RemoteAuthorization,
+    ) -> Result<()> {
+        if let Some(speed) = self.speed_peers.lock().unwrap().get(&peer) {
+            speed.revoke_authorization(authorization);
+        }
+        let denied = move |direction| match direction {
+            TaskDirection::Send => !authorization.outbound_authorized(),
+            TaskDirection::Receive => !authorization.inbound_authorized(),
+        };
+        for task in self.active.lock().unwrap().values() {
+            if task.peer == peer && denied(task.direction) {
+                task.pause.send_replace(true);
+            }
+        }
+        let queue = self.sender_queue.clone();
+        self.store(move |store| {
+            let ids = store
+                .list()
+                .iter()
+                .filter(|t| {
+                    t.peer_id().as_str() == peer.to_hex()
+                        && denied(t.direction())
+                        && t.state().needs_startup_recovery()
+                })
+                .map(|t| t.task_id().clone())
+                .collect::<Vec<_>>();
+            for id in ids {
+                queue.lock().unwrap().remove_queued(&id);
+                disk::transition(store, &id, TaskState::Interrupted)?;
+            }
+            Ok(())
+        })
+        .await
+    }
     pub async fn interrupt_all(&self) -> Result<()> {
         self.epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.sender_queue.lock().unwrap().clear();
@@ -1233,9 +1270,10 @@ impl TransferService {
         connection: Connection,
         peer: NodeId,
         local: NodeId,
-        authorization: super::remote_auth::RemoteAuthorization,
+        authorization: impl Into<super::remote_auth::LiveAuthorization>,
         allowed_forward_targets: watch::Receiver<Vec<super::config::AllowedForwardTarget>>,
     ) -> Result<()> {
+        let authorization = authorization.into();
         let speed = super::speed::SpeedPeer::new(
             connection.clone(),
             local,
@@ -1283,7 +1321,7 @@ impl TransferService {
             connection,
             peer,
             None,
-            super::remote_auth::RemoteAuthorization::BOTH,
+            super::remote_auth::RemoteAuthorization::BOTH.into(),
             allowed_forward_targets,
         )
         .await
@@ -1293,7 +1331,7 @@ impl TransferService {
         connection: Connection,
         peer: NodeId,
         speed: Option<super::speed::SpeedPeer>,
-        authorization: super::remote_auth::RemoteAuthorization,
+        authorization: super::remote_auth::LiveAuthorization,
         allowed_forward_targets: watch::Receiver<Vec<super::config::AllowedForwardTarget>>,
     ) -> Result<()> {
         let mut streams = JoinSet::new();
@@ -1307,9 +1345,11 @@ impl TransferService {
             tokio::select! {
                 accepted=connection.accept_bi()=> {
                     let (mut send,mut recv)=match accepted { Ok(streams)=>streams, Err(_)=>break };
-                    if !authorization.inbound_authorized || streams.len()>=8 {let _=send.reset(4u32.into());let _=recv.stop(4u32.into());continue;}
+                    if !authorization.current().inbound_authorized() || streams.len()>=8 {let _=send.reset(4u32.into());let _=recv.stop(4u32.into());continue;}
                     let service=self.clone();let connection=connection.clone();let speed=speed.clone();let allowed_forward_targets=allowed_forward_targets.clone();
+                    let authorization = authorization.clone();
                     streams.spawn(async move {
+                        authorization.guard(true, async {
                         let buffered=tokio::time::timeout(Duration::from_secs(5),service.frame_budget.read(&mut recv,None)).await.map_err(|_|disk::failure("文件流首帧超时"))??;
                         let super::frame_budget::BufferedFrame {frame:first,_lease}=buffered;
                         match &first.message {
@@ -1323,7 +1363,7 @@ impl TransferService {
                             Message::ResumeTask{task_id} if first.request_id==1 => {
                                 // This recovery path initiates a new Offer stream, so it also
                                 // needs the local outgoing right; it is not a stream reply.
-                                if !authorization.outbound_authorized { let _=send.reset(3u32.into()); let _=recv.stop(3u32.into()); return Err(disk::failure("出站文件访问尚未授权")); }
+                                if !authorization.current().outbound_authorized() { let _=send.reset(3u32.into()); let _=recv.stop(3u32.into()); return Err(disk::failure("出站文件访问尚未授权")); }
                                 let id=task_id.clone();let lookup=id.clone();
                                 let checked=service.read_store(move|store|disk::bound_task(store,peer,&lookup)).await;
                                 if !matches!(checked, Ok(ref record) if record.direction()==TaskDirection::Send && can_continue(record)) {
@@ -1351,7 +1391,7 @@ impl TransferService {
                                         let _=send.finish();return Err(error);
                                     }
                                 };
-                                let result=service.send_inner(&connection,peer,&id,pause,Some(&mut send)).await;
+                                let result=authorization.guard(false, service.send_inner(&connection,peer,&id,pause,Some(&mut send))).await;
                                 if let Err(error)=&result {
                                     let _=protocol::write(&mut send,&Frame{request_id:1,message:Message::Error{task_id:id.clone(),code:error_code(error)}}).await;
                                     let _=send.finish();service.finish_error(&id,error).await;
@@ -1360,6 +1400,7 @@ impl TransferService {
                             }
                             _=>Err(disk::failure("桌面流入口仅接受任务、测速或 TCP 隧道请求")),
                         }
+                        }).await
                     });
                 }
                 result=streams.join_next(),if !streams.is_empty()=> {if let Some(Err(error))=result {tracing::warn!(%error,"桌面文件任务终止");}}
@@ -3777,5 +3818,56 @@ mod tests {
             bytes
         );
         pair.shutdown().await;
+    }
+    #[tokio::test]
+    async fn speed_revocation_uses_lease_owner_and_preserves_reverse_password_right() {
+        use super::super::{
+            protocol::SpeedDirection,
+            remote_auth::{AuthorizationGrant, RemoteAuthorization},
+            speed::SpeedStatus,
+        };
+        for revoke_request_direction in [false, true] {
+            let pair = Pair::new_inner(true).await;
+            pair.a.speed_peers.lock().unwrap()[&pair.ib]
+                .set_test_duration(Duration::from_millis(300));
+            pair.b.speed_peers.lock().unwrap()[&pair.ia]
+                .set_test_duration(Duration::from_millis(300));
+            let (reached, release) = pair.a.speed_peers.lock().unwrap()[&pair.ib].gate_data();
+            let service = pair.a.clone();
+            let peer = pair.ib;
+            let job =
+                tokio::spawn(
+                    async move { service.start_speed(peer, SpeedDirection::Upload, 30).await },
+                );
+            tokio::time::timeout(Duration::from_secs(5), reached)
+                .await
+                .unwrap()
+                .unwrap();
+            let rights = RemoteAuthorization {
+                inbound: AuthorizationGrant::password(!revoke_request_direction),
+                outbound: AuthorizationGrant::password(true),
+            };
+            pair.b.revoke_authorization(pair.ia, rights).await.unwrap();
+            if revoke_request_direction {
+                // Cancellation can already have dropped the gated data future.
+                let _ = release.send(());
+            } else {
+                release.send(()).unwrap();
+            }
+            let result = tokio::time::timeout(Duration::from_secs(5), job)
+                .await
+                .unwrap()
+                .unwrap();
+            if revoke_request_direction {
+                assert!(
+                    result.is_err()
+                        || result.is_ok_and(|report| report.status != SpeedStatus::Completed)
+                );
+            } else {
+                assert_eq!(result.unwrap().status, SpeedStatus::Completed);
+            }
+            assert!(pair.ca.close_reason().is_none());
+            pair.shutdown().await;
+        }
     }
 }

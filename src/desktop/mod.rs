@@ -34,6 +34,7 @@ mod task_recovery;
 mod task_store;
 mod transfer;
 mod transfer_files;
+mod trusted_devices;
 mod tunnel;
 mod ui;
 mod ui_model;
@@ -970,6 +971,8 @@ struct DesktopShell {
     peer_id: Entity<TextField>,
     peer_password: Entity<TextField>,
     local_password: Entity<TextField>,
+    trusted_name: Entity<TextField>,
+    editing_trusted: Option<NodeId>,
     local_short_id: Option<ShortId>,
     resolved_peer: Option<(String, NodeId)>,
     concurrency_input: Entity<TextField>,
@@ -2107,6 +2110,8 @@ impl DesktopShell {
             return false;
         };
         config.remote_auth = self.settings.remote_auth.clone();
+        config.trusted_devices = self.settings.trusted_devices.clone();
+        config.config_path = Some(self.config_file.clone());
         config.transfer = self.transfer_service.clone();
         config.allowed_forward_targets = self.settings.enabled_forward_targets();
         config.tunnel_rules = self.settings.tunnel_rules.clone();
@@ -2230,7 +2235,8 @@ impl DesktopShell {
                                             cx.notify();
                                         }
                                     }
-                                    session::SessionEvent::Diagnostic(detail) => {
+                                    session::SessionEvent::TrustedDevicesChanged(devices) => { shell.settings.trusted_devices = devices; cx.notify(); }
+                            session::SessionEvent::Diagnostic(detail) => {
                                         if detail != "信令心跳已确认" {shell.set_status(detail, cx);}
                                     }
                                     session::SessionEvent::TunnelState { rule_id, state } => {
@@ -2276,7 +2282,12 @@ impl DesktopShell {
     }
     fn connect_current_peer(&mut self, cx: &mut Context<Self>) {
         let text = self.peer_id.read(cx).content.trim().to_owned();
-        let password = match SecretPassword::new(self.peer_password.read(cx).content.to_string()) {
+        let input = self.peer_password.read(cx).content.to_string();
+        let password = match if input.is_empty() {
+            Ok(None)
+        } else {
+            SecretPassword::new(input).map(Some)
+        } {
             Ok(password) => password,
             Err(error) => {
                 self.set_status(error.to_string(), cx);
@@ -2293,13 +2304,19 @@ impl DesktopShell {
                 return;
             }
             self.resolved_peer = None;
-            session.connect_short_id(short_id, password)
+            match password {
+                Some(password) => session.connect_short_id(short_id, password),
+                None => session.connect_short_id_trusted(short_id),
+            }
         } else if let Ok(peer) = NodeId::from_hex(&text) {
             if self.identity.as_ref().is_some_and(|i| i.node_id() == peer) {
                 self.set_status("不能连接本机设备 ID", cx);
                 return;
             }
-            session.connect_peer_with_password(peer, password)
+            match password {
+                Some(password) => session.connect_peer_with_password(peer, password),
+                None => session.connect_peer_trusted(peer),
+            }
         } else {
             self.set_status("设备 ID 须为 9 位短 ID 或完整 Node ID", cx);
             return;
@@ -2951,8 +2968,8 @@ impl DesktopShell {
         let peer_is_valid = peer_is_valid
             || ShortId::normalize(self.peer_id.read(cx).content.trim())
                 .is_ok_and(|id| self.local_short_id != Some(id));
-        let password_valid =
-            SecretPassword::new(self.peer_password.read(cx).content.to_string()).is_ok();
+        let password_valid = self.peer_password.read(cx).content.is_empty()
+            || SecretPassword::new(self.peer_password.read(cx).content.to_string()).is_ok();
         let enabled = self.identity.is_some()
             && self.network_session.is_some()
             && password_valid
@@ -2966,7 +2983,14 @@ impl DesktopShell {
         if let Some(peer) = self.selected_peer(cx) {
             match self.peer_states.get(&peer) {
                 Some(network_state::PeerLifecycle::Connected(auth)) => {
-                    return (auth.label().into(), ui_components::StatusTone::Success);
+                    return (
+                        auth.label(),
+                        if auth.inbound_authorized() || auth.outbound_authorized() {
+                            ui_components::StatusTone::Success
+                        } else {
+                            ui_components::StatusTone::Warning
+                        },
+                    );
                 }
                 Some(network_state::PeerLifecycle::PeerPending) => {
                     return ("等待对端".into(), ui_components::StatusTone::Info);
@@ -2978,7 +3002,10 @@ impl DesktopShell {
                     return ("正在认证".into(), ui_components::StatusTone::Info);
                 }
                 Some(network_state::PeerLifecycle::RemoteAuthPending) => {
-                    return ("等待密码授权".into(), ui_components::StatusTone::Info);
+                    return (
+                        "正在验证密码或可信设备授权".into(),
+                        ui_components::StatusTone::Info,
+                    );
                 }
                 Some(network_state::PeerLifecycle::Negotiating) => {
                     return ("正在协商".into(), ui_components::StatusTone::Info);
@@ -3067,6 +3094,201 @@ impl DesktopShell {
             )
     }
 
+    fn can_trust_peer(&self, peer: NodeId) -> bool {
+        ui_model::can_trust_peer(
+            peer,
+            self.identity.as_ref().map(Identity::node_id),
+            self.peer_states.get(&peer),
+            &self.settings.trusted_devices,
+        ) && self
+            .network_session
+            .as_ref()
+            .is_some_and(session::DesktopSessionHandle::is_running)
+            && self.peer_generations.contains_key(&peer)
+            && self.can_save_settings
+            && !self.is_saving_settings
+    }
+    fn trust_peer_button(&self, peer: NodeId, cx: &mut Context<Self>) -> impl IntoElement {
+        let enabled = self.can_trust_peer(peer);
+        ui_components::secondary_button("信任此设备", enabled).on_mouse_up(
+            MouseButton::Left,
+            cx.listener(move |shell, _: &MouseUpEvent, _, cx| {
+                if !shell.can_trust_peer(peer) {
+                    return;
+                }
+                shell.change_trusted_device(
+                    session::TrustedDeviceChange::Trust {
+                        peer,
+                        generation: shell.peer_generations[&peer],
+                        display_name: format!("设备 {}", peer.short()),
+                    },
+                    cx,
+                );
+            }),
+        )
+    }
+    fn change_trusted_device(
+        &mut self,
+        change: session::TrustedDeviceChange,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_save_settings || self.is_saving_settings {
+            return;
+        }
+        let session = self.network_session.clone();
+        let path = self.config_file.clone();
+        let background = cx.background_executor().clone();
+        self.is_saving_settings = true;
+        self.set_status("正在保存可信设备设置…", cx);
+        cx.spawn(async move |shell, cx| {
+            let result = background
+                .spawn(async move {
+                    session::change_trusted_device(session.as_ref(), &path, change).await
+                })
+                .await;
+            let _ = shell.update(cx, |shell, cx| {
+                shell.is_saving_settings = false;
+                match result {
+                    Ok(devices) => {
+                        shell.settings.trusted_devices = devices;
+                        shell.editing_trusted = None;
+                        shell.set_status(
+                            "可信设备设置已保存；信任仅允许该真实身份免输入本机密码",
+                            cx,
+                        );
+                    }
+                    Err(error) => shell.set_status(format!("可信设备设置未确认：{error}"), cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+    fn trusted_devices_card(&self, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
+        let enabled = self.can_save_settings && !self.is_saving_settings;
+        let mut card =
+            ui_components::card()
+                .p(px(16.))
+                .gap_3()
+                .child(ui_components::section_header(
+                    "✓",
+                    "可信设备",
+                    "仅手动保存的真实 NodeId 可免输入本机访问密码；信任是单向的",
+                ));
+        if self.settings.trusted_devices.is_empty() {
+            card = card.child(div().child("暂无可信设备")).child(
+                div()
+                    .text_sm()
+                    .child("只有你手动信任的设备才会出现在这里。"),
+            );
+        }
+        for device in &self.settings.trusted_devices {
+            let Ok(peer) = NodeId::from_hex(&device.node_id) else {
+                continue;
+            };
+            let mut row = div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(device.display_name.clone())
+                .child(format!(
+                    "设备 ID：{}",
+                    device.last_short_id.as_deref().unwrap_or("未记录")
+                ))
+                .child(format!(
+                    "Node ID：{}…{}",
+                    &device.node_id[..8],
+                    &device.node_id[24..]
+                ))
+                .child(format!(
+                    "信任时间：{} UTC",
+                    trusted_devices::date(device.trusted_at)
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            ui_components::secondary_button("复制完整 Node ID", true).on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |_, _: &MouseUpEvent, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(peer.to_hex()))
+                                }),
+                            ),
+                        )
+                        .child(
+                            ui_components::secondary_button("修改名称", enabled).on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |shell, _: &MouseUpEvent, _, cx| {
+                                    if shell.is_saving_settings {
+                                        return;
+                                    }
+                                    if let Some(device) = shell
+                                        .settings
+                                        .trusted_devices
+                                        .iter()
+                                        .find(|d| d.node_id == peer.to_hex())
+                                    {
+                                        Self::set_text_field(
+                                            &shell.trusted_name,
+                                            device.display_name.clone(),
+                                            cx,
+                                        );
+                                    }
+                                    shell.editing_trusted = Some(peer);
+                                    cx.notify();
+                                }),
+                            ),
+                        )
+                        .child(
+                            ui_components::secondary_button("取消信任", enabled).on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |shell, _: &MouseUpEvent, _, cx| {
+                                    shell.change_trusted_device(
+                                        session::TrustedDeviceChange::Revoke { peer },
+                                        cx,
+                                    )
+                                }),
+                            ),
+                        ),
+                );
+            if self.editing_trusted == Some(peer) {
+                row = row
+                    .child(Self::text_field_frame(&self.trusted_name, window, cx))
+                    .child(
+                        ui_components::secondary_button("保存名称", enabled).on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |shell, _: &MouseUpEvent, _, cx| {
+                                let display_name = shell.trusted_name.read(cx).content.to_string();
+                                shell.change_trusted_device(
+                                    session::TrustedDeviceChange::Rename { peer, display_name },
+                                    cx,
+                                );
+                            }),
+                        ),
+                    );
+            }
+            card = card.child(row);
+        }
+        for (peer, state) in &self.peer_states {
+            if let network_state::PeerLifecycle::Connected(auth) = state
+                && self.can_trust_peer(*peer)
+            {
+                card = card.child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(format!(
+                            "已通过密码认证：{}（{}）",
+                            peer.short(),
+                            auth.label()
+                        ))
+                        .child(self.trust_peer_button(*peer, cx)),
+                );
+            }
+        }
+        card
+    }
     fn settings_home(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
@@ -3102,6 +3324,7 @@ impl DesktopShell {
                     ),
             )
             .child(self.remote_password_card(window, cx))
+            .child(self.trusted_devices_card(window, cx))
             .child(self.advanced_network_card(window, cx))
     }
 
@@ -3180,7 +3403,12 @@ impl DesktopShell {
             .gap_2()
             .child(local)
             .child(peer)
-            .child(Self::text_field_frame(&self.peer_password, window, cx));
+            .child(Self::text_field_frame(&self.peer_password, window, cx))
+            .children(
+                self.selected_peer(cx)
+                    .filter(|peer| self.can_trust_peer(*peer))
+                    .map(|peer| self.trust_peer_button(peer, cx)),
+            );
 
         let mut speed_test_button = ui_components::compact_secondary_button("速度测试", connected);
         if connected {
@@ -3205,7 +3433,7 @@ impl DesktopShell {
             .child(ui_components::section_header(
                 "↔",
                 "连接设备",
-                "输入对端短设备 ID 和远程密码，授权后开始传输",
+                "输入设备 ID；对端已信任本机时可免密码连接",
             ))
             .child(fields)
             .when(!self.local_password.read(cx).content.is_empty(), |card| {
@@ -4594,7 +4822,8 @@ pub fn run() {
             },
             move |_, cx| {
                 let peer_id = cx.new(|cx| TextField::new(cx, "输入 9 位对方 ID"));
-                let peer_password = cx.new(|cx| TextField::new_password(cx, "对方的远程访问密码"));
+                let peer_password = cx
+                    .new(|cx| TextField::new_password(cx, "对方访问密码；对端已信任本机时可留空"));
                 let local_password = cx.new(|cx| {
                     let mut field = TextField::new_password(cx, "已设置；输入 6～12 位新密码");
                     if let Some(password) = initial_password {
@@ -4627,6 +4856,7 @@ pub fn run() {
                     field.content = "127.0.0.1:2222".into();
                     field
                 });
+                let trusted_name = cx.new(|cx| TextField::new(cx, "本地设备备注"));
                 let tunnel_target = cx.new(|cx| TextField::new(cx, "127.0.0.1:22"));
                 cx.new(|cx| {
                     cx.observe(
@@ -4646,6 +4876,8 @@ pub fn run() {
                         peer_id,
                         peer_password,
                         local_password,
+                        trusted_name,
+                        editing_trusted: None,
                         local_short_id: None,
                         resolved_peer: None,
                         concurrency_input,

@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const APP_DIR_NAME: &str = "p2p_file";
-const CONFIG_SCHEMA_VERSION: u32 = 4;
+const CONFIG_SCHEMA_VERSION: u32 = 5;
+static CONFIG_MUTATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 const LEGACY_CONFIG_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Error)]
@@ -106,6 +108,7 @@ pub struct SettingsDraft {
     pub allowed_forward_targets: Vec<AllowedForwardTarget>,
     pub tunnel_rules: Vec<TunnelRule>,
     pub remote_auth: Option<super::remote_auth::RemoteVerifier>,
+    pub trusted_devices: Vec<super::trusted_devices::TrustedDevice>,
 }
 
 /// A local TCP service that authenticated peers may reach through this device.
@@ -195,6 +198,7 @@ impl SettingsDraft {
             allowed_forward_targets: Vec::new(),
             tunnel_rules: Vec::new(),
             remote_auth: None,
+            trusted_devices: Vec::new(),
         }
     }
 
@@ -223,6 +227,7 @@ impl SettingsDraft {
             allowed_forward_targets: config.allowed_forward_targets,
             tunnel_rules: config.tunnel_rules,
             remote_auth: config.remote_auth,
+            trusted_devices: config.trusted_devices,
         }
     }
 
@@ -257,13 +262,20 @@ impl SettingsDraft {
             allowed_forward_targets: self.allowed_forward_targets.clone(),
             tunnel_rules: self.tunnel_rules.clone(),
             remote_auth: self.remote_auth.clone(),
+            trusted_devices: self.trusted_devices.clone(),
         };
         config.validate()?;
         Ok(config)
     }
 
     pub fn save_atomic(&self, path: &Path) -> Result<(), ConfigError> {
-        let config = self.to_config()?;
+        let _guard = config_mutation_lock()?;
+        let mut config = self.to_config()?;
+        if let Some(saved) = DesktopConfig::load(path)? {
+            // A settings draft predating a trust/password mutation must not undo it.
+            config.trusted_devices = saved.trusted_devices;
+            config.remote_auth = saved.remote_auth;
+        }
         validate_receive_directory(
             config
                 .receive_directory
@@ -319,6 +331,8 @@ pub struct DesktopConfig {
     tunnel_rules: Vec<TunnelRule>,
     #[serde(default)]
     remote_auth: Option<super::remote_auth::RemoteVerifier>,
+    #[serde(default)]
+    trusted_devices: Vec<super::trusted_devices::TrustedDevice>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -347,6 +361,7 @@ impl DesktopConfig {
         path: &Path,
         verifier: super::remote_auth::RemoteVerifier,
     ) -> Result<(), ConfigError> {
+        let _guard = config_mutation_lock()?;
         let mut config = match Self::load(path)? {
             Some(config) => config,
             None => Self {
@@ -359,10 +374,60 @@ impl DesktopConfig {
                 allowed_forward_targets: Vec::new(),
                 tunnel_rules: Vec::new(),
                 remote_auth: None,
+                trusted_devices: Vec::new(),
             },
         };
         config.remote_auth = Some(verifier);
         config.write_atomic(path)
+    }
+    pub fn save_trusted_devices(
+        path: &Path,
+        devices: Vec<super::trusted_devices::TrustedDevice>,
+    ) -> Result<(), ConfigError> {
+        let _guard = config_mutation_lock()?;
+        let mut config =
+            Self::load(path)?.ok_or_else(|| ConfigError::Invalid("请先保存远程认证配置".into()))?;
+        config.trusted_devices = devices;
+        config.write_atomic(path)
+    }
+    pub fn revoke_trusted_device(
+        path: &Path,
+        peer: crate::identity::NodeId,
+    ) -> Result<Vec<super::trusted_devices::TrustedDevice>, ConfigError> {
+        Self::mutate_trusted_devices(path, |devices| {
+            devices.retain(|device| device.node_id != peer.to_hex());
+            Ok(())
+        })
+    }
+    pub fn rename_trusted_device(
+        path: &Path,
+        peer: crate::identity::NodeId,
+        display_name: String,
+    ) -> Result<Vec<super::trusted_devices::TrustedDevice>, ConfigError> {
+        Self::mutate_trusted_devices(path, |devices| {
+            let device = devices
+                .iter_mut()
+                .find(|device| device.node_id == peer.to_hex())
+                .ok_or_else(|| ConfigError::Invalid("可信设备不存在".into()))?;
+            device.display_name = display_name;
+            device.updated_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .max(device.trusted_at);
+            Ok(())
+        })
+    }
+    fn mutate_trusted_devices(
+        path: &Path,
+        change: impl FnOnce(&mut Vec<super::trusted_devices::TrustedDevice>) -> Result<(), ConfigError>,
+    ) -> Result<Vec<super::trusted_devices::TrustedDevice>, ConfigError> {
+        let _guard = config_mutation_lock()?;
+        let mut config =
+            Self::load(path)?.ok_or_else(|| ConfigError::Invalid("请先保存远程认证配置".into()))?;
+        change(&mut config.trusted_devices)?;
+        config.write_atomic(path)?;
+        Ok(config.trusted_devices)
     }
     pub fn load(path: &Path) -> Result<Option<Self>, ConfigError> {
         let metadata = match fs::symlink_metadata(path) {
@@ -401,15 +466,19 @@ impl DesktopConfig {
                     allowed_forward_targets: Vec::new(),
                     tunnel_rules: Vec::new(),
                     remote_auth: None,
+                    trusted_devices: Vec::new(),
                 }
             }
-            2 | 3 | CONFIG_SCHEMA_VERSION => {
+            2 | 3 | 4 | CONFIG_SCHEMA_VERSION => {
                 let mut config = serde_json::from_slice::<Self>(&bytes)
                     .map_err(|error| ConfigError::Corrupt(error.to_string()))?;
-                if version < CONFIG_SCHEMA_VERSION
-                    && (config.signal.is_none() || config.receive_directory.is_none())
-                {
+                if version < 4 && (config.signal.is_none() || config.receive_directory.is_none()) {
                     return Err(ConfigError::Corrupt("旧配置缺少信令或接收目录".into()));
+                }
+                if version < 5 && !config.trusted_devices.is_empty() {
+                    return Err(ConfigError::Corrupt(
+                        "旧配置版本不能声明可信设备授权".into(),
+                    ));
                 }
                 // v2 had target-only grants. Preserve rows, but require explicit peer authorization.
                 if version == 2 {
@@ -460,6 +529,7 @@ impl DesktopConfig {
                 .validate()
                 .map_err(|_| ConfigError::Invalid("不支持的远程认证版本".into()))?;
         }
+        super::trusted_devices::validate(&self.trusted_devices)?;
         validate_forward_configuration(&self.allowed_forward_targets, &self.tunnel_rules)?;
         Ok(())
     }
@@ -837,6 +907,12 @@ fn is_reparse_point(metadata: &fs::Metadata) -> bool {
     }
 }
 
+fn config_mutation_lock() -> Result<std::sync::MutexGuard<'static, ()>, ConfigError> {
+    CONFIG_MUTATION
+        .lock()
+        .map_err(|_| ConfigError::Invalid("配置写入锁不可用".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -860,6 +936,7 @@ mod tests {
             allowed_forward_targets: Vec::new(),
             tunnel_rules: Vec::new(),
             remote_auth: None,
+            trusted_devices: Vec::new(),
         }
     }
 
@@ -908,7 +985,7 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
         let migrated = DesktopConfig::load(&path).unwrap().unwrap();
         assert!(migrated.remote_auth.is_none());
-        assert_eq!(migrated.schema_version, 4);
+        assert_eq!(migrated.schema_version, 5);
         fs::write(&path, b"corrupt").unwrap();
         assert!(DesktopConfig::save_remote_auth(&path, verifier).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"corrupt");
@@ -938,6 +1015,7 @@ mod tests {
             allowed_forward_targets: Vec::new(),
             tunnel_rules: Vec::new(),
             remote_auth: None,
+            trusted_devices: Vec::new(),
         });
         assert_eq!(upgraded.speedtest_direction, SpeedtestDirection::Both);
     }
@@ -1378,5 +1456,175 @@ mod tests {
             0o700
         );
         fs::remove_dir_all(path).unwrap();
+    }
+    #[test]
+    fn trusted_persistence_restart_metadata_rotation_and_stale_settings_preserve_identity() {
+        let root = temp_dir("trusted");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("settings.json");
+        let draft = valid_draft(root.clone());
+        draft.save_atomic(&path).unwrap();
+        assert!(
+            DesktopConfig::load(&path)
+                .unwrap()
+                .unwrap()
+                .trusted_devices
+                .is_empty()
+        );
+        let peer = crate::identity::Identity::generate().node_id();
+        let mut device = super::super::trusted_devices::TrustedDevice::new(
+            peer,
+            "家里 Windows".into(),
+            Some("100000124".into()),
+        );
+        DesktopConfig::save_trusted_devices(&path, vec![device.clone()]).unwrap();
+        assert_eq!(
+            DesktopConfig::load(&path).unwrap().unwrap().trusted_devices,
+            vec![device.clone()]
+        );
+        let original_id = device.node_id.clone();
+        device.display_name = "新名称".into();
+        device.last_short_id = Some("100000125".into());
+        DesktopConfig::save_trusted_devices(&path, vec![device.clone()]).unwrap();
+        let password = super::super::remote_auth::SecretPassword::new("Change9".into()).unwrap();
+        let verifier = super::super::remote_auth::RemoteVerifier::create(&password).unwrap();
+        DesktopConfig::save_remote_auth(&path, verifier.clone()).unwrap();
+        draft.save_atomic(&path).unwrap();
+        let saved = DesktopConfig::load(&path).unwrap().unwrap();
+        assert_eq!(saved.trusted_devices, vec![device]);
+        assert_eq!(saved.trusted_devices[0].node_id, original_id);
+        assert_eq!(saved.remote_auth, Some(verifier));
+        assert!(!String::from_utf8_lossy(&fs::read(&path).unwrap()).contains(password.expose()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn trusted_duplicates_corruption_and_failed_write_preserve_original_file() {
+        let root = temp_dir("trusted-invalid");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("settings.json");
+        valid_draft(root.clone()).save_atomic(&path).unwrap();
+        let peer = crate::identity::Identity::generate().node_id();
+        let device = super::super::trusted_devices::TrustedDevice::new(peer, "device".into(), None);
+        let original = fs::read(&path).unwrap();
+        assert!(
+            DesktopConfig::save_trusted_devices(&path, vec![device.clone(), device.clone()])
+                .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let mut corrupt: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        corrupt["trusted_devices"] = serde_json::json!([device.clone(), device]);
+        fs::write(&path, serde_json::to_vec(&corrupt).unwrap()).unwrap();
+        let bad = fs::read(&path).unwrap();
+        assert!(DesktopConfig::load(&path).is_err());
+        assert!(DesktopConfig::save_trusted_devices(&path, Vec::new()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bad);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn trusted_mutations_serialize_with_password_and_settings_writes() {
+        let root = temp_dir("trusted-concurrent");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("settings.json");
+        let draft = valid_draft(root.clone());
+        draft.save_atomic(&path).unwrap();
+        let device = super::super::trusted_devices::TrustedDevice::new(
+            crate::identity::Identity::generate().node_id(),
+            "device".into(),
+            None,
+        );
+        let verifier = super::super::remote_auth::RemoteVerifier::create(
+            &super::super::remote_auth::SecretPassword::new("Change9".into()).unwrap(),
+        )
+        .unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                DesktopConfig::save_trusted_devices(&path, vec![device.clone()]).unwrap()
+            });
+            scope.spawn(|| DesktopConfig::save_remote_auth(&path, verifier.clone()).unwrap());
+            scope.spawn(|| draft.save_atomic(&path).unwrap());
+        });
+        let saved = DesktopConfig::load(&path).unwrap().unwrap();
+        assert_eq!(saved.trusted_devices, vec![device]);
+        assert_eq!(saved.remote_auth, Some(verifier));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn offline_rename_and_revoke_serialize_without_restoring_stale_trust() {
+        use super::super::trusted_devices::TrustedDevice;
+        use crate::identity::Identity;
+        let root = temp_dir("offline-trust-mutation");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("settings.json");
+        let draft = valid_draft(root.clone());
+        draft.save_atomic(&path).unwrap();
+        let rename = Identity::generate().node_id();
+        let revoke = Identity::generate().node_id();
+        let untouched =
+            TrustedDevice::new(Identity::generate().node_id(), "untouched".into(), None);
+        DesktopConfig::save_trusted_devices(
+            &path,
+            vec![
+                TrustedDevice::new(rename, "before".into(), Some("100000124".into())),
+                TrustedDevice::new(revoke, "removed".into(), None),
+                untouched.clone(),
+            ],
+        )
+        .unwrap();
+        let verifier = super::super::remote_auth::RemoteVerifier::create(
+            &super::super::remote_auth::SecretPassword::new("Change9".into()).unwrap(),
+        )
+        .unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                DesktopConfig::rename_trusted_device(&path, rename, "after".into()).unwrap()
+            });
+            scope.spawn(|| DesktopConfig::revoke_trusted_device(&path, revoke).unwrap());
+            scope.spawn(|| DesktopConfig::save_remote_auth(&path, verifier.clone()).unwrap());
+            scope.spawn(|| draft.save_atomic(&path).unwrap());
+        });
+        let saved = DesktopConfig::load(&path).unwrap().unwrap();
+        assert_eq!(saved.trusted_devices.len(), 2);
+        assert_eq!(saved.trusted_devices[0].node_id, rename.to_hex());
+        assert_eq!(saved.trusted_devices[0].display_name, "after");
+        assert_eq!(
+            saved.trusted_devices[0].last_short_id.as_deref(),
+            Some("100000124")
+        );
+        assert_eq!(saved.trusted_devices[1], untouched);
+        assert_eq!(saved.remote_auth, Some(verifier));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn v2_v3_v4_migrate_to_empty_trust_without_losing_network_rules_or_password() {
+        let root = temp_dir("trusted-migrations");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("settings.json");
+        let mut draft = valid_draft(root.clone());
+        draft.remote_auth = Some(
+            super::super::remote_auth::RemoteVerifier::create(
+                &super::super::remote_auth::SecretPassword::new("A9b8C7".into()).unwrap(),
+            )
+            .unwrap(),
+        );
+        for version in [2, 3, 4] {
+            let mut value = serde_json::to_value(draft.to_config().unwrap()).unwrap();
+            value["schema_version"] = version.into();
+            value.as_object_mut().unwrap().remove("trusted_devices");
+            fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            let saved = DesktopConfig::load(&path).unwrap().unwrap();
+            assert_eq!(saved.schema_version, 5);
+            assert!(saved.trusted_devices.is_empty());
+            assert_eq!(saved.remote_auth, draft.remote_auth);
+            assert_eq!(saved.signal.unwrap().host, draft.signal_host);
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 }

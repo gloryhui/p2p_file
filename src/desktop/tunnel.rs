@@ -103,7 +103,7 @@ pub(super) async fn serve_open(
 pub(super) async fn serve_peer(
     connection: Connection,
     peer: NodeId,
-    inbound_authorized: bool,
+    authorization: super::remote_auth::LiveAuthorization,
     allowed_updates: watch::Receiver<Vec<super::config::AllowedForwardTarget>>,
 ) -> Result<()> {
     let mut streams = JoinSet::new();
@@ -114,7 +114,7 @@ pub(super) async fn serve_peer(
                     Ok(streams) => streams,
                     Err(_) => break,
                 };
-                if !inbound_authorized {
+                if !authorization.current().inbound_authorized() {
                     let mut send = send;
                     let _ = send.reset(3u32.into());
                     let _ = recv.stop(3u32.into());
@@ -137,7 +137,9 @@ pub(super) async fn serve_peer(
                     continue;
                 }
                 let allowed_updates = allowed_updates.clone();
+                let authorization = authorization.clone();
                 streams.spawn(async move {
+                    authorization.guard(true, async {
                     let mut send = send;
                     let frame = tokio::time::timeout(STREAM_OPEN_TIMEOUT, protocol::read(&mut recv))
                         .await
@@ -156,6 +158,7 @@ pub(super) async fn serve_peer(
                             Err(Error::Protocol("未配置任务存储，仅接受 TCP 隧道请求".into()))
                         }
                     }
+                    }).await
                 });
             }
             result = streams.join_next(), if !streams.is_empty() => {
@@ -300,7 +303,12 @@ mod tests {
         let grant =
             super::super::config::AllowedForwardTarget::new("echo", target, vec![peer.to_hex()]);
         let (updates, grants) = watch::channel(vec![grant]);
-        let service = tokio::spawn(serve_peer(server_conn.clone(), peer, true, grants));
+        let service = tokio::spawn(serve_peer(
+            server_conn.clone(),
+            peer,
+            crate::desktop::remote_auth::RemoteAuthorization::BOTH.into(),
+            grants,
+        ));
         let (mut send, mut recv) = client_conn.open_bi().await.unwrap();
         let frame = Frame {
             request_id: 0,
