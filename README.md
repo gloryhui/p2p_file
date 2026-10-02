@@ -361,6 +361,11 @@ ticket、不向目标推送候选，也不新增 offline waiter；`max_pending_l
 Admission 的 outstanding ticket 默认每 unordered NodeId pair 最多 16 张、每 NodeId
 最多 64 张；小容量服务还将两者分别限制在全局 ticket 池的一半。quota 直接依据真实
 ticket map，TTL 到期自动释放；已 Ready 的转发 session 仍按原有 idle timeout 运行。
+Session 另有独立配额：每 unordered NodeId pair 最多 16 个、每 NodeId 最多 64 个，
+小容量服务将其限制为全局 session 池的一半（单槽服务至少允许一个）。每个 arm
+无论 half-bound 或 Ready 均计入，按已签名 Bound 的 node/peer 从真实 session map
+统计；创建前及签名 Register 后都检查。ticket 过期或普通 UDP 保活均不能释放
+session 配额；idle 清理自动释放。已有 half-bound arm 可在配额满时完成另一端绑定。
 第三方 source、未知 ticket、错 pair/公钥/签名与重放均拒绝。两边绑定前丢弃数据，
 不排队；绑定后的 source 不能漂移或抢占，断线重新 pairing。Relay 不解码 QUIC 或
 文件/Tunnel/Speedtest，不解密、不落盘；恶意服务器可以阻断，不能冒充设备。

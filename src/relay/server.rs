@@ -17,6 +17,8 @@ pub const DEFAULT_MAX_SESSIONS: usize = 512;
 pub const DEFAULT_PENDING_PER_IP: usize = 8;
 pub const MAX_TICKETS_PER_PAIR: usize = 16;
 pub const MAX_TICKETS_PER_NODE: usize = 64;
+pub const MAX_SESSIONS_PER_PAIR: usize = 16;
+pub const MAX_SESSIONS_PER_NODE: usize = 64;
 pub const MAX_DATAGRAM: usize = 2048;
 const CHALLENGE_TTL: Duration = Duration::from_secs(5);
 
@@ -98,6 +100,18 @@ struct Session {
 impl Session {
     fn ready(&self) -> bool {
         self.sides.iter().all(Option::is_some)
+    }
+    fn contains_node(&self, node: NodeId) -> bool {
+        self.sides
+            .iter()
+            .flatten()
+            .any(|bound| bound.hello.node == node || bound.hello.peer == node)
+    }
+    fn contains_pair(&self, a: NodeId, b: NodeId) -> bool {
+        self.sides.iter().flatten().any(|bound| {
+            (bound.hello.node == a && bound.hello.peer == b)
+                || (bound.hello.node == b && bound.hello.peer == a)
+        })
     }
 }
 
@@ -296,7 +310,7 @@ impl State {
                 .filter(|addr| addr.ip() == source.ip())
                 .count()
                 >= self.config.max_pending_per_ip
-            || self.available_arm(token, side).is_none()
+            || self.available_arm(hello, side).is_none()
         {
             return Vec::new();
         }
@@ -357,7 +371,7 @@ impl State {
         if self.sources.contains_key(&source) {
             return Vec::new();
         }
-        let Some(arm) = self.available_arm(pending.session.0, pending.side) else {
+        let Some(arm) = self.available_arm(challenge.hello, pending.side) else {
             return Vec::new();
         };
         let session = self.sessions.entry(arm).or_insert(Session {
@@ -375,20 +389,46 @@ impl State {
         self.sources.insert(source, (arm, pending.side));
         self.ready_packets(arm)
     }
-    fn available_arm(&self, token: Token, side: usize) -> Option<SessionKey> {
+    fn available_arm(&self, hello: Hello, side: usize) -> Option<SessionKey> {
+        let token = *hello.token.as_bytes();
         // Prefer a waiting opposite socket. Once paired, its destination is immutable.
         if let Some(key) = self
             .sessions
             .iter()
             .filter(|((t, _), s)| {
-                *t == token && s.sides[side].is_none() && s.sides[1 - side].is_some()
+                *t == token
+                    && s.sides[side].is_none()
+                    && s.sides[1 - side].is_some_and(|bound| {
+                        bound.hello.node == hello.peer && bound.hello.peer == hello.node
+                    })
             })
             .map(|(key, _)| *key)
             .min()
         {
             return Some(key);
         }
-        if self.sessions.len() >= self.config.max_sessions {
+        // Count real arms, including half-bound ones, from their signed Bound
+        // identities. Tickets may already have expired while Ready arms live.
+        // No separate counters can drift on idle cleanup. Reserve half the
+        // global pool for unrelated identities even with small configurations.
+        let fair_limit = (self.config.max_sessions / 2).max(1);
+        let pair_limit = MAX_SESSIONS_PER_PAIR.min(fair_limit);
+        let node_limit = MAX_SESSIONS_PER_NODE.min(fair_limit);
+        if self.sessions.len() >= self.config.max_sessions
+            || self
+                .sessions
+                .values()
+                .filter(|session| session.contains_pair(hello.node, hello.peer))
+                .count()
+                >= pair_limit
+            || [hello.node, hello.peer].into_iter().any(|node| {
+                self.sessions
+                    .values()
+                    .filter(|session| session.contains_node(node))
+                    .count()
+                    >= node_limit
+            })
+        {
             return None;
         }
         (0..MAX_ARMS_PER_TICKET)
@@ -566,6 +606,423 @@ mod tests {
                 <= wire::encode(register).unwrap().len()
         );
         (hello, register, replies)
+    }
+    #[test]
+    fn relay_session_pair_quota_counts_half_bound_arms_in_both_directions() {
+        let (admission, a, b, first) = fixture(128, 8);
+        let mut bindings = Vec::new();
+        for ticket_index in 0..MAX_SESSIONS_PER_PAIR / MAX_ARMS_PER_TICKET as usize {
+            let token = if ticket_index == 0 {
+                first
+            } else {
+                let token = PunchToken::random();
+                assert!(admission.issue(token, b.node_id(), a.node_id()));
+                token
+            };
+            let (owner, peer) = if ticket_index % 2 == 0 {
+                (&a, &b)
+            } else {
+                (&b, &a)
+            };
+            for _ in 0..MAX_ARMS_PER_TICKET {
+                let port = 10000 + bindings.len() as u16 * 2;
+                assert!(
+                    bind_side(&admission, owner, peer.node_id(), token, source(port))
+                        .2
+                        .is_empty()
+                );
+                bindings.push((token, owner, peer, port));
+            }
+        }
+        assert_eq!(
+            admission.0.lock().unwrap().sessions.len(),
+            MAX_SESSIONS_PER_PAIR
+        );
+        let token = PunchToken::random();
+        assert!(admission.issue(token, a.node_id(), b.node_id()));
+        for (owner, peer) in [(&a, &b), (&b, &a)] {
+            assert!(
+                challenge(
+                    &admission,
+                    Hello::new(owner, peer.node_id(), token),
+                    source(11000)
+                )
+                .is_none()
+            );
+        }
+        // Completing an existing arm consumes no new quota. Ready still counts
+        // once, rather than once per bound socket.
+        for (token, owner, peer, port) in bindings {
+            assert_eq!(
+                bind_side(&admission, peer, owner.node_id(), token, source(port + 1))
+                    .2
+                    .len(),
+                2
+            );
+        }
+        assert_eq!(
+            admission.0.lock().unwrap().sessions.len(),
+            MAX_SESSIONS_PER_PAIR
+        );
+        assert!(
+            challenge(
+                &admission,
+                Hello::new(&a, b.node_id(), token),
+                source(11000)
+            )
+            .is_none()
+        );
+        let c = Identity::generate();
+        let d = Identity::generate();
+        let cd = PunchToken::random();
+        assert!(admission.issue(cd, c.node_id(), d.node_id()));
+        bind_side(&admission, &c, d.node_id(), cd, source(11001));
+        assert_eq!(
+            bind_side(&admission, &d, c.node_id(), cd, source(11002))
+                .2
+                .len(),
+            2
+        );
+    }
+    #[test]
+    fn relay_session_node_quota_counts_peer_identity_across_rotating_pairs() {
+        let (admission, a, b, token) = fixture(256, 8);
+        // Only counterparts sign these half-bound arms. The unbound A identity
+        // still owns every session, irrespective of ticket order or signer.
+        for i in 0..MAX_SESSIONS_PER_NODE / 2 {
+            let peer = if i == 0 {
+                b.clone()
+            } else {
+                Identity::generate()
+            };
+            let token = if i == 0 {
+                token
+            } else {
+                let token = PunchToken::random();
+                let (left, right) = if i % 2 == 0 {
+                    (a.node_id(), peer.node_id())
+                } else {
+                    (peer.node_id(), a.node_id())
+                };
+                assert!(admission.issue(token, left, right));
+                token
+            };
+            for arm in 0..2 {
+                bind_side(
+                    &admission,
+                    &peer,
+                    a.node_id(),
+                    token,
+                    source(12000 + i as u16 * 2 + arm),
+                );
+            }
+        }
+        assert_eq!(
+            admission.0.lock().unwrap().sessions.len(),
+            MAX_SESSIONS_PER_NODE
+        );
+        let peer = Identity::generate();
+        let token = PunchToken::random();
+        assert!(admission.issue(token, peer.node_id(), a.node_id()));
+        for (owner, counterpart) in [(&a, &peer), (&peer, &a)] {
+            assert!(
+                challenge(
+                    &admission,
+                    Hello::new(owner, counterpart.node_id(), token),
+                    source(13000)
+                )
+                .is_none()
+            );
+        }
+        let c = Identity::generate();
+        let d = Identity::generate();
+        let cd = PunchToken::random();
+        assert!(admission.issue(cd, c.node_id(), d.node_id()));
+        bind_side(&admission, &c, d.node_id(), cd, source(13001));
+        assert_eq!(
+            bind_side(&admission, &d, c.node_id(), cd, source(13002))
+                .2
+                .len(),
+            2
+        );
+    }
+    #[test]
+    fn relay_session_quota_rechecks_concurrent_signed_pending_challenges() {
+        let (admission, a, b, first) = fixture(8, 8);
+        let mut responses = Vec::new();
+        for i in 0..6 {
+            let token = if i == 0 {
+                first
+            } else {
+                let token = PunchToken::random();
+                assert!(admission.issue(token, a.node_id(), b.node_id()));
+                token
+            };
+            let addr = source(14000 + i);
+            let proof = challenge(&admission, Hello::new(&a, b.node_id(), token), addr).unwrap();
+            responses.push((addr, wire::register(&a, proof).unwrap()));
+        }
+        assert!(admission.0.lock().unwrap().sessions.is_empty());
+        let barrier = Arc::new(std::sync::Barrier::new(responses.len()));
+        std::thread::scope(|scope| {
+            for (addr, register) in responses {
+                let admission = admission.clone();
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    assert!(
+                        admission
+                            .control(register, addr, AddressFamily::Ipv4)
+                            .is_empty()
+                    );
+                });
+            }
+        });
+        let state = admission.0.lock().unwrap();
+        assert_eq!(state.sessions.len(), 4);
+        assert_eq!(state.sources.len(), 4);
+        assert!(state.pending.is_empty());
+    }
+    #[test]
+    fn relay_session_limits_scale_to_small_pools_and_keep_global_cap() {
+        for max_sessions in [1, 2, 4, 8, 32] {
+            let (admission, a, b, first) = fixture(max_sessions, 8);
+            let limit = MAX_SESSIONS_PER_PAIR.min((max_sessions / 2).max(1));
+            for i in 0..limit {
+                let token = if i == 0 {
+                    first
+                } else {
+                    let token = PunchToken::random();
+                    assert!(admission.issue(token, a.node_id(), b.node_id()));
+                    token
+                };
+                bind_side(
+                    &admission,
+                    &a,
+                    b.node_id(),
+                    token,
+                    source(15000 + i as u16 * 2),
+                );
+                assert_eq!(
+                    bind_side(
+                        &admission,
+                        &b,
+                        a.node_id(),
+                        token,
+                        source(15001 + i as u16 * 2)
+                    )
+                    .2
+                    .len(),
+                    2
+                );
+            }
+            assert!(
+                challenge(
+                    &admission,
+                    Hello::new(&a, b.node_id(), first),
+                    source(15100)
+                )
+                .is_none()
+            );
+            for i in limit..max_sessions {
+                let c = Identity::generate();
+                let d = Identity::generate();
+                let token = PunchToken::random();
+                // Retire tickets only, leaving live arms independent of them.
+                {
+                    let mut state = admission.0.lock().unwrap();
+                    state.tickets.clear();
+                }
+                assert!(admission.issue(token, c.node_id(), d.node_id()));
+                bind_side(
+                    &admission,
+                    &c,
+                    d.node_id(),
+                    token,
+                    source(15200 + i as u16 * 2),
+                );
+                assert_eq!(
+                    bind_side(
+                        &admission,
+                        &d,
+                        c.node_id(),
+                        token,
+                        source(15201 + i as u16 * 2)
+                    )
+                    .2
+                    .len(),
+                    2
+                );
+            }
+            let c = Identity::generate();
+            let d = Identity::generate();
+            let token = PunchToken::random();
+            admission.0.lock().unwrap().tickets.clear();
+            assert!(admission.issue(token, c.node_id(), d.node_id()));
+            assert!(
+                challenge(
+                    &admission,
+                    Hello::new(&c, d.node_id(), token),
+                    source(15300)
+                )
+                .is_none()
+            );
+            assert_eq!(admission.0.lock().unwrap().sessions.len(), max_sessions);
+        }
+    }
+    #[test]
+    fn relay_half_bound_session_idle_cleanup_releases_pair_and_node_quotas() {
+        let (admission, a, b, token) = fixture(2, 8);
+        bind_side(&admission, &a, b.node_id(), token, source(16000));
+        assert!(
+            challenge(
+                &admission,
+                Hello::new(&a, b.node_id(), token),
+                source(16001)
+            )
+            .is_none()
+        );
+        let peer = Identity::generate();
+        let next = PunchToken::random();
+        assert!(admission.issue(next, a.node_id(), peer.node_id()));
+        assert!(
+            challenge(
+                &admission,
+                Hello::new(&peer, a.node_id(), next),
+                source(16002)
+            )
+            .is_none()
+        );
+        {
+            let mut state = admission.0.lock().unwrap();
+            let idle = state.config.idle_timeout;
+            state.sessions.values_mut().next().unwrap().last_activity = Instant::now() - idle;
+            state.cleanup(Instant::now());
+            assert!(state.sessions.is_empty());
+            assert!(state.sources.is_empty());
+            assert_eq!(state.tickets.len(), 2);
+        }
+        bind_side(&admission, &peer, a.node_id(), next, source(16002));
+        assert_eq!(
+            bind_side(&admission, &a, peer.node_id(), next, source(16003))
+                .2
+                .len(),
+            2
+        );
+    }
+    #[tokio::test]
+    async fn relay_live_udp_after_ticket_expiry_cannot_bypass_session_quotas() {
+        let (admission, a, b, token) = fixture(2, 8);
+        let listener = UdpSocket::bind(source(0)).await.unwrap();
+        let server = listener.local_addr().unwrap();
+        let sa = UdpSocket::bind(source(0)).await.unwrap();
+        let sb = UdpSocket::bind(source(0)).await.unwrap();
+        bind_side(&admission, &a, b.node_id(), token, sa.local_addr().unwrap());
+        bind_side(&admission, &b, a.node_id(), token, sb.local_addr().unwrap());
+        let task = tokio::spawn(run(listener, admission.clone()));
+        {
+            let mut state = admission.0.lock().unwrap();
+            state.tickets.get_mut(token.as_bytes()).unwrap().expires = Instant::now();
+            state.cleanup(Instant::now());
+            assert!(state.tickets.is_empty());
+            assert_eq!(state.sessions.len(), 1);
+        }
+        let peer = Identity::generate();
+        let mut buffer = [0; 256];
+        for i in 0..8 {
+            // Explicit expiry/aging avoids wall-clock TTL sleeps. Receipt of a
+            // real opaque datagram is the barrier proving last_activity refreshed.
+            let aged = Instant::now() - Duration::from_secs(30);
+            admission
+                .0
+                .lock()
+                .unwrap()
+                .sessions
+                .values_mut()
+                .next()
+                .unwrap()
+                .last_activity = aged;
+            let payload = [i; 128];
+            let (sender, receiver) = if i % 2 == 0 { (&sa, &sb) } else { (&sb, &sa) };
+            sender.send_to(&payload, server).await.unwrap();
+            let (length, from) =
+                tokio::time::timeout(Duration::from_secs(2), receiver.recv_from(&mut buffer))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(from, server);
+            assert_eq!(&buffer[..length], payload);
+            assert!(
+                admission
+                    .0
+                    .lock()
+                    .unwrap()
+                    .sessions
+                    .values()
+                    .next()
+                    .unwrap()
+                    .last_activity
+                    > aged
+            );
+            let next = PunchToken::random();
+            assert!(admission.issue(next, a.node_id(), b.node_id()));
+            assert!(
+                challenge(&admission, Hello::new(&a, b.node_id(), next), source(17000)).is_none()
+            );
+            // Ticket quota is genuinely available, but rotating the peer also
+            // cannot bypass the live session's per-node ownership.
+            let rotated = PunchToken::random();
+            assert!(admission.issue(rotated, peer.node_id(), a.node_id()));
+            assert!(
+                challenge(
+                    &admission,
+                    Hello::new(&peer, a.node_id(), rotated),
+                    source(17001)
+                )
+                .is_none()
+            );
+            let mut state = admission.0.lock().unwrap();
+            let now = Instant::now();
+            for ticket in state.tickets.values_mut() {
+                ticket.expires = now;
+            }
+            state.cleanup(now);
+            assert_eq!(state.sessions.len(), 1);
+            assert_eq!(state.sources.len(), 2);
+            assert!(state.tickets.is_empty());
+        }
+        let c = Identity::generate();
+        let d = Identity::generate();
+        let cd = PunchToken::random();
+        assert!(admission.issue(cd, c.node_id(), d.node_id()));
+        bind_side(&admission, &c, d.node_id(), cd, source(17002));
+        assert_eq!(
+            bind_side(&admission, &d, c.node_id(), cd, source(17003))
+                .2
+                .len(),
+            2
+        );
+        {
+            let mut state = admission.0.lock().unwrap();
+            let idle = state.config.idle_timeout;
+            for session in state.sessions.values_mut() {
+                session.last_activity = Instant::now() - idle;
+            }
+            state.cleanup(Instant::now());
+            assert!(state.sessions.is_empty());
+            assert!(state.sources.is_empty());
+        }
+        let next = PunchToken::random();
+        assert!(admission.issue(next, a.node_id(), b.node_id()));
+        bind_side(&admission, &a, b.node_id(), next, sa.local_addr().unwrap());
+        assert_eq!(
+            bind_side(&admission, &b, a.node_id(), next, sb.local_addr().unwrap())
+                .2
+                .len(),
+            2
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
     }
     #[tokio::test]
     async fn relay_requires_real_pair_both_signatures_and_unique_source_before_forwarding() {

@@ -526,8 +526,16 @@ WSAEMSGSIZE 行为）；回应不大于触发报文，双边 Ready notice 总量
 512 sessions（最大 4096）、单 IP 8 pending（最大 128）、总 pending/tickets 各受
 session cap 两倍限制。`Admission::issue` 另从真实 ticket map 计算 unordered pair/node
 quota，默认分别 16/64 张，且各自不超过全局 ticket 池的一半；双方 NodeId 均计入，
-不使用独立计数器。ticket 到期释放 quota；已 Ready session 按既有 idle timeout 继续
+不使用独立计数器。ticket 到期释放 ticket quota；已 Ready session 按既有 idle timeout 继续
 转发，未 Ready session/pending 按 TTL 清理，仍 active 的 token 禁止重新分配。
+Session 配额独立于 ticket：每 unordered pair 默认最多 16 个 arm，每 NodeId 最多
+64 个，均夹紧到全局 session 池的一半（至少一个），并保留全局 `max_sessions`。
+统计依据真实 sessions map 内已验签 Bound/Hello 的 node + peer，half-bound 和 Ready
+各占一个 session，双边完成不会重复计数，不依赖可过期的 ticket 或独立计数器。
+Hello 预检和签名 Register 的实际分配均在同一 admission mutex 内检查；并发 pending
+challenge 不能绕过配额。先允许补全既有 half-bound，再检查新 arm 的全局/pair/node
+预算。ticket TTL 清理及普通 UDP 的 last_activity 刷新均不会释放存活 session 配额；
+idle cleanup 删除 session/source 后自动恢复预算，清理规则和不可漂移的绑定保持原样。
 普通 NodeId Lookup 在连接所有权校验后、查询目标状态/修改 waiter/调用 `try_pair`
 之前限流：固定 10s 窗口，每连接默认 64 次、每 source IP 默认 256 次。IP bucket
 表上限 1024 项，每次 IP 检查清理过期项；超限统一返回查询不可用错误，无 pairing、
