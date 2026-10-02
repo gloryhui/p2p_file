@@ -53,7 +53,7 @@ fn parse_speedtest_block_size(raw: &str) -> std::result::Result<u32, String> {
 /// 点对点文件传输。
 ///
 /// 目标是在公网上把文件直接发给对方：STUN 探出各自的公网映射，双方同时
-/// 打洞，打通后走 QUIC 加密通道传数据。打洞不成时才退回中继。
+/// 打洞，打通后走 QUIC 加密通道传数据；IPv6 原生直连与 IPv4 并行尝试。
 #[derive(Debug, Parser)]
 #[command(
     name = "p2p_file",
@@ -77,6 +77,10 @@ pub struct Cli {
 /// 打洞相关的公共参数。`serve` / `tunnel` / `push` 都要用。
 #[derive(Debug, Args, Clone)]
 pub struct DirectOpts {
+    /// Native UDP address families; each uses a separate socket.
+    #[arg(long, value_enum, default_value = "dual-stack")]
+    pub ip_family: crate::net::NetworkFamilies,
+
     /// 信令服务器地址（跑在阿里云那台上的 `signal-server`）
     #[arg(long, value_name = "HOST:PORT")]
     pub signal: String,
@@ -289,6 +293,34 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
+    #[test]
+    fn ipv6_advertise_send_and_family_options_parse_without_ipv4_mapping() {
+        let node = crate::identity::Identity::generate().node_id().to_hex();
+        let cli = Cli::try_parse_from([
+            "p2p_file",
+            "push",
+            "--signal",
+            "127.0.0.1:7000",
+            "--peer",
+            &node,
+            "--ip-family",
+            "ipv6-only",
+            "--advertise",
+            "[2001:db8::7]:9000",
+            "file.bin",
+        ])
+        .unwrap();
+        let Command::Push { direct, .. } = cli.command else {
+            panic!("push expected")
+        };
+        assert_eq!(direct.ip_family, crate::net::NetworkFamilies::Ipv6Only);
+        assert_eq!(
+            direct.advertise,
+            vec!["[2001:db8::7]:9000".parse::<SocketAddr>().unwrap()]
+        );
+        let cli = Cli::try_parse_from(["p2p_file", "send", "file.bin", "[::1]:9000"]).unwrap();
+        assert!(matches!(cli.command, Command::Send { peer, .. } if peer.is_ipv6()));
+    }
     #[test]
     fn 命令行定义本身是合法的() {
         Cli::command().debug_assert();

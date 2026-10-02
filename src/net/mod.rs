@@ -16,7 +16,11 @@
 //! 路由器如果是对称型 NAT（用同一个本地端口访问不同目标会拿到不同公网端口），
 //! 这套流程打不通，只能靠端口映射或中继。
 
-use std::net::{IpAddr, SocketAddr, UdpSocket as StdUdpSocket};
+pub mod family;
+pub mod race;
+pub use family::{AddressFamily, NetworkFamilies};
+
+use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
@@ -28,13 +32,11 @@ use crate::discovery::signal::{
 };
 use crate::error::{Error, Result};
 use crate::identity::{Identity, NodeId};
-use crate::nat::classify::{MappingBehavior, MappingEvidence, probe_rfc5780};
-use crate::nat::punch::{PunchConfig, simultaneous_open_any};
-use crate::nat::stun::resolve_server;
-use crate::transport::handshake::handshake_initiator;
+use crate::nat::classify::{MappingBehavior, MappingEvidence, MappingProbe, probe_rfc5780};
+use crate::nat::punch::PunchConfig;
+use crate::nat::stun::{query_binding_with, resolve_server_for};
 use crate::transport::quic::{
-    ACCEPT_FIRST_BI_STREAM_TIMEOUT, ChannelBinding, PunchSocketHandle, endpoint_from_socket,
-    endpoint_from_socket_with_punch_dispatcher,
+    PunchSocketHandle, endpoint_from_socket, endpoint_from_socket_with_punch_dispatcher,
 };
 
 /// 默认 STUN 服务器。
@@ -50,6 +52,7 @@ pub const DEFAULT_STUN_SERVERS: &[&str] = &[
 #[derive(Clone, Debug)]
 pub struct DesktopNetworkConfig {
     pub local_port: u16,
+    pub families: NetworkFamilies,
     pub stun_servers: Vec<String>,
     pub stun_timeout: Duration,
     pub advertise: Vec<SocketAddr>,
@@ -60,6 +63,7 @@ impl Default for DesktopNetworkConfig {
     fn default() -> Self {
         Self {
             local_port: 0,
+            families: NetworkFamilies::DualStack,
             stun_servers: DEFAULT_STUN_SERVERS
                 .iter()
                 .map(|server| server.to_string())
@@ -71,19 +75,48 @@ impl Default for DesktopNetworkConfig {
     }
 }
 
-/// One prepared UDP socket, its advertised candidates, and the QUIC endpoint that owns reads.
-pub struct DesktopNetwork {
+/// Each family owns the exact socket used for its discovery, probes and QUIC.
+#[derive(Clone)]
+pub struct NetworkPath {
+    pub family: AddressFamily,
     pub endpoint: quinn::Endpoint,
     pub punch_socket: PunchSocketHandle,
     pub local_addr: SocketAddr,
     pub local_candidates: Vec<Candidate>,
-    pub mapping: MappingBehavior,
+    /// Only IPv4 has RFC 5780 NAT classification.
+    pub mapping: Option<MappingBehavior>,
+    pub mapping_probe: Option<MappingProbe>,
     pub public_addr: Option<SocketAddr>,
 }
-
-impl DesktopNetwork {
+impl NetworkPath {
     pub fn reachable_candidates(&self, candidates: &[Candidate]) -> Vec<SocketAddr> {
         filter_reachable(candidates, self.local_addr)
+    }
+}
+pub struct DesktopNetwork {
+    pub paths: Vec<NetworkPath>,
+    pub local_candidates: Vec<Candidate>,
+    pub diagnostics: Vec<String>,
+}
+impl DesktopNetwork {
+    pub fn reachable_candidates(&self, candidates: &[Candidate]) -> Vec<SocketAddr> {
+        self.paths
+            .iter()
+            .flat_map(|p| p.reachable_candidates(candidates))
+            .collect()
+    }
+    pub fn path(&self, family: AddressFamily) -> Option<&NetworkPath> {
+        self.paths.iter().find(|p| p.family == family)
+    }
+    pub fn close(&self) {
+        for path in &self.paths {
+            path.endpoint.close(0u32.into(), b"network shutdown");
+        }
+    }
+    pub async fn wait_idle(&self) {
+        for path in &self.paths {
+            path.endpoint.wait_idle().await;
+        }
     }
 }
 
@@ -98,6 +131,7 @@ pub struct DirectConfig {
     ///
     /// 固定端口有个好处：NAT 上的映射能复用，重复连接更快。
     pub local_port: u16,
+    pub families: NetworkFamilies,
     /// STUN 服务器列表。
     pub stun_servers: Vec<String>,
     /// 单个 STUN 查询的超时。
@@ -121,6 +155,7 @@ impl DirectConfig {
             signal_server: signal_server.into(),
             peer,
             local_port: 9000,
+            families: NetworkFamilies::DualStack,
             stun_servers: DEFAULT_STUN_SERVERS.iter().map(|s| s.to_string()).collect(),
             stun_timeout: Duration::from_secs(3),
             advertise: Vec::new(),
@@ -131,312 +166,248 @@ impl DirectConfig {
     }
 }
 
-/// 建立好的直连通道。
+/// Prepared native paths. No candidate or probe is an authenticated winner.
 pub struct DirectLink {
-    /// 已经绑定在打洞端口上的 QUIC 端点。两边都既能 `accept` 也能 `connect`。
-    pub endpoint: quinn::Endpoint,
-    /// 打洞确认可用的对端地址；没确认时是按优先级猜的首选候选。
+    pub network: DesktopNetwork,
     pub peer_addr: SocketAddr,
-    /// 打洞时是否真的收到了对端的探测包。
-    pub punch_confirmed: bool,
-    /// 对端节点 ID。
     pub peer_node_id: NodeId,
-    /// 对端提供的候选地址。
     pub peer_candidates: Vec<SocketAddr>,
-    /// 我们提供给对端的候选地址。
-    pub local_candidates: Vec<Candidate>,
-    /// 本机 NAT 的映射行为。
-    pub mapping: MappingBehavior,
-    /// STUN 看到的公网映射（没探到就是 None）。
-    pub public_addr: Option<SocketAddr>,
-    /// 本机打洞使用的本地端口。
-    pub local_port: u16,
-    /// 与信令服务器的连接。
-    ///
-    /// **必须一直持有**：一旦 drop，服务器就会认为本节点下线，对端之后再也
-    /// 查不到我们。常驻的 `serve` 靠它保持「在线」。
-    ///
-    /// 持有期间不需要手动保活：`SignalingClient` 后台会按
-    /// `DEFAULT_HEARTBEAT_INTERVAL` 自动心跳，所以即使 QUIC/隧道长时间活跃、
-    /// 上层完全不碰信令，服务器也不会因为空闲把本节点摘掉。
     signal: SignalingClient,
+    probes: tokio::task::JoinSet<()>,
+    observations: Vec<race::ProbeObservation>,
 }
-
 impl DirectLink {
-    /// 消费直连并拆出 QUIC 端点和信令连接。
-    ///
-    /// serve 会话结束时必须先释放信令后台任务和其它 link 状态，再释放
-    /// endpoint；否则上一轮的 socket 可能仍被 link 的内部句柄保留，固定端口
-    /// 的下一轮重建会得到 `Address already in use`。
-    pub fn into_parts(self) -> (quinn::Endpoint, SignalingClient) {
-        let Self {
-            endpoint, signal, ..
-        } = self;
-        (endpoint, signal)
+    pub fn into_parts(self) -> (DesktopNetwork, SignalingClient, tokio::task::JoinSet<()>) {
+        (self.network, self.signal, self.probes)
     }
-
-    /// 连到对端，按候选顺序依次尝试。
-    ///
-    /// 打洞确认过的地址排在最前面，给足时间（QUIC 会自己重传，慢一点没关系）；
-    /// 其余的候选快试快换，避免在一个明显不通的地址上耗太久。
-    ///
-    /// 之所以要「依次尝试」而不是只用打洞确认的那个：打洞没收到回应并不代表
-    /// 连不上——我们的探测包已经在 NAT 上开了映射，对端也可能已经收到了。
-    /// 让 QUIC 去试，比在打洞阶段就放弃要靠谱得多。
+    pub fn endpoints(&self) -> Vec<quinn::Endpoint> {
+        self.network
+            .paths
+            .iter()
+            .map(|p| p.endpoint.clone())
+            .collect()
+    }
+    /// Unauthenticated QUIC helper retained for the pending-handshake regression.
     pub async fn connect(&self) -> Result<quinn::Connection> {
-        let mut ordered = vec![self.peer_addr];
-        for candidate in &self.peer_candidates {
-            if !ordered.contains(candidate) {
-                ordered.push(*candidate);
-            }
-        }
-
-        let mut last_error: Option<Error> = None;
-
-        for (index, addr) in ordered.iter().enumerate() {
-            let timeout = if index == 0 && self.punch_confirmed {
-                // 打洞确认过的地址，值得多等一会儿。
-                DIRECT_CONNECT_TIMEOUT
-            } else {
-                FALLBACK_CONNECT_TIMEOUT
-            };
-
-            match tokio::time::timeout(
-                timeout,
-                crate::transport::quic::connect(&self.endpoint, *addr, "p2pfile"),
-            )
-            .await
-            {
-                Ok(Ok(connection)) => {
-                    if index == 0 {
-                        info!(%addr, "直连建立");
-                    } else {
-                        info!(%addr, "直连建立（换用了后面的候选地址）");
-                    }
-                    return Ok(connection);
-                }
-                Ok(Err(err)) => {
-                    warn!(%addr, error = %err, "连接失败，试下一个候选");
-                    last_error = Some(err);
-                }
-                Err(_) => {
-                    warn!(%addr, timeout = ?timeout, "连接超时，试下一个候选");
-                }
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| {
-            Error::Transport(format!(
-                "所有候选地址都连不上：{}",
-                ordered
-                    .iter()
-                    .map(|addr| addr.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ))
-        }))
+        let path = self
+            .network
+            .path(AddressFamily::of(self.peer_addr))
+            .ok_or_else(|| Error::Transport("missing address family".into()))?;
+        crate::transport::quic::connect(&path.endpoint, self.peer_addr, "p2pfile").await
     }
-
-    /// 信令服务器地址。
-    ///
-    /// 读一下这个字段也顺带说明：连接一直被持有，对端在整个进程存活期间
-    /// 都能通过信令服务器查到我们。
     pub fn signal_server(&self) -> &str {
         self.signal.server()
     }
-
-    /// 把候选地址列表打印出来，方便排查为什么打不通。
     pub fn describe(&self) -> String {
-        let peers: Vec<String> = self
-            .peer_candidates
-            .iter()
-            .map(|addr| addr.to_string())
-            .collect();
         format!(
-            "本地端口 {}，NAT 映射行为 {}，公网映射 {}，对端候选 [{}]，首选 {}（打洞{}）",
-            self.local_port,
-            self.mapping.describe(),
-            self.public_addr
-                .map(|addr| addr.to_string())
-                .unwrap_or_else(|| "未知".into()),
-            peers.join(", "),
-            self.peer_addr,
-            if self.punch_confirmed {
-                "已确认"
-            } else {
-                "未确认"
-            }
+            "{}; 对端候选 [{}]；等待 QUIC + Ed25519/TLS 身份认证",
+            self.network.diagnostics.join("; "),
+            self.peer_candidates
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
         )
     }
-
-    /// 在已经建立的直连上完成一次应用层身份认证。
-    ///
-    /// `push`、`tunnel` 和 `speedtest` 都走这里，确保测速不会另起一套
-    /// 连接流程，也不会绕过 channel binding 或目标节点 ID 校验。
     pub async fn connect_authenticated(&self, identity: &Identity) -> Result<quinn::Connection> {
-        let connection = self.connect().await?;
-        let binding = ChannelBinding::from_connection(&connection)?;
-        let (mut send, mut recv) =
-            tokio::time::timeout(ACCEPT_FIRST_BI_STREAM_TIMEOUT, connection.open_bi())
-                .await
-                .map_err(|_| Error::Transport("打开握手流超时".into()))?
-                .map_err(|err| Error::Transport(format!("打开握手流失败: {err}")))?;
-        let outcome = handshake_initiator(&mut send, &mut recv, identity, &binding).await?;
-        let _ = send.finish();
-
-        if outcome.peer_node_id != self.peer_node_id {
-            connection.close(2u32.into(), b"unexpected peer");
-            return Err(Error::Identity(format!(
-                "对端身份不符：期待 {}，实际 {}",
-                self.peer_node_id.short(),
-                outcome.peer_node_id.short()
-            )));
-        }
-        Ok(connection)
+        let candidates = self
+            .network
+            .paths
+            .iter()
+            .flat_map(|path| {
+                self.peer_candidates
+                    .iter()
+                    .filter(|a| path.family.accepts(**a))
+                    .map(|a| (path.endpoint.clone(), *a))
+            })
+            .collect();
+        race::authenticated_race_with_probes(
+            candidates,
+            self.observations.clone(),
+            identity,
+            self.peer_node_id,
+        )
+        .await
     }
 }
 
-/// 打洞确认过时，等 QUIC 握手的时长。
-const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// 打洞未确认时，每个候选地址试探的时长。
-const FALLBACK_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
-
-/// 建立到 `config.peer` 的直连。
 pub async fn establish(identity: &Identity, config: &DirectConfig) -> Result<DirectLink> {
-    // ---- 1. 绑定打洞用的 socket，全程就这一个 ----
-    let bind: SocketAddr = format!("0.0.0.0:{}", config.local_port).parse().unwrap();
-    let socket = UdpSocket::bind(bind)
-        .await
-        .map_err(|err| Error::Transport(format!("绑定本地 UDP 端口 {bind} 失败: {err}")))?;
-    let local_addr = socket.local_addr()?;
-    let local_port = local_addr.port();
-    info!(port = local_port, "打洞 socket 就绪");
-
-    // ---- 2. STUN 探自己的公网映射 ----
-    let (public_addr, mapping) =
-        probe_public_addr(&socket, &config.stun_servers, config.stun_timeout).await?;
-
-    // ---- 3. 组装候选地址 ----
-    let mut candidates = build_candidates(
-        local_port,
-        public_addr,
-        &config.advertise,
-        config.include_loopback,
-    );
-    dedup_candidates(&mut candidates);
-    sort_candidates(&mut candidates);
-    let local_candidates = candidates.clone();
-
-    info!(
-        count = candidates.len(),
-        list = %local_candidates
-            .iter()
-            .map(|c| c.to_string())
-            .collect::<Vec<_>>()
-            .join(" / "),
-        "本机候选地址"
-    );
-    if public_addr.is_none() && config.advertise.is_empty() {
-        warn!(
-            "没探到公网映射，也没有手动指定对外地址：只有对端能直连到本机时才有戏。\
-             若路由器上做了端口映射，用 --advertise 告诉我对外的地址"
-        );
-    }
-
-    // ---- 4. 信令：登记自己，换回对端候选 ----
-    let mut signal = SignalingClient::connect(&config.signal_server, identity, candidates).await?;
-    info!(server = %config.signal_server, "已接入信令服务器");
+    let network = prepare_desktop_network(&DesktopNetworkConfig {
+        local_port: config.local_port,
+        families: config.families,
+        stun_servers: config.stun_servers.clone(),
+        stun_timeout: config.stun_timeout,
+        advertise: config.advertise.clone(),
+        include_loopback: config.include_loopback,
+    })
+    .await?;
+    let mut signal = SignalingClient::connect(
+        &config.signal_server,
+        identity,
+        network.local_candidates.clone(),
+    )
+    .await?;
     let offer = resolve_peer_waiting(&mut signal, config.peer, config.signal_timeout).await?;
-    let peer_candidates_raw = offer.candidates;
-    info!(
-        peer = %config.peer.short(),
-        count = peer_candidates_raw.len(),
-        token = %offer.token,
-        list = %peer_candidates_raw
-            .iter()
-            .map(|c| c.to_string())
-            .collect::<Vec<_>>()
-            .join(" / "),
-        "拿到对端候选地址"
-    );
-
-    // ---- 5. 过滤出这个 socket 真能发过去的地址 ----
-    let peer_candidates = filter_reachable(&peer_candidates_raw, local_addr);
-    if peer_candidates.is_empty() {
-        return Err(Error::Transport(format!(
-            "对端给的候选地址没有一个能用（本机 socket 是 {}，对端给的是 [{}]）。\
-             本机只绑了 IPv4，对端的 IPv6 地址暂时用不上",
-            local_addr,
-            peer_candidates_raw
-                .iter()
-                .map(|c| c.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )));
+    let peer_candidates = network.reachable_candidates(&offer.candidates);
+    let peer_addr = *peer_candidates.first().ok_or_else(|| {
+        Error::Transport("no peer candidate matches an available native path".into())
+    })?;
+    let mut probes = tokio::task::JoinSet::new();
+    let mut observations = Vec::new();
+    for path in &network.paths {
+        let candidates = path.reachable_candidates(&offer.candidates);
+        if candidates.is_empty() {
+            continue;
+        }
+        let socket = path.punch_socket.clone();
+        let mut receiver = socket.register_probe(&offer.token)?;
+        let token = offer.token;
+        let punch = config.punch;
+        let (observation, changes) = tokio::sync::watch::channel(None);
+        observations.push((path.endpoint.clone(), changes));
+        probes.spawn(async move {
+            for _ in 0..punch.attempts {
+                for candidate in &candidates {
+                    let _ = socket.send_probe_to(&token, *candidate).await;
+                }
+                if let Ok(Some(source)) =
+                    tokio::time::timeout(punch.interval, receiver.recv()).await
+                {
+                    let _ = socket.send_probe_to(&token, source).await;
+                    observation.send_replace(Some(source));
+                    if source.is_ipv6() {
+                        info!(%source, "IPv6 原生 UDP 可达性探测已确认");
+                    } else {
+                        info!(%source, "洞打通了，收到对端探测包");
+                    }
+                    // Keep sending through the full probe window for the other side.
+                }
+            }
+        });
     }
-
-    // ---- 6. 同时打洞 ----
-    info!(
-        candidates = peer_candidates.len(),
-        "开始打洞（双方必须同时在发，这是 NAT 的行为决定的）"
-    );
-    let (peer_addr, punch_confirmed) =
-        match simultaneous_open_any(&socket, &peer_candidates, &offer.token, &config.punch).await {
-            Ok(addr) => {
-                info!(%addr, "洞打通了，收到对端探测包");
-                (addr, true)
-            }
-            Err(err) => {
-                // 打洞没收到回应**不等于**连不上：
-                //
-                // - 我们发出去的探测包已经在本机 NAT 上建立了映射，这是关键的一半；
-                // - 对端可能已经收到了我们的包，只是它的回应还没到；
-                // - 有些情况下（比如对端是常驻服务、不再发包）本来就收不到回应。
-                //
-                // 所以这里不放弃，改为「按候选顺序逐个尝试连接」，让 QUIC 自己的
-                // 重传去撞那扇门。真正决定成败的是 QUIC 握手，而不是探测包。
-                warn!(
-                    error = %err,
-                    "打洞没收到对端回应，仍然会按候选顺序尝试直连"
-                );
-                warn!("{}", punch_diagnosis(mapping, public_addr));
-                (peer_candidates[0], false)
-            }
-        };
-
-    // ---- 7. 把同一个 socket 交给 QUIC ----
-    let std_socket = socket
-        .into_std()
-        .map_err(|err| Error::Transport(format!("取回 socket 失败: {err}")))?;
-    let endpoint = endpoint_from_socket(std_socket)?;
-    info!(local = %endpoint.local_addr()?, "QUIC 端点已就绪（复用打洞的端口）");
-
     Ok(DirectLink {
-        endpoint,
+        network,
         peer_addr,
-        punch_confirmed,
         peer_node_id: config.peer,
         peer_candidates,
-        local_candidates,
-        mapping,
-        public_addr,
-        local_port,
         signal,
+        probes,
+        observations,
     })
 }
 
-/// Bind and probe the desktop UDP socket, then transfer receive ownership to the QUIC
-/// endpoint's punch-aware adapter. STUN, punch sends, and QUIC all use this same socket.
+/// One family may fail without disabling the other. Fixed ports are bound once
+/// per family; ephemeral ports are independently advertised with their real value.
 pub async fn prepare_desktop_network(config: &DesktopNetworkConfig) -> Result<DesktopNetwork> {
-    let bind = SocketAddr::from(([0, 0, 0, 0], config.local_port));
-    let socket = UdpSocket::bind(bind)
-        .await
-        .map_err(|err| Error::Transport(format!("绑定本地 UDP 端口 {bind} 失败: {err}")))?;
+    let mut tasks = tokio::task::JoinSet::new();
+    for family in [AddressFamily::Ipv6, AddressFamily::Ipv4] {
+        if !config.families.enabled(family) {
+            continue;
+        }
+        let config = config.clone();
+        tasks.spawn(async move { (family, prepare_path(family, &config).await) });
+    }
+    let mut paths = Vec::new();
+    let mut diagnostics = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        let (family, result) = result.map_err(|e| Error::Transport(e.to_string()))?;
+        match result {
+            Ok(path) => {
+                diagnostics.push(format!(
+                    "{family} UDP {}；Host {}；STUN {}{}",
+                    path.local_addr,
+                    path.local_candidates
+                        .iter()
+                        .filter(|c| c.kind == crate::discovery::signal::CandidateKind::Host)
+                        .count(),
+                    path.public_addr
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|| "不可用（保留 Host）".into()),
+                    path.mapping
+                        .map(|m| format!("；IPv4 mapping {}", m.describe()))
+                        .unwrap_or_default()
+                ));
+                paths.push(path);
+            }
+            Err(error) => diagnostics.push(format!("{family} path unavailable: {error}")),
+        }
+    }
+    if paths.is_empty() {
+        return Err(Error::Transport(diagnostics.join("; ")));
+    }
+    paths.sort_by_key(|p| p.family);
+    let mut local_candidates: Vec<_> = paths
+        .iter()
+        .flat_map(|p| p.local_candidates.clone())
+        .collect();
+    dedup_candidates(&mut local_candidates);
+    sort_candidates(&mut local_candidates);
+    bound_candidates(&mut local_candidates);
+    Ok(DesktopNetwork {
+        paths,
+        local_candidates,
+        diagnostics,
+    })
+}
+fn bound_candidates(candidates: &mut Vec<Candidate>) {
+    let mut v6 = candidates.iter().copied().filter(|c| c.addr.is_ipv6());
+    let mut v4 = candidates.iter().copied().filter(|c| c.addr.is_ipv4());
+    let mut selected = Vec::new();
+    while selected.len() < crate::discovery::signal::MAX_CANDIDATES {
+        let next = if selected.len() % 2 == 0 {
+            v6.next().or_else(|| v4.next())
+        } else {
+            v4.next().or_else(|| v6.next())
+        };
+        let Some(next) = next else {
+            break;
+        };
+        selected.push(next);
+    }
+    sort_candidates(&mut selected);
+    *candidates = selected;
+}
+
+async fn prepare_path(family: AddressFamily, config: &DesktopNetworkConfig) -> Result<NetworkPath> {
+    let socket = UdpSocket::from_std(family::bind_udp(family.wildcard(config.local_port))?)?;
     let local_addr = socket.local_addr()?;
-    let (public_addr, mapping) =
-        probe_public_addr(&socket, &config.stun_servers, config.stun_timeout).await?;
-    let mut candidates = build_candidates(
+    let (public_addr, mapping, mapping_probe) = if family == AddressFamily::Ipv4 {
+        let report = probe_public_addr(&socket, &config.stun_servers, config.stun_timeout).await?;
+        let addr = report
+            .as_ref()
+            .and_then(|r| r.observations.first())
+            .map(|o| o.mapped_addr);
+        let mapping = report
+            .as_ref()
+            .map(|r| r.mapping)
+            .unwrap_or(MappingBehavior::Unknown);
+        (addr, Some(mapping), report)
+    } else {
+        let mut observation = None;
+        for spec in &config.stun_servers {
+            if let Ok(Ok(servers)) =
+                tokio::time::timeout(config.stun_timeout, resolve_server_for(spec, family)).await
+            {
+                for server in servers {
+                    match query_binding_with(&socket, server, config.stun_timeout).await {
+                        Ok(result) => {
+                            observation = Some(result.mapped_addr);
+                            break;
+                        }
+                        Err(error) => {
+                            debug!(%server, %error, "IPv6 STUN observation failed; Host candidates remain usable")
+                        }
+                    }
+                }
+            }
+            if observation.is_some() {
+                break;
+            }
+        }
+        (observation, None, None)
+    };
+    let mut candidates = build_candidates_for(
+        family,
         local_addr.port(),
         public_addr,
         &config.advertise,
@@ -444,23 +415,18 @@ pub async fn prepare_desktop_network(config: &DesktopNetworkConfig) -> Result<De
     );
     dedup_candidates(&mut candidates);
     sort_candidates(&mut candidates);
-
-    let std_socket = socket
-        .into_std()
-        .map_err(|err| Error::Transport(format!("取回 desktop UDP socket 失败: {err}")))?;
-    let (endpoint, punch_socket) = endpoint_from_socket_with_punch_dispatcher(std_socket)?;
+    let (endpoint, punch_socket) = endpoint_from_socket_with_punch_dispatcher(socket.into_std()?)?;
     if endpoint.local_addr()? != local_addr {
-        return Err(Error::Transport(
-            "desktop QUIC endpoint 未复用 STUN 探测时的 UDP 地址".into(),
-        ));
+        return Err(Error::Transport("QUIC socket changed after STUN".into()));
     }
-
-    Ok(DesktopNetwork {
+    Ok(NetworkPath {
+        family,
         endpoint,
         punch_socket,
         local_addr,
         local_candidates: candidates,
         mapping,
+        mapping_probe,
         public_addr,
     })
 }
@@ -501,17 +467,19 @@ async fn probe_public_addr(
     socket: &UdpSocket,
     stun_servers: &[String],
     stun_timeout: Duration,
-) -> Result<(Option<SocketAddr>, MappingBehavior)> {
+) -> Result<Option<MappingProbe>> {
     if stun_servers.is_empty() {
         info!("没有配置 STUN 服务器，跳过公网探测");
-        return Ok((None, MappingBehavior::Unknown));
+        return Ok(None);
     }
 
     let mut servers = Vec::new();
     for spec in stun_servers {
-        match resolve_server(spec).await {
-            Ok(addr) => servers.push(addr),
-            Err(err) => warn!(%spec, error = %err, "解析 STUN 服务器失败，跳过"),
+        match tokio::time::timeout(stun_timeout, resolve_server_for(spec, AddressFamily::Ipv4))
+            .await
+        {
+            Ok(Ok(addresses)) => servers.extend(addresses),
+            other => warn!(%spec, error = ?other, "解析 IPv4 STUN 服务器失败，跳过"),
         }
     }
 
@@ -526,11 +494,11 @@ async fn probe_public_addr(
                         "STUN mapping 观测"
                     );
                 }
-                let Some(first) = probe.observations.first() else {
+                if probe.observations.is_empty() {
                     continue;
-                };
+                }
                 if fallback.is_none() {
-                    fallback = Some((first.mapped_addr, probe.mapping));
+                    fallback = Some(probe.clone());
                 }
                 info!(
                     primary = %server,
@@ -540,77 +508,75 @@ async fn probe_public_addr(
                     "NAT mapping probing 结果"
                 );
                 if probe.evidence == MappingEvidence::Rfc5780 {
-                    return Ok((Some(first.mapped_addr), probe.mapping));
+                    return Ok(Some(probe));
                 }
             }
             Err(err) => warn!(%server, error = %err, "STUN mapping probing 失败，跳过"),
         }
     }
 
-    if let Some((public_addr, mapping)) = fallback {
+    if let Some(mut report) = fallback {
+        let public_addr = report.observations[0].mapped_addr;
+        let mapping = report.mapping;
         warn!(
             %public_addr,
             behavior = mapping.describe(),
             "没有充分 RFC 5780 行为发现证据，mapping 结果按证据不足处理"
         );
-        return Ok((Some(public_addr), MappingBehavior::Unknown));
+        report.mapping = MappingBehavior::Unknown;
+        return Ok(Some(report));
     }
 
     warn!("所有 STUN 服务器都没有响应，拿不到公网映射");
-    Ok((None, MappingBehavior::Unknown))
+    Ok(None)
 }
 
-/// 组装要报给信令服务器的候选地址。
+#[cfg(test)]
 fn build_candidates(
-    local_port: u16,
-    public_addr: Option<SocketAddr>,
+    port: u16,
+    public: Option<SocketAddr>,
     advertise: &[SocketAddr],
-    include_loopback: bool,
+    loopback: bool,
+) -> Vec<Candidate> {
+    build_candidates_for(AddressFamily::Ipv4, port, public, advertise, loopback)
+}
+fn build_candidates_for(
+    family: AddressFamily,
+    port: u16,
+    public: Option<SocketAddr>,
+    advertise: &[SocketAddr],
+    loopback: bool,
 ) -> Vec<Candidate> {
     let mut candidates = Vec::new();
-
-    if let Some(addr) = public_addr {
+    if let Some(addr) = public.filter(|a| family.accepts(*a)) {
         candidates.push(Candidate::reflexive(addr));
     }
-    for addr in advertise {
-        candidates.push(Candidate::reflexive(*addr));
+    for addr in advertise.iter().filter(|a| family.accepts(**a)) {
+        candidates.push(if family == AddressFamily::Ipv6 {
+            Candidate::host(*addr)
+        } else {
+            Candidate::reflexive(*addr)
+        });
     }
     for ip in local_ip_addresses() {
-        // IPv6 链路本地地址（fe80::/10）必须丢掉：它只在同一个二层网段内有效，
-        // 出了路由器就没有意义，而且还得带 scope id 才能用。留着只会把候选
-        // 列表撑得又长又没用（本机实测 11 个候选里有 8 个是这种东西）。
-        //
-        // 顺带一提：本机 socket 目前只绑 IPv4，所以就算留着 IPv6 全局地址也
-        // 用不上。等以后做双栈监听时再把它们放回来。
-        if matches!(ip, IpAddr::V6(v6) if v6.is_unicast_link_local()) {
-            continue;
+        let addr = SocketAddr::new(ip, port);
+        if family.accepts(addr) {
+            candidates.push(Candidate::host(addr));
         }
-        candidates.push(Candidate::host(SocketAddr::new(ip, local_port)));
     }
-    if include_loopback {
-        candidates.push(Candidate::host(SocketAddr::new(
-            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            local_port,
-        )));
+    if loopback {
+        candidates.push(Candidate::host(family.loopback(port)));
     }
-
     candidates
 }
-
-/// 只留下这个 socket 发得出去的候选地址。
-///
-/// 本机绑的是 IPv4，往 IPv6 地址发会直接失败，所以先按地址族筛一遍。
 fn filter_reachable(candidates: &[Candidate], local_addr: SocketAddr) -> Vec<SocketAddr> {
+    let family = AddressFamily::of(local_addr);
     let mut out = Vec::new();
     for candidate in candidates {
-        if candidate.addr.is_ipv4() != local_addr.is_ipv4() {
-            warn!(addr = %candidate.addr, "地址族不匹配，跳过该候选");
-            continue;
-        }
-        if candidate.addr.ip().is_unspecified() {
-            continue;
-        }
-        if !out.contains(&candidate.addr) {
+        if candidate.kind != crate::discovery::signal::CandidateKind::Relay
+            && family.accepts(candidate.addr)
+            && !out.contains(&candidate.addr)
+        {
             out.push(candidate.addr);
         }
     }
@@ -620,7 +586,7 @@ fn filter_reachable(candidates: &[Candidate], local_addr: SocketAddr) -> Vec<Soc
 /// 打洞没成功时，把可能的原因讲清楚。
 ///
 /// 不再当成致命错误——连接成不成由 QUIC 握手决定，这里只负责解释。
-fn punch_diagnosis(mapping: MappingBehavior, public_addr: Option<SocketAddr>) -> String {
+pub fn punch_diagnosis(mapping: MappingBehavior, public_addr: Option<SocketAddr>) -> String {
     let hint = match mapping {
         MappingBehavior::AddressAndPortDependent => {
             "本机是地址端口相关（对称型）NAT：用同一端口访问不同目标会拿到不同的公网端口。\
@@ -655,6 +621,122 @@ pub fn endpoint_for_socket(socket: StdUdpSocket) -> Result<quinn::Endpoint> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn independent_family_bind_failures_and_both_fail_closed() {
+        if !family::ipv6_test_available() {
+            return;
+        }
+        for blocked_family in [AddressFamily::Ipv4, AddressFamily::Ipv6] {
+            let held = family::bind_udp(blocked_family.wildcard(0)).unwrap();
+            let port = held.local_addr().unwrap().port();
+            let config = DesktopNetworkConfig {
+                local_port: port,
+                stun_servers: Vec::new(),
+                include_loopback: true,
+                ..Default::default()
+            };
+            let network = prepare_desktop_network(&config).await.unwrap();
+            assert_eq!(network.paths.len(), 1);
+            assert_ne!(network.paths[0].family, blocked_family);
+            assert_eq!(network.paths[0].local_addr.port(), port);
+            assert!(
+                network
+                    .local_candidates
+                    .iter()
+                    .all(|c| network.paths[0].family.accepts(c.addr))
+            );
+            let other = family::bind_udp(network.paths[0].family.wildcard(port));
+            assert!(other.is_err());
+            network.close();
+            network.wait_idle().await;
+        }
+        let v6 = family::bind_udp(AddressFamily::Ipv6.wildcard(0)).unwrap();
+        let port = v6.local_addr().unwrap().port();
+        let _v4 = family::bind_udp(AddressFamily::Ipv4.wildcard(port)).unwrap();
+        let config = DesktopNetworkConfig {
+            local_port: port,
+            stun_servers: Vec::new(),
+            ..Default::default()
+        };
+        let error = prepare_desktop_network(&config)
+            .await
+            .err()
+            .expect("both held paths must fail closed")
+            .to_string();
+        assert!(error.contains("IPv4"));
+        assert!(error.contains("IPv6"));
+    }
+    #[tokio::test]
+    async fn ipv6_stun_failure_retains_host_and_paths_advertise_their_own_real_port() {
+        if !family::ipv6_test_available() {
+            return;
+        }
+        let held = UdpSocket::from_std(family::bind_udp(AddressFamily::Ipv6.loopback(0)).unwrap())
+            .unwrap();
+        let config = DesktopNetworkConfig {
+            stun_servers: vec![held.local_addr().unwrap().to_string()],
+            stun_timeout: Duration::from_millis(10),
+            include_loopback: true,
+            advertise: vec!["[fd00::7]:7777".parse().unwrap()],
+            ..Default::default()
+        };
+        let network = prepare_desktop_network(&config).await.unwrap();
+        let v6 = network.path(AddressFamily::Ipv6).unwrap();
+        assert_eq!(v6.mapping, None);
+        assert_eq!(v6.public_addr, None);
+        assert!(
+            network
+                .local_candidates
+                .contains(&Candidate::host("[fd00::7]:7777".parse().unwrap()))
+        );
+        for path in &network.paths {
+            assert_eq!(path.endpoint.local_addr().unwrap(), path.local_addr);
+            assert_eq!(path.punch_socket.local_addr().unwrap(), path.local_addr);
+            assert!(path.local_candidates.contains(&Candidate::host(
+                path.family.loopback(path.local_addr.port())
+            )));
+            assert!(
+                path.local_candidates
+                    .iter()
+                    .all(|c| path.family.accepts(c.addr))
+            );
+        }
+        network.close();
+        network.wait_idle().await;
+    }
+    #[test]
+    fn candidate_budget_keeps_both_families_and_fills_unused_quota() {
+        let mut candidates = (1..=40)
+            .map(|port| Candidate::host(AddressFamily::Ipv4.loopback(port)))
+            .collect::<Vec<_>>();
+        bound_candidates(&mut candidates);
+        assert_eq!(candidates.len(), 32);
+        for port in 1..=40 {
+            candidates.push(Candidate::host(AddressFamily::Ipv6.loopback(port)));
+        }
+        sort_candidates(&mut candidates);
+        bound_candidates(&mut candidates);
+        assert_eq!(candidates.len(), 32);
+        assert_eq!(candidates.iter().filter(|c| c.addr.is_ipv6()).count(), 16);
+    }
+
+    #[test]
+    fn missing_family_and_unsupported_candidates_never_cross_path() {
+        let candidates = [
+            Candidate::host("[fd00::7]:9000".parse().unwrap()),
+            Candidate::host("127.0.0.1:9000".parse().unwrap()),
+            Candidate::host("[fe80::1]:9000".parse().unwrap()),
+            Candidate::host("[::ffff:127.0.0.1]:9000".parse().unwrap()),
+        ];
+        assert_eq!(
+            filter_reachable(&candidates, AddressFamily::Ipv4.wildcard(0)),
+            vec!["127.0.0.1:9000".parse::<SocketAddr>().unwrap()]
+        );
+        assert_eq!(
+            filter_reachable(&candidates, AddressFamily::Ipv6.wildcard(0)),
+            vec!["[fd00::7]:9000".parse::<SocketAddr>().unwrap()]
+        );
+    }
 
     #[test]
     fn 默认参数合理() {
@@ -670,20 +752,23 @@ mod tests {
     async fn desktop网络探测与quinn端点保持同一udp地址() {
         let config = DesktopNetworkConfig {
             local_port: 0,
+            families: NetworkFamilies::Ipv4Only,
             stun_servers: Vec::new(),
             stun_timeout: Duration::from_millis(20),
             advertise: Vec::new(),
             include_loopback: true,
         };
         let network = prepare_desktop_network(&config).await.unwrap();
-        let endpoint_addr = network.endpoint.local_addr().unwrap();
-        assert_eq!(network.local_addr, endpoint_addr);
+        let endpoint_addr = network.paths[0].endpoint.local_addr().unwrap();
+        assert_eq!(network.paths[0].local_addr, endpoint_addr);
         assert!(network.local_candidates.iter().any(|candidate| {
             candidate.addr
                 == SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, endpoint_addr.port()))
         }));
-        network.endpoint.close(0u32.into(), b"test complete");
-        network.endpoint.wait_idle().await;
+        network.paths[0]
+            .endpoint
+            .close(0u32.into(), b"test complete");
+        network.paths[0].endpoint.wait_idle().await;
     }
 
     #[test]

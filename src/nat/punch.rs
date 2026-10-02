@@ -135,6 +135,15 @@ pub async fn simultaneous_open_any(
         return Err(Error::Transport("没有可用的候选地址，无法打洞".into()));
     }
 
+    let family = crate::net::AddressFamily::of(socket.local_addr()?);
+    if candidates
+        .iter()
+        .any(|candidate| !family.accepts(*candidate))
+    {
+        return Err(Error::Transport(
+            "punch candidate/socket family mismatch".into(),
+        ));
+    }
     let probe = probe_packet(token);
     let mut buffer = vec![0u8; 2048];
 
@@ -156,6 +165,9 @@ pub async fn simultaneous_open_any(
 
             match tokio::time::timeout(remaining, socket.recv_from(&mut buffer)).await {
                 Ok(Ok((len, from))) => {
+                    if !family.accepts(from) {
+                        continue;
+                    }
                     let data = &buffer[..len];
 
                     if !is_probe(data) {

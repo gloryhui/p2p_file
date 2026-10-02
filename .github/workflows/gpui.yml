@@ -57,6 +57,10 @@ jobs:
         run: sudo ifconfig lo0 alias 127.0.0.2 up
       - name: Run full GUI library regressions
         run: "cargo test --locked --features gui --lib --target ${{ matrix.target }}"
+      - name: Run native IPv6 loopback regressions with capability diagnostics
+        run: "cargo test --locked --features gui ipv6 --lib --target ${{ matrix.target }} -- --nocapture"
+      - name: Run IPv6 CLI send regression
+        run: "cargo test --locked --test ipv6_cli_send --target ${{ matrix.target }} -- --nocapture"
       - name: Run GUI Clippy
         if: runner.os == 'Linux'
         run: cargo clippy --locked --features gui --all-targets --target ${{ matrix.target }} -- -D warnings

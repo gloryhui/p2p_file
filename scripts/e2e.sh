@@ -16,7 +16,21 @@
 set -euo pipefail
 
 PROFILE="debug"
-[[ "${1:-}" == "--release" ]] && PROFILE="release"
+NATIVE_FAMILY="ipv4-only"
+for option in "$@"; do
+    case "$option" in
+        --release) PROFILE="release" ;;
+        --ipv6) NATIVE_FAMILY="ipv6-only" ;;
+        *) echo "未知参数: $option" >&2; exit 1 ;;
+    esac
+done
+DIRECT_OPTIONS=(--ip-family "$NATIVE_FAMILY" --stun 127.0.0.1:9)
+if [[ "$NATIVE_FAMILY" == "ipv6-only" ]]; then
+    DIRECT_OPTIONS=(--ip-family ipv6-only --stun '[::1]:9')
+fi
+advertise_address() {
+    if [[ "$NATIVE_FAMILY" == "ipv6-only" ]]; then printf '[::1]:%s' "$1"; else printf '127.0.0.1:%s' "$1"; fi
+}
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$ROOT/target/$PROFILE/p2p_file"
@@ -53,7 +67,7 @@ wait_for() {
     return 1
 }
 
-step "准备：三个端口上的三个进程"
+step "准备：$NATIVE_FAMILY 原生 P2P，IPv4 信令和 TCP 目标"
 # 目标服务：一个纯回显 TCP 服务，模拟「家里那台机器上的 ssh / web」
 cat > "$WORK/target.py" <<'PY'
 import socket, threading
@@ -92,11 +106,11 @@ pass "两个身份：家=$HOME_ID 本机=$LAPTOP_ID"
 step "1. 「家里那台」先启动并常驻等待（此时对端还没上线）"
 mkdir -p "$WORK/recv"
 RUST_LOG=info "$BIN" --key-file "$WORK/home.key" --log info serve \
-    --signal 127.0.0.1:7000 \
+    --signal 127.0.0.1:7000 "${DIRECT_OPTIONS[@]}" \
     --allow "$LAPTOP_ID" \
     --forward 127.0.0.1:9999 \
     --recv-dir "$WORK/recv" \
-    --port 9101 \
+    --port 9101 --advertise "$(advertise_address 9101)" \
     --re-punch-after "$RE_PUNCH" > "$WORK/serve.log" 2>&1 &
 PIDS+=($!)
 
@@ -105,19 +119,19 @@ pass "serve 已常驻等待对端上线（没有超时退出）"
 
 step "2. 「本机」发起隧道：本地 2222 → 对端 9999"
 RUST_LOG=info "$BIN" --key-file "$WORK/laptop.key" --log info tunnel \
-    --signal 127.0.0.1:7000 \
+    --signal 127.0.0.1:7000 "${DIRECT_OPTIONS[@]}" \
     --peer "$HOME_ID" \
     --listen 127.0.0.1:2222 \
     --to 127.0.0.1:9999 \
-    --port 9102 > "$WORK/tunnel.log" 2>&1 &
+    --port 9102 --advertise "$(advertise_address 9102)" > "$WORK/tunnel.log" 2>&1 &
 TUNNEL_PID=$!
 PIDS+=($TUNNEL_PID)
 
-wait_for "$WORK/tunnel.log" "隧道已就绪" 60 || fail "隧道没能建立"
+wait_for "$WORK/tunnel.log" "本地转发已就绪" 60 || fail "本地隧道未能监听"
 if grep -qa "洞打通了" "$WORK/serve.log" "$WORK/tunnel.log"; then
     pass "打洞成功"
-elif grep -qa "直连已建立" "$WORK/tunnel.log"; then
-    pass "打洞未确认，但候选直连已建立"
+elif grep -qa "直连候选已准备" "$WORK/tunnel.log"; then
+    pass "打洞未确认；已准备候选，随后验证实际业务"
 else
     fail "既没有打洞成功，也没有候选直连建立证据"
 fi
@@ -142,15 +156,21 @@ blob = os.urandom(1_000_000)
 assert roundtrip(blob) == blob, "1MB 随机数据不对"
 PY
 pass "隧道转发正确（含 1MB 随机数据、多条并发连接）"
+if [[ "$NATIVE_FAMILY" == "ipv6-only" ]]; then
+    grep -qa 'family=IPv6' "$WORK/tunnel.log" || fail "实际已认证 winner 未报告 IPv6"
+else
+    grep -qa 'family=IPv4' "$WORK/tunnel.log" || fail "实际已认证 winner 未报告 IPv4"
+fi
+pass "实际业务使用已认证的 $NATIVE_FAMILY winner"
 
 step "2.25 纯网络测速（不读写文件、不经过文件协议）"
 RUST_LOG=info "$BIN" --key-file "$WORK/laptop.key" --log info speedtest \
-    --signal 127.0.0.1:7000 \
+    --signal 127.0.0.1:7000 "${DIRECT_OPTIONS[@]}" \
     --peer "$HOME_ID" \
     --duration 1 \
     --direction both \
     --block-size 65536 \
-    --port 9103 > "$WORK/speedtest.log" 2>&1 \
+    --port 9103 --advertise "$(advertise_address 9103)" > "$WORK/speedtest.log" 2>&1 \
     || fail "speedtest 没有完成"
 grep -Eq '^bytes:[[:space:]]+[1-9][0-9]*' "$WORK/speedtest.log" \
     || fail "speedtest 没有报告正数 bytes"
@@ -173,9 +193,9 @@ pass "隧道在宽限期后依然可用（空闲计时不会误拆活跃连接�
 step "3. 隧道还开着时直推文件（此时 serve 不会再打洞，走候选重试）"
 head -c 2000000 /dev/urandom > "$WORK/big.bin"
 RUST_LOG=info "$BIN" --key-file "$WORK/laptop.key" --log info push \
-    --signal 127.0.0.1:7000 \
+    --signal 127.0.0.1:7000 "${DIRECT_OPTIONS[@]}" \
     --peer "$HOME_ID" \
-    "$WORK/big.bin" --port 9105 > "$WORK/push.log" 2>&1
+    "$WORK/big.bin" --port 9105 --advertise "$(advertise_address 9105)" > "$WORK/push.log" 2>&1
 
 wait_for "$WORK/push.log" "发送完成" 30 || fail "推送没有完成"
 RECEIVED="$WORK/recv/big.bin"
@@ -193,13 +213,13 @@ wait_for "$WORK/serve.log" "重新打洞" 90 || fail "serve 没有在空闲后�
 pass "serve 空闲后已重新进入等待"
 
 RUST_LOG=info "$BIN" --key-file "$WORK/laptop.key" --log info tunnel \
-    --signal 127.0.0.1:7000 \
+    --signal 127.0.0.1:7000 "${DIRECT_OPTIONS[@]}" \
     --peer "$HOME_ID" \
     --listen 127.0.0.1:2223 \
     --to 127.0.0.1:9999 \
-    --port 9106 > "$WORK/tunnel2.log" 2>&1 &
+    --port 9106 --advertise "$(advertise_address 9106)" > "$WORK/tunnel2.log" 2>&1 &
 PIDS+=($!)
-wait_for "$WORK/tunnel2.log" "隧道已就绪" 60 || fail "第二次隧道没能建立"
+wait_for "$WORK/tunnel2.log" "本地转发已就绪" 60 || fail "第二次本地隧道未能监听"
 
 python3 - <<'PY' || fail "第二次隧道转发不正确"
 import socket
@@ -210,4 +230,28 @@ s.close()
 PY
 pass "第二次连接同样成功（隔一段时间再连也能通）"
 
-printf '\n\033[32m全部通过\033[0m\n'
+printf '\n\033[32m%s 全部通过\033[0m\n' "$NATIVE_FAMILY"
+
+# The default invocation validates both native families. Public IPv6 is not required.
+if [[ "$NATIVE_FAMILY" == "ipv4-only" ]]; then
+    cleanup
+    PIDS=()
+    if python3 - <<'PYV6'
+import socket, sys
+try:
+    with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as probe:
+        probe.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        probe.bind(("::1", 0))
+except OSError as exc:
+    if exc.errno in (97, 99, 49, 47, 10047, 10049):
+        print(f"SKIP IPv6 e2e: runner has no IPv6 capability: {exc}")
+        sys.exit(42)
+    raise
+PYV6
+    then
+        if [[ "$PROFILE" == "release" ]]; then "$0" --ipv6 --release; else "$0" --ipv6; fi
+    else
+        probe_rc=$?
+        [[ "$probe_rc" == 42 ]] || exit "$probe_rc"
+    fi
+fi

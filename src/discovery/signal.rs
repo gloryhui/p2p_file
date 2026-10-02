@@ -2274,6 +2274,57 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_candidate_roundtrip_and_signature_cover_the_full_native_address() {
+        let identity = Identity::generate();
+        let challenge = [9_u8; CHALLENGE_LEN];
+        let mut candidates = vec![
+            Candidate::host("[fd00::1]:9000".parse().unwrap()),
+            Candidate::host("[2001:db8::7]:9000".parse().unwrap()),
+            Candidate::host("127.0.0.1:9000".parse().unwrap()),
+        ];
+        let payload = register_payload(
+            &challenge,
+            identity.node_id(),
+            &identity.public_key_bytes(),
+            &candidates,
+        )
+        .unwrap();
+        let signature = identity.sign(&payload);
+        let message = SignalMessage::Register {
+            node_id: identity.node_id(),
+            public_key: identity.public_key_bytes(),
+            candidates: candidates.clone(),
+            signature: signature.to_bytes().to_vec(),
+        };
+        assert_eq!(
+            SignalMessage::decode(&message.encode().unwrap()).unwrap(),
+            message
+        );
+        candidates[0].addr = "[fd00::2]:9000".parse().unwrap();
+        let changed = register_payload(
+            &challenge,
+            identity.node_id(),
+            &identity.public_key_bytes(),
+            &candidates,
+        )
+        .unwrap();
+        assert!(
+            verify_signature(
+                &public_key_from_bytes(&identity.public_key_bytes()).unwrap(),
+                &changed,
+                &signature
+            )
+            .is_err()
+        );
+        candidates.push(candidates[0]);
+        dedup_candidates(&mut candidates);
+        sort_candidates(&mut candidates);
+        assert_eq!(candidates.len(), 3);
+        assert!(candidates[0].addr.is_ipv6());
+        assert!(candidates[1].addr.is_ipv6());
+    }
+
+    #[test]
     fn 候选排序_公网映射优先于中继() {
         let mut candidates = vec![
             candidate(CandidateKind::Relay, "10.0.0.1:1000"),

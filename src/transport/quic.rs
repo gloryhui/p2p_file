@@ -268,6 +268,12 @@ impl PunchSocketHandle {
         token: &PunchToken,
         destination: SocketAddr,
     ) -> io::Result<()> {
+        if !crate::net::AddressFamily::of(self.local_addr()?).accepts(destination) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "punch address family mismatch",
+            ));
+        }
         let packet = crate::nat::punch::probe_packet(token);
         let sent = self.io.send_to(&packet, destination).await?;
         if sent != packet.len() {
@@ -666,15 +672,25 @@ impl UdpPoller for PunchUdpPoller {
 /// 创建服务端端点，绑定到 `bind`。
 pub fn server_endpoint(bind: SocketAddr) -> Result<Endpoint> {
     install_crypto_provider();
-    Endpoint::server(server_config()?, bind)
-        .map_err(|err| Error::Transport(format!("绑定 {bind} 失败: {err}")))
+    Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server_config()?),
+        crate::net::family::bind_udp(bind)?,
+        Arc::new(quinn::TokioRuntime),
+    )
+    .map_err(|err| Error::Transport(format!("绑定 {bind} 失败: {err}")))
 }
 
 /// 创建客户端端点，绑定到 `bind`（通常写 `0.0.0.0:0`）。
 pub fn client_endpoint(bind: SocketAddr) -> Result<Endpoint> {
     install_crypto_provider();
-    let mut endpoint = Endpoint::client(bind)
-        .map_err(|err| Error::Transport(format!("绑定 {bind} 失败: {err}")))?;
+    let mut endpoint = Endpoint::new(
+        quinn::EndpointConfig::default(),
+        None,
+        crate::net::family::bind_udp(bind)?,
+        Arc::new(quinn::TokioRuntime),
+    )
+    .map_err(|err| Error::Transport(format!("绑定 {bind} 失败: {err}")))?;
     endpoint.set_default_client_config(client_config()?);
     Ok(endpoint)
 }
@@ -692,6 +708,23 @@ pub async fn connect(
     connecting
         .await
         .map_err(|err| Error::Transport(format!("与 {remote} 建立连接失败: {err}")))
+}
+
+/// Dedicated identity streams are already finished by existing CLI/Desktop
+/// initiators after Ready. Only the racing winner sends that FIN; responders
+/// must observe it before exposing capabilities, authorization or handlers.
+pub async fn await_identity_commit(recv: &mut quinn::RecvStream) -> Result<()> {
+    let mut byte = [0_u8; 1];
+    let next = tokio::time::timeout(APPLICATION_HANDSHAKE_TIMEOUT, recv.read(&mut byte))
+        .await
+        .map_err(|_| Error::Transport("identity winner commit timed out".into()))?
+        .map_err(|e| Error::Transport(e.to_string()))?;
+    if next.is_some() {
+        return Err(Error::Protocol(
+            "unexpected data on dedicated identity stream".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// **不安全**的证书校验器：一律放行。

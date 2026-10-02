@@ -321,7 +321,43 @@ $BIN --log info tunnel --signal $SIGNAL --peer $HOME_ID --listen 127.0.0.1:2222 
 
 - 对称型 NAT 的中继兜底（TURN / relay）。
 - UPnP / NAT-PMP 自动端口映射（`nat::portmap` 是空壳，暂时用 `--advertise` 手工替代）。
-- IPv6：目前只绑 IPv4。IPv6 通常没有 NAT，能直连就省掉大半麻烦，是下一步的优先项。
+
+## IPv6 原生直连与双栈竞速
+
+Desktop 和 CLI `serve/tunnel/push/speedtest` 默认分别建立 IPv4、IPv6 UDP path。
+IPv6 socket 在绑定前设置 `IPV6_V6ONLY`，不用 IPv4-mapped 地址。每族自己的 STUN、
+PunchToken 探测和 QUIC 使用同一个 socket；固定端口按族各绑定一次，`--port 0`
+时各自公告自己的实际随机端口。某一族绑定失败不会禁用另一族。
+
+IPv6 优先启动，IPv4 最多延后 200ms；候选并发、有数量和时间上限。竞速覆盖 QUIC、
+Ed25519 签名、TLS exporter binding 和 `Ready`，只在 winner 的专用身份流上发送 FIN。
+接收方确认 FIN 后才协商 Desktop 能力、Remote Auth 或启动 CLI 业务 handler；loser
+连接和探测注册会被回收。IPv6 QUIC 或 Ready 阶段黑洞都不会等完 IPv6 超时才尝试 IPv4。
+
+IPv6 global / ULA 是 Host 候选；IPv6 STUN Binding 只是补充地址观测，失败时仍保留
+Host。IPv4 的 RFC 5780 mapping 分类只使用 IPv4 样本。链路本地 scope-id、IPv4-mapped、
+未指定地址、多播地址不参与 P2P 候选。信令 TCP 可以走 IPv4，同时业务走 IPv6。
+
+```bash
+# 公网 IPv6 主机的手动公告；serve 与其余公网命令使用相同参数
+p2p_file serve --signal signal.example.com:7000 --allow <PEER_NODE_ID> \
+  --port 9000 --advertise '[YOUR_GLOBAL_IPV6]:9000' --ip-family ipv6-only
+
+# LAN send/recv 按指定地址族绑定
+p2p_file recv --listen '[::]:9000' --out-dir ./received
+p2p_file send ./file.bin '[PEER_IPV6]:9000'
+```
+
+`--ip-family dual-stack` 为默认；排障时可用 `ipv4-only` 或 `ipv6-only`。`stun` 命令
+分别报告两族 socket、Host、STUN observation，IPv6 不显示为 NAT EIM/ADM/APDM。
+GPUI 网络卡片显示本地 path 是否可用、peer 两族候选数量和最终已认证的 family/address。
+IPv6 地址只决定 transport，不代替 NodeId 身份、远程密码、单向 Trusted Device 或
+Tunnel 的 peer/target allowlist。
+
+IPv6 仍需要操作系统、路由器和云安全组允许相应 UDP 端口。没有 global IPv6 的网络可
+通过 IPv4 path 工作；跨网络公网 IPv6 是否可达需要两台真实主机验证。自动化覆盖原生
+IPv6 loopback 和可控黑洞，不代表已实测公网 IPv6 穿透。未实现 Relay/TURN、UPnP、
+NAT-PMP、PCP、link-local scope-id、Multipath QUIC。
 
 ## 局域网直连（不经过信令服务器）
 
