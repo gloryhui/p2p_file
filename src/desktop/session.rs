@@ -17,11 +17,18 @@ use crate::discovery::signal::{Candidate, CandidateKind, SignalMessage, Signalin
 use crate::error::{Error, Result};
 use crate::identity::{Identity, NodeId};
 use crate::nat::punch::{PunchConfig, PunchToken};
-use crate::net::{DesktopNetwork, DesktopNetworkConfig, prepare_desktop_network};
-use crate::transport::handshake::{handshake_initiator, handshake_responder};
+use crate::net::race::{ConnectionGuard, PreparedTransport};
+use crate::net::{
+    AddressFamily, DesktopNetwork, DesktopNetworkConfig, NetworkPath, prepare_desktop_network,
+};
+#[cfg(test)]
+use crate::transport::handshake::handshake_initiator;
+use crate::transport::handshake::handshake_responder;
+#[cfg(test)]
+use crate::transport::quic::connect as quic_connect;
 use crate::transport::quic::{
     ACCEPT_FIRST_BI_STREAM_TIMEOUT, APPLICATION_HANDSHAKE_TIMEOUT, ChannelBinding,
-    QUIC_HANDSHAKE_TIMEOUT, connect as quic_connect,
+    QUIC_HANDSHAKE_TIMEOUT,
 };
 
 use super::remote_auth::{AuthContext, RemoteAuthorization, RemoteVerifier, SecretPassword};
@@ -35,7 +42,7 @@ use super::network_state::{
 const COMMAND_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 128;
 const SESSION_INPUT_CAPACITY: usize = 64;
-const MAX_CANDIDATES: usize = 16;
+const MAX_CANDIDATES: usize = crate::discovery::signal::MAX_CANDIDATES;
 const MAX_RECONNECT_PROBES_PER_PEER: usize = 2;
 // Bound waiting across signaling, punching and application authentication.
 const TUNNEL_PEER_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -90,6 +97,12 @@ pub enum TunnelRuntimeState {
 
 #[derive(Clone, Debug)]
 pub enum SessionEvent {
+    NetworkPaths(String),
+    PeerPath {
+        peer: NodeId,
+        generation: u64,
+        detail: String,
+    },
     TrustedDevicesChanged(Vec<super::trusted_devices::TrustedDevice>),
     Lifecycle(NetworkLifecycle),
     PeerState {
@@ -520,7 +533,7 @@ enum SessionInput {
         generation: u64,
         transport: usize,
     },
-    Incoming(Box<quinn::Incoming>),
+    Incoming(AddressFamily, Box<quinn::Incoming>),
     SignalConnected {
         generation: u64,
         result: Result<SignalingClient>,
@@ -557,7 +570,7 @@ struct ReconnectProbe {
     generation: u64,
     candidates: Vec<Candidate>,
     token: PunchToken,
-    receiver: crate::transport::quic::PunchProbeReceiver,
+    receivers: Vec<crate::transport::quic::PunchProbeReceiver>,
     deadline: Pin<Box<Sleep>>,
 }
 fn poll_reconnect_probes(
@@ -566,8 +579,10 @@ fn poll_reconnect_probes(
 ) -> Poll<(NodeId, usize, bool)> {
     for (peer, watches) in probes {
         for (index, watch) in watches.iter_mut().enumerate() {
-            if let Poll::Ready(source) = watch.receiver.poll_recv(cx) {
-                return Poll::Ready((*peer, index, source.is_some()));
+            for receiver in &mut watch.receivers {
+                if let Poll::Ready(Some(_)) = receiver.poll_recv(cx) {
+                    return Poll::Ready((*peer, index, true));
+                }
             }
             if watch.deadline.as_mut().poll(cx).is_ready() {
                 return Poll::Ready((*peer, index, false));
@@ -702,14 +717,19 @@ async fn run_session(
     let mut short_queries: HashMap<ShortId, (Option<SecretPassword>, time::Instant)> =
         HashMap::new();
     let local_node = identity.node_id();
-    let endpoint = network.endpoint.clone();
     let (input_tx, mut inputs) = mpsc::channel(SESSION_INPUT_CAPACITY);
-    let accept_endpoint = endpoint.clone();
-    let accept_inputs = input_tx.clone();
     let mut session_tasks = JoinSet::new();
-    session_tasks.spawn(async move {
-        accept_incoming_loop(accept_endpoint, accept_inputs).await;
-    });
+    let _ = events
+        .send(SessionEvent::NetworkPaths(network.diagnostics.join("; ")))
+        .await;
+    for path in &network.paths {
+        let endpoint = path.endpoint.clone();
+        let family = path.family;
+        let accept_inputs = input_tx.clone();
+        session_tasks.spawn(async move {
+            accept_incoming_loop(endpoint, family, accept_inputs).await;
+        });
+    }
 
     let semaphore = Arc::new(Semaphore::new(MAX_PENDING_PEERS));
     let mut peer_tasks = JoinSet::new();
@@ -749,8 +769,7 @@ async fn run_session(
     let mut forced_tunnel_errors: HashMap<String, String> = HashMap::new();
     // Candidate sets are bound to the same peer generation as authenticated connections.
     let mut peer_candidates: HashMap<NodeId, (u64, Vec<Candidate>)> = HashMap::new();
-    let mut pending_inbound: HashMap<(NodeId, u64), oneshot::Sender<quinn::Incoming>> =
-        HashMap::new();
+    let mut pending_inbound: HashMap<(NodeId, u64), mpsc::Sender<quinn::Incoming>> = HashMap::new();
     let mut queued_lookups: VecDeque<(NodeId, u64)> = VecDeque::new();
     let mut signal: Option<SignalingClient> = None;
     let mut signal_server = config.signal_server;
@@ -1720,15 +1739,22 @@ async fn run_session(
                             if watches.len() >= MAX_RECONNECT_PROBES_PER_PEER {
                                 watches.pop_front();
                             }
-                            if let Ok(receiver) = network
-                                .punch_socket
-                                .register_peer_probe(&token, node_id, generation)
-                            {
+                            let receivers = network
+                                .paths
+                                .iter()
+                                .filter(|path| !path.reachable_candidates(&candidates).is_empty())
+                                .filter_map(|path| {
+                                    path.punch_socket
+                                        .register_peer_probe(&token, node_id, generation)
+                                        .ok()
+                                })
+                                .collect::<Vec<_>>();
+                            if !receivers.is_empty() {
                                 watches.push_back(ReconnectProbe {
                                     generation,
                                     candidates,
                                     token,
-                                    receiver,
+                                    receivers,
                                     deadline: Box::pin(time::sleep(
                                         PEER_PUNCH_CONFIG.interval * PEER_PUNCH_CONFIG.attempts,
                                     )),
@@ -1949,10 +1975,13 @@ async fn run_session(
                     }
                 }
             }
-            Wake::Input(Some(SessionInput::Incoming(incoming))) => {
+            Wake::Input(Some(SessionInput::Incoming(family, incoming))) => {
                 let incoming = *incoming;
                 let remote = incoming.remote_address();
-                let Some((peer, generation)) = network.punch_socket.claim_authorized_peer(remote)
+                let Some((peer, generation)) = network
+                    .path(family)
+                    .and_then(|path| path.punch_socket.claim_authorized_peer(remote))
+                    .or_else(|| pending_ipv6_route(remote, local_node, &peers, &peer_candidates))
                 else {
                     incoming.refuse();
                     continue;
@@ -1961,12 +1990,12 @@ async fn run_session(
                     incoming.refuse();
                     continue;
                 }
-                let Some(waiting) = pending_inbound.remove(&(peer, generation)) else {
+                let Some(waiting) = pending_inbound.get(&(peer, generation)) else {
                     incoming.refuse();
                     continue;
                 };
-                if let Err(incoming) = waiting.send(incoming) {
-                    incoming.refuse();
+                if let Err(error) = waiting.try_send(incoming) {
+                    error.into_inner().refuse();
                 }
             }
             Wake::Input(Some(SessionInput::PeerProgress {
@@ -1996,6 +2025,18 @@ async fn run_session(
                     connection.close(0u32.into(), b"duplicate or stale peer generation");
                     continue;
                 }
+                let _ = events
+                    .send(SessionEvent::PeerPath {
+                        peer,
+                        generation,
+                        detail: format!(
+                            "对端 {} 已认证 transport：{} {}",
+                            peer.short(),
+                            AddressFamily::of(connection.remote_address()),
+                            connection.remote_address()
+                        ),
+                    })
+                    .await;
                 peer_attempts.remove(&peer);
                 if credential_retries.remove(&peer) {
                     connection.close(
@@ -2316,10 +2357,10 @@ async fn run_session(
                     generation,
                     candidates,
                     token,
-                    receiver,
+                    receivers,
                     ..
                 } = probe;
-                drop(receiver); // Synchronously revoke the old generation's source/token route.
+                drop(receivers); // Synchronously revoke the old generation's source/token route.
                 if !ready
                     || !peers.is_current(peer, generation)
                     || !matches!(
@@ -2572,12 +2613,12 @@ async fn run_session(
     for (_, (_, connection)) in connections.drain() {
         connection.close(0u32.into(), b"desktop session shutdown");
     }
-    endpoint.close(0u32.into(), b"desktop session shutdown");
+    network.close();
     session_tasks.abort_all();
     peer_tasks.abort_all();
     while peer_tasks.join_next().await.is_some() {}
     while session_tasks.join_next().await.is_some() {}
-    let _ = time::timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
+    let _ = time::timeout(Duration::from_secs(1), network.wait_idle()).await;
 }
 
 fn retire_peer_listeners(
@@ -2889,10 +2930,42 @@ async fn emit_peer_state(
         .await;
 }
 
-async fn accept_incoming_loop(endpoint: quinn::Endpoint, inputs: mpsc::Sender<SessionInput>) {
+/// A signed IPv6 candidate is only a routing hint for a bounded pending attempt,
+/// never an identity or authorization. Full TLS-bound Ed25519 authentication of
+/// the expected NodeId follows. IPv4 and unknown/ambiguous sources still need a probe.
+fn pending_ipv6_route(
+    remote: SocketAddr,
+    local: NodeId,
+    peers: &PeerRegistry,
+    candidates: &HashMap<NodeId, (u64, Vec<Candidate>)>,
+) -> Option<(NodeId, u64)> {
+    if !remote.is_ipv6() || !crate::net::family::usable_address(remote) {
+        return None;
+    }
+    let mut matches = candidates
+        .iter()
+        .filter_map(|(peer, (generation, addresses))| {
+            (!should_initiate_quic(local, *peer)
+                && peers.is_current(*peer, *generation)
+                && matches!(
+                    peers.state(*peer),
+                    Some(PeerLifecycle::Punching | PeerLifecycle::Authenticating)
+                )
+                && addresses.iter().any(|candidate| candidate.addr == remote))
+            .then_some((*peer, *generation))
+        });
+    let matched = matches.next()?;
+    matches.next().is_none().then_some(matched)
+}
+
+async fn accept_incoming_loop(
+    endpoint: quinn::Endpoint,
+    family: AddressFamily,
+    inputs: mpsc::Sender<SessionInput>,
+) {
     while let Some(incoming) = endpoint.accept().await {
         if inputs
-            .send(SessionInput::Incoming(Box::new(incoming)))
+            .send(SessionInput::Incoming(family, Box::new(incoming)))
             .await
             .is_err()
         {
@@ -2924,7 +2997,7 @@ async fn start_peer_attempt(
     inputs: &mpsc::Sender<SessionInput>,
     semaphore: &Arc<Semaphore>,
     peers: &mut PeerRegistry,
-    pending_inbound: &mut HashMap<(NodeId, u64), oneshot::Sender<quinn::Incoming>>,
+    pending_inbound: &mut HashMap<(NodeId, u64), mpsc::Sender<quinn::Incoming>>,
     tasks: &mut JoinSet<()>,
     auth: AuthContext,
     verifier: Option<RemoteVerifier>,
@@ -2967,6 +3040,24 @@ async fn start_peer_attempt(
         .filter(|candidate| candidate.kind != CandidateKind::Relay)
         .collect::<Vec<_>>();
     let reachable = network.reachable_candidates(&filtered);
+    let _ = events
+        .send(SessionEvent::PeerPath {
+            peer,
+            generation,
+            detail: format!(
+                "对端 {} 候选：IPv6 {} / IPv4 {}；本机可用路径 {}",
+                peer.short(),
+                filtered.iter().filter(|c| c.addr.is_ipv6()).count(),
+                filtered.iter().filter(|c| c.addr.is_ipv4()).count(),
+                network
+                    .paths
+                    .iter()
+                    .map(|p| p.family.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            ),
+        })
+        .await;
     if reachable.is_empty() {
         let detail = "对端候选地址与本机 UDP 地址族不匹配".to_owned();
         peers.transition(peer, generation, PeerLifecycle::Failed(detail.clone()));
@@ -2985,20 +3076,24 @@ async fn start_peer_attempt(
     }
     emit_peer_state(events, peer, generation, PeerLifecycle::Punching).await;
     emit_lifecycle(events, NetworkLifecycle::Punching { peer }).await;
-    let (inbound_tx, inbound_rx) = oneshot::channel();
+    let (inbound_tx, inbound_rx) = mpsc::channel(MAX_CANDIDATES);
     pending_inbound.insert((peer, generation), inbound_tx);
     let input_sender = inputs.clone();
-    let endpoint = network.endpoint.clone();
-    let punch_socket = network.punch_socket.clone();
+    let paths: Vec<_> = network
+        .paths
+        .iter()
+        .filter_map(|path| {
+            let candidates = path.reachable_candidates(&filtered);
+            (!candidates.is_empty()).then(|| (path.clone(), candidates))
+        })
+        .collect();
     let attempt = tasks.spawn(async move {
         let result = run_peer_attempt(
             peer,
             generation,
             local_node,
             identity,
-            endpoint,
-            punch_socket,
-            reachable,
+            paths,
             token,
             inbound_rx,
             permit,
@@ -3027,23 +3122,15 @@ async fn run_peer_attempt(
     generation: u64,
     local_node: NodeId,
     identity: Identity,
-    endpoint: quinn::Endpoint,
-    punch_socket: crate::transport::quic::PunchSocketHandle,
-    candidates: Vec<SocketAddr>,
+    paths: Vec<(NetworkPath, Vec<SocketAddr>)>,
     token: PunchToken,
-    inbound: oneshot::Receiver<quinn::Incoming>,
+    inbound: mpsc::Receiver<quinn::Incoming>,
     _pending_permit: tokio::sync::OwnedSemaphorePermit,
     inputs: mpsc::Sender<SessionInput>,
     auth: AuthContext,
     verifier: Option<RemoteVerifier>,
     password: Option<SecretPassword>,
 ) -> std::result::Result<(), String> {
-    let mut probe_events = punch_socket
-        .register_peer_probe(&token, peer, generation)
-        .map_err(|error| error.to_string())?;
-    let remote = punch_candidates(&punch_socket, &mut probe_events, &candidates, &token)
-        .await
-        .map_err(|error| error.to_string())?;
     let _ = inputs
         .send(SessionInput::PeerProgress {
             peer,
@@ -3051,22 +3138,13 @@ async fn run_peer_attempt(
             state: PeerLifecycle::Authenticating,
         })
         .await;
-
-    let connection = if should_initiate_quic(local_node, peer) {
-        authenticate_outgoing(&endpoint, remote, &identity, peer).await?
-    } else {
-        let incoming = time::timeout(
-            QUIC_HANDSHAKE_TIMEOUT + APPLICATION_HANDSHAKE_TIMEOUT,
-            inbound,
-        )
-        .await
-        .map_err(|_| "打洞确认后未收到发起方的 QUIC 连接".to_owned())?
-        .map_err(|_| "入站 QUIC 等待已取消".to_owned())?;
-        // The dispatcher already checked this incoming source against this peer's
-        // live token and generation. Multiple valid local/public paths may race;
-        // the responder's first probe source need not be the dialer's chosen path.
-        authenticate_incoming(incoming, &identity, peer).await?
-    };
+    let connection = race_peer_paths(
+        paths, token, peer, generation, local_node, identity, inbound,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let guard = ConnectionGuard::new(connection);
+    let connection = guard.connection();
 
     let _ = inputs
         .send(SessionInput::PeerProgress {
@@ -3076,7 +3154,7 @@ async fn run_peer_attempt(
         })
         .await;
     let capabilities =
-        super::protocol::negotiate(&connection, should_initiate_quic(local_node, peer))
+        super::protocol::negotiate(connection, should_initiate_quic(local_node, peer))
             .await
             .map_err(|error| error.to_string())?;
 
@@ -3090,7 +3168,7 @@ async fn run_peer_attempt(
     let authorization = match verifier {
         Some(verifier) => {
             auth.authorize_session(
-                &connection,
+                connection,
                 should_initiate_quic(local_node, peer),
                 local_node,
                 peer,
@@ -3117,10 +3195,118 @@ async fn run_peer_attempt(
             capabilities,
             authorization: authorization.authorization,
             control: authorization.control.map(Box::new),
-            connection,
+            connection: guard.release(),
         })
         .await
         .map_err(|_| "desktop session 已关闭".to_owned())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn race_peer_paths(
+    paths: Vec<(NetworkPath, Vec<SocketAddr>)>,
+    token: PunchToken,
+    peer: NodeId,
+    generation: u64,
+    local: NodeId,
+    identity: Identity,
+    mut inbound: mpsc::Receiver<quinn::Incoming>,
+) -> Result<quinn::Connection> {
+    let initiator = should_initiate_quic(local, peer);
+    // Registration is synchronous and per path, before awaiting probes or any incoming connection.
+    let mut routes = Vec::new();
+    for (path, candidates) in paths {
+        let receiver = path
+            .punch_socket
+            .register_peer_probe(&token, peer, generation)?;
+        routes.push((path, candidates, receiver));
+    }
+    if initiator {
+        let mut tasks = JoinSet::new();
+        let has_v6 = routes
+            .iter()
+            .any(|(p, _, _)| p.family == AddressFamily::Ipv6);
+        for (path, candidates, mut receiver) in routes {
+            let identity = identity.clone();
+            tasks.spawn(async move {
+                if has_v6 && path.family == AddressFamily::Ipv4 {
+                    time::sleep(crate::net::race::FAMILY_STAGGER).await;
+                }
+                let remote = if path.family == AddressFamily::Ipv6 {
+                    match time::timeout(
+                        crate::net::race::FAMILY_STAGGER,
+                        punch_candidates(&path.punch_socket, &mut receiver, &candidates, &token),
+                    )
+                    .await
+                    {
+                        Ok(Ok(remote)) => remote,
+                        _ => candidates[0], // IPv6 QUIC still verifies NodeId/TLS; a probe is optional.
+                    }
+                } else {
+                    punch_candidates(&path.punch_socket, &mut receiver, &candidates, &token).await?
+                };
+                let mut ordered = vec![remote];
+                for candidate in candidates {
+                    if !ordered.contains(&candidate) {
+                        ordered.push(candidate);
+                    }
+                }
+                let mut dials = JoinSet::new();
+                for (index, remote) in ordered.into_iter().enumerate() {
+                    let identity = identity.clone();
+                    let endpoint = path.endpoint.clone();
+                    dials.spawn(async move {
+                        time::sleep(crate::net::race::CANDIDATE_STAGGER * index as u32).await;
+                        time::timeout(
+                            crate::net::race::PATH_TIMEOUT,
+                            PreparedTransport::dial(&endpoint, remote, &identity, peer),
+                        )
+                        .await
+                        .map_err(|_| {
+                            Error::Transport(format!("{remote} authenticated path timeout"))
+                        })?
+                    });
+                }
+                crate::net::race::select_prepared(dials).await
+            });
+        }
+        return crate::net::race::finish_prepared_race(tasks).await;
+    }
+    let mut probes = JoinSet::new();
+    for (path, candidates, mut receiver) in routes {
+        probes.spawn(async move {
+            let _ = punch_candidates(&path.punch_socket, &mut receiver, &candidates, &token).await;
+            // Retain the token/source route even after a successful probe; Quinn's
+            // incoming event is routed later by the generation-fenced actor.
+            std::future::pending::<()>().await;
+            drop(receiver);
+        });
+    }
+    let mut authentication = JoinSet::new();
+    let deadline = time::sleep(
+        QUIC_HANDSHAKE_TIMEOUT + APPLICATION_HANDSHAKE_TIMEOUT + Duration::from_secs(6),
+    );
+    tokio::pin!(deadline);
+    let result = loop {
+        tokio::select! {
+            incoming = inbound.recv() => {
+                let Some(incoming) = incoming else { break Err(Error::Transport("incoming generation retired".into())); };
+                if authentication.len() >= MAX_CANDIDATES { incoming.refuse(); continue; }
+                let identity = identity.clone();
+                authentication.spawn(async move {
+                    authenticate_incoming(incoming, &identity, peer).await.map(ConnectionGuard::new)
+                });
+            }
+            result = authentication.join_next(), if !authentication.is_empty() => {
+                if let Some(Ok(Ok(winner))) = result { break Ok(winner); }
+            }
+            _ = &mut deadline => break Err(Error::Transport("all incoming paths timed out".into())),
+        }
+    };
+    probes.abort_all();
+    authentication.abort_all();
+    while probes.join_next().await.is_some() {}
+    while authentication.join_next().await.is_some() {}
+    result.map(ConnectionGuard::release)
 }
 
 async fn punch_candidates(
@@ -3155,6 +3341,7 @@ async fn punch_candidates(
     )))
 }
 
+#[cfg(test)]
 async fn authenticate_outgoing(
     endpoint: &quinn::Endpoint,
     remote: SocketAddr,
@@ -3202,8 +3389,9 @@ async fn authenticate_incoming(
         .await
         .map_err(|_| "入站 QUIC 握手超时".to_owned())?
         .map_err(|error| error.to_string())?;
-    let binding =
-        ChannelBinding::from_connection(&connection).map_err(|error| error.to_string())?;
+    let guard = ConnectionGuard::new(connection);
+    let connection = guard.connection();
+    let binding = ChannelBinding::from_connection(connection).map_err(|error| error.to_string())?;
     let (mut send, mut recv) =
         time::timeout(ACCEPT_FIRST_BI_STREAM_TIMEOUT, connection.accept_bi())
             .await
@@ -3225,7 +3413,10 @@ async fn authenticate_incoming(
             outcome.peer_node_id.short()
         ));
     }
-    Ok(connection)
+    crate::transport::quic::await_identity_commit(&mut recv)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(guard.release())
 }
 
 #[cfg(test)]
@@ -3278,6 +3469,524 @@ mod tests {
         .await
         .unwrap();
     }
+
+    #[tokio::test]
+    async fn ipv6_desktop_responder_authenticates_password_without_any_punch_response() {
+        use crate::net::{NetworkFamilies, family::ipv6_test_available};
+        if !ipv6_test_available() {
+            return;
+        }
+        let (signal, server) = start_local_server().await;
+        let desktop = Identity::generate();
+        let mut client = Identity::generate();
+        while !should_initiate_quic(client.node_id(), desktop.node_id()) {
+            client = Identity::generate();
+        }
+        let mut config = auth_config(signal);
+        config.network.families = NetworkFamilies::Ipv6Only;
+        let (handle, mut events) = spawn(desktop.clone(), config).unwrap();
+        wait_signal_online(&mut events).await;
+        // A normal Quinn client never interprets/responds to PunchToken packets.
+        let endpoint = crate::transport::quic::client_endpoint("[::1]:0".parse().unwrap()).unwrap();
+        let mut signaling = SignalingClient::connect_with_events(
+            &signal.to_string(),
+            &client,
+            vec![Candidate::host(endpoint.local_addr().unwrap())],
+        )
+        .await
+        .unwrap();
+        let offer = signaling
+            .resolve_peer(desktop.node_id(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = events.recv().await {
+                if matches!(event, SessionEvent::PeerState { peer, state: PeerLifecycle::Authenticating, .. } if peer == client.node_id()) { return; }
+            }
+            panic!("desktop stopped before pending attempt");
+        }).await.unwrap();
+        let connection = crate::net::race::authenticated_race(
+            offer
+                .candidates
+                .iter()
+                .filter(|c| c.addr.is_ipv6())
+                .map(|c| (endpoint.clone(), c.addr))
+                .collect(),
+            &client,
+            desktop.node_id(),
+        )
+        .await
+        .unwrap();
+        let capabilities = super::super::protocol::negotiate(&connection, true)
+            .await
+            .unwrap();
+        let authorization = AuthContext::default()
+            .authorize_session(
+                &connection,
+                true,
+                client.node_id(),
+                desktop.node_id(),
+                test_verifier(),
+                Some(test_password()),
+                capabilities,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            authorization.authorization.outbound,
+            super::super::remote_auth::AuthorizationGrant::password(true)
+        );
+        assert!(!authorization.authorization.inbound_authorized());
+        wait_grants(
+            &mut events,
+            client.node_id(),
+            RemoteAuthorization {
+                inbound: super::super::remote_auth::AuthorizationGrant::password(true),
+                outbound: Default::default(),
+            },
+        )
+        .await;
+        assert!(
+            inspect(&handle).await[&client.node_id()]
+                .1
+                .remote_address()
+                .is_ipv6()
+        );
+        connection.close(0u32.into(), b"done");
+        handle.shutdown();
+        drop(handle);
+        endpoint.close(0u32.into(), b"done");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ipv6_quic_completes_when_peer_never_answers_punch_probes() {
+        use crate::net::{NetworkFamilies, family::ipv6_test_available};
+        if !ipv6_test_available() {
+            return;
+        }
+        let local = Identity::generate();
+        let mut remote = Identity::generate();
+        while !should_initiate_quic(local.node_id(), remote.node_id()) {
+            remote = Identity::generate();
+        }
+        let peer = remote.node_id();
+        // Ordinary Quinn endpoint ignores our PunchToken datagrams; only QUIC is answered.
+        let endpoint = crate::transport::quic::server_endpoint("[::1]:0".parse().unwrap()).unwrap();
+        let address = endpoint.local_addr().unwrap();
+        let (committed, mut commits) = mpsc::channel(1);
+        let server_endpoint = endpoint.clone();
+        let responder = tokio::spawn(async move {
+            let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+            let guard = ConnectionGuard::new(connection);
+            let binding = ChannelBinding::from_connection(guard.connection()).unwrap();
+            let (mut send, mut recv) = guard.connection().accept_bi().await.unwrap();
+            let outcome = handshake_responder(&mut send, &mut recv, &remote, &binding)
+                .await
+                .unwrap();
+            let _ = send.finish();
+            crate::transport::quic::await_identity_commit(&mut recv)
+                .await
+                .unwrap();
+            committed.send(outcome.peer_node_id).await.unwrap();
+            let _ = guard.connection().closed().await;
+        });
+        let network = prepare_desktop_network(&DesktopNetworkConfig {
+            families: NetworkFamilies::Ipv6Only,
+            stun_servers: Vec::new(),
+            include_loopback: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let (_tx, incoming) = mpsc::channel(1);
+        let started = time::Instant::now();
+        let connection = time::timeout(
+            Duration::from_secs(3),
+            race_peer_paths(
+                vec![(network.paths[0].clone(), vec![address])],
+                PunchToken::random(),
+                peer,
+                1,
+                local.node_id(),
+                local.clone(),
+                incoming,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(connection.remote_address().is_ipv6());
+        assert_eq!(
+            time::timeout(Duration::from_secs(2), commits.recv())
+                .await
+                .unwrap(),
+            Some(local.node_id())
+        );
+        connection.close(0u32.into(), b"done");
+        network.close();
+        endpoint.close(0u32.into(), b"done");
+        responder.await.unwrap();
+        network.wait_idle().await;
+    }
+
+    #[test]
+    fn pending_ipv6_candidate_is_only_a_unique_current_generation_routing_hint() {
+        let local = Identity::generate().node_id();
+        let mut peer = Identity::generate().node_id();
+        while should_initiate_quic(local, peer) {
+            peer = Identity::generate().node_id();
+        }
+        let mut peers = PeerRegistry::default();
+        let BeginPeerAttempt::Started(generation) = peers.begin_attempt(peer) else {
+            panic!("start")
+        };
+        peers.transition(peer, generation, PeerLifecycle::Authenticating);
+        let address = "[::1]:9000".parse().unwrap();
+        let mut candidates = HashMap::from([(peer, (generation, vec![Candidate::host(address)]))]);
+        assert_eq!(
+            pending_ipv6_route(address, local, &peers, &candidates),
+            Some((peer, generation))
+        );
+        assert_eq!(
+            pending_ipv6_route("[::1]:9001".parse().unwrap(), local, &peers, &candidates),
+            None
+        );
+        assert_eq!(
+            pending_ipv6_route(
+                "127.0.0.1:9000".parse().unwrap(),
+                local,
+                &peers,
+                &candidates
+            ),
+            None
+        );
+        let mut other = Identity::generate().node_id();
+        while should_initiate_quic(local, other) || other == peer || other == local {
+            other = Identity::generate().node_id();
+        }
+        let BeginPeerAttempt::Started(other_generation) = peers.begin_attempt(other) else {
+            panic!("other")
+        };
+        peers.transition(other, other_generation, PeerLifecycle::Authenticating);
+        candidates.insert(other, (other_generation, vec![Candidate::host(address)]));
+        assert_eq!(
+            pending_ipv6_route(address, local, &peers, &candidates),
+            None,
+            "ambiguous source is not a routing hint"
+        );
+        candidates.remove(&other);
+        candidates.get_mut(&peer).unwrap().0 += 1;
+        assert_eq!(
+            pending_ipv6_route(address, local, &peers, &candidates),
+            None
+        );
+        candidates.get_mut(&peer).unwrap().0 = generation;
+        peers.transition(
+            peer,
+            generation,
+            PeerLifecycle::Connected(RemoteAuthorization::default()),
+        );
+        assert_eq!(
+            pending_ipv6_route(address, local, &peers, &candidates),
+            None
+        );
+        // A routing hint itself granted neither password nor trusted permission.
+        assert_eq!(
+            peers.state(peer),
+            Some(&PeerLifecycle::Connected(RemoteAuthorization::default()))
+        );
+    }
+
+    #[tokio::test]
+    async fn ipv6_only_concurrent_desktop_requests_publish_one_verified_transport() {
+        use crate::net::{NetworkFamilies, family::ipv6_test_available};
+        if !ipv6_test_available() {
+            return;
+        }
+        let (signal, server) = start_local_server().await;
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let mut ca = local_config(signal);
+        ca.network.families = NetworkFamilies::Ipv6Only;
+        let cb = ca.clone();
+        let (ha, mut ea) = spawn(a.clone(), ca).unwrap();
+        let (hb, mut eb) = spawn(b.clone(), cb).unwrap();
+        wait_signal_online(&mut ea).await;
+        wait_signal_online(&mut eb).await;
+        for _ in 0..4 {
+            ha.connect_peer(b.node_id()).unwrap();
+            hb.connect_peer(a.node_id()).unwrap();
+        }
+        for (events, peer) in [(&mut ea, b.node_id()), (&mut eb, a.node_id())] {
+            let count = time::timeout(Duration::from_secs(20), async {
+                let mut committed = 0;
+                loop {
+                    match events.recv().await.expect("session alive") {
+                        SessionEvent::PeerPath {
+                            peer: id, detail, ..
+                        } if id == peer && detail.contains("已认证 transport") => {
+                            assert!(detail.contains("IPv6"));
+                            committed += 1;
+                        }
+                        SessionEvent::PeerState {
+                            peer: id,
+                            state: PeerLifecycle::Connected(_),
+                            ..
+                        } if id == peer => break committed,
+                        SessionEvent::PeerState {
+                            state: PeerLifecycle::Failed(error),
+                            ..
+                        } => panic!("{error}"),
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                count, 1,
+                "only one transport may enter authorization/business dispatch"
+            );
+        }
+        let a_connections = inspect(&ha).await;
+        let b_connections = inspect(&hb).await;
+        assert_eq!(a_connections.len(), 1);
+        assert_eq!(b_connections.len(), 1);
+        assert!(a_connections[&b.node_id()].1.remote_address().is_ipv6());
+        assert!(b_connections[&a.node_id()].1.remote_address().is_ipv6());
+        ha.shutdown();
+        hb.shutdown();
+        drop((ha, hb));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn trusted_auto_start_reconnects_ipv4_to_ipv6_with_new_generation_and_binding() {
+        use super::super::{
+            config::{AllowedForwardTarget, DesktopConfig, TunnelRule},
+            remote_auth::AuthorizationGrant,
+            trusted_devices::TrustedDevice,
+        };
+        use crate::net::{NetworkFamilies, family::ipv6_test_available};
+        if !ipv6_test_available() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "p2p-trusted-family-switch-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("settings.json");
+        let a = Identity::generate();
+        let b = Identity::generate();
+        security_config(
+            &path,
+            vec![TrustedDevice::new(a.node_id(), "peer".into(), None)],
+        );
+        let (signal, server) = start_local_server().await;
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reserve = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = reserve.local_addr().unwrap();
+        drop(reserve);
+        let mut rule = TunnelRule::new(
+            "family recovery",
+            b.node_id().to_hex(),
+            listen.port(),
+            target.local_addr().unwrap(),
+        );
+        rule.auto_start = true;
+        let mut ca = auth_config(signal);
+        ca.tunnel_rules = vec![rule.clone()];
+        let mut cb = auth_config(signal);
+        cb.network.families = NetworkFamilies::Ipv4Only;
+        cb.config_path = Some(path.clone());
+        cb.trusted_devices = super::super::config::SettingsDraft::from_config(
+            DesktopConfig::load(&path).unwrap().unwrap(),
+        )
+        .trusted_devices;
+        cb.allowed_forward_targets = vec![AllowedForwardTarget::new(
+            "echo",
+            target.local_addr().unwrap(),
+            vec![a.node_id().to_hex()],
+        )];
+        let restart = cb.clone();
+        let (hb, mut eb) = spawn(b.clone(), cb).unwrap();
+        wait_signal_online(&mut eb).await;
+        let (ha, mut ea) = spawn(a.clone(), ca).unwrap();
+        wait_specific_tunnel_state(&mut ea, &rule.id, TunnelRuntimeState::Running).await;
+        let (old_generation, old_connection) = inspect(&ha).await[&b.node_id()].clone();
+        assert!(old_connection.remote_address().is_ipv4());
+        let old_binding = ChannelBinding::from_connection(&old_connection).unwrap();
+        hb.shutdown();
+        drop(hb);
+        time::timeout(Duration::from_secs(10), async {
+            while !inspect(&ha).await.is_empty() {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(old_connection.close_reason().is_some());
+        while ea.try_recv().is_ok() {}
+        let mut cb = restart;
+        cb.network.families = NetworkFamilies::Ipv6Only;
+        cb.trusted_devices = super::super::config::SettingsDraft::from_config(
+            DesktopConfig::load(&path).unwrap().unwrap(),
+        )
+        .trusted_devices;
+        let (hb, mut eb) = spawn(b.clone(), cb).unwrap();
+        wait_signal_online(&mut eb).await;
+        ha.connect_peer_trusted(b.node_id()).unwrap();
+        wait_specific_tunnel_state(&mut ea, &rule.id, TunnelRuntimeState::Running).await;
+        let (generation, connection) = inspect(&ha).await[&b.node_id()].clone();
+        assert_ne!(generation, old_generation);
+        assert_ne!(connection.stable_id(), old_connection.stable_id());
+        assert_ne!(
+            ChannelBinding::from_connection(&connection).unwrap(),
+            old_binding
+        );
+        assert!(connection.remote_address().is_ipv6());
+        wait_grants(
+            &mut eb,
+            a.node_id(),
+            RemoteAuthorization {
+                inbound: AuthorizationGrant {
+                    password: false,
+                    trusted_device: true,
+                },
+                outbound: AuthorizationGrant::default(),
+            },
+        )
+        .await;
+        let mut tcp = tokio::net::TcpStream::connect(listen).await.unwrap();
+        tcp.write_all(b"ipv6new").await.unwrap();
+        let (mut destination, _) = time::timeout(Duration::from_secs(3), target.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut data = [0; 7];
+        destination.read_exact(&mut data).await.unwrap();
+        assert_eq!(&data, b"ipv6new");
+        // Address-family recovery did not mutate either password verifier or persistent trust.
+        assert_eq!(
+            super::super::config::SettingsDraft::from_config(
+                DesktopConfig::load(&path).unwrap().unwrap()
+            )
+            .trusted_devices
+            .len(),
+            1
+        );
+        ha.shutdown();
+        hb.shutdown();
+        drop((ha, hb, tcp, destination));
+        server.abort();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn ipv6_and_ipv4_reconnect_routes_retire_together_and_old_generation_is_rejected() {
+        use crate::net::family::{bind_udp, ipv6_test_available};
+        if !ipv6_test_available() {
+            return;
+        }
+        let network = prepare_desktop_network(&DesktopNetworkConfig {
+            stun_servers: Vec::new(),
+            include_loopback: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let peer = Identity::generate().node_id();
+        let old_token = PunchToken::random();
+        let mut peers = PeerRegistry::default();
+        let BeginPeerAttempt::Started(old_generation) = peers.begin_attempt(peer) else {
+            panic!("start")
+        };
+        let mut receivers = Vec::new();
+        let mut sources = Vec::new();
+        for path in &network.paths {
+            let mut receiver = path
+                .punch_socket
+                .register_peer_probe(&old_token, peer, old_generation)
+                .unwrap();
+            let source =
+                tokio::net::UdpSocket::from_std(bind_udp(path.family.loopback(0)).unwrap())
+                    .unwrap();
+            source
+                .send_to(
+                    &crate::nat::punch::probe_packet(&old_token),
+                    path.family.loopback(path.local_addr.port()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                time::timeout(Duration::from_secs(2), receiver.recv())
+                    .await
+                    .unwrap(),
+                Some(source.local_addr().unwrap())
+            );
+            receivers.push(receiver);
+            sources.push(source);
+        }
+        assert!(peers.transition(
+            peer,
+            old_generation,
+            PeerLifecycle::Failed("retired".into())
+        ));
+        let BeginPeerAttempt::Started(new_generation) = peers.begin_attempt(peer) else {
+            panic!("restart")
+        };
+        for (path, source) in network.paths.iter().zip(&sources) {
+            let (_, claimed_generation) = path
+                .punch_socket
+                .claim_authorized_peer(source.local_addr().unwrap())
+                .unwrap();
+            assert_eq!(claimed_generation, old_generation);
+            assert!(!peers.is_current(peer, claimed_generation));
+        }
+        drop(receivers); // removes both families' token/source routes synchronously
+        let token = PunchToken::random();
+        for (path, source) in network.paths.iter().zip(&sources) {
+            assert_eq!(
+                path.punch_socket
+                    .claim_authorized_peer(source.local_addr().unwrap()),
+                None
+            );
+            let mut receiver = path
+                .punch_socket
+                .register_peer_probe(&token, peer, new_generation)
+                .unwrap();
+            let target = path.family.loopback(path.local_addr.port());
+            source
+                .send_to(&crate::nat::punch::probe_packet(&old_token), target)
+                .await
+                .unwrap();
+            assert!(
+                time::timeout(Duration::from_millis(30), receiver.recv())
+                    .await
+                    .is_err()
+            );
+            source
+                .send_to(&crate::nat::punch::probe_packet(&token), target)
+                .await
+                .unwrap();
+            assert!(
+                time::timeout(Duration::from_secs(2), receiver.recv())
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                path.punch_socket
+                    .claim_authorized_peer(source.local_addr().unwrap()),
+                Some((peer, new_generation))
+            );
+        }
+        network.close();
+        network.wait_idle().await;
+    }
+
     #[tokio::test]
     async fn reconnect_watch_only_accepts_matching_probe_and_expires_without_reconnecting() {
         use crate::nat::punch::probe_packet;
@@ -3293,7 +4002,7 @@ mod tests {
                 generation: 7,
                 candidates: Vec::new(),
                 token,
-                receiver: punch.register_peer_probe(&token, peer, 7).unwrap(),
+                receivers: vec![punch.register_peer_probe(&token, peer, 7).unwrap()],
                 deadline: Box::pin(time::sleep(Duration::from_secs(5))),
             }]),
         )]);
@@ -3339,7 +4048,7 @@ mod tests {
                 generation: 8,
                 candidates: Vec::new(),
                 token,
-                receiver,
+                receivers: vec![receiver],
                 deadline: Box::pin(time::sleep(Duration::ZERO)),
             }]),
         );

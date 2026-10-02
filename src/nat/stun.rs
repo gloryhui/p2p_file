@@ -629,6 +629,12 @@ pub async fn query_binding_with_change(
     change_ip: bool,
     change_port: bool,
 ) -> Result<StunResult> {
+    let family = crate::net::AddressFamily::of(socket.local_addr()?);
+    if !family.accepts(server) {
+        return Err(Error::Stun(format!(
+            "{family} socket cannot query {server}"
+        )));
+    }
     let transaction_id: [u8; TRANSACTION_ID_LEN] = rand::random();
     let request =
         Message::binding_request_with_change(transaction_id, change_ip, change_port).encode();
@@ -658,6 +664,9 @@ pub async fn query_binding_with_change(
         if message.transaction_id != transaction_id {
             continue;
         }
+        if crate::net::AddressFamily::of(from) != family {
+            continue;
+        }
         if message.class == MessageClass::ErrorResponse {
             return Err(Error::Stun(format!("{from} 返回了错误响应")));
         }
@@ -666,6 +675,15 @@ pub async fn query_binding_with_change(
             .mapped_address()
             .ok_or_else(|| Error::Stun("响应里没有映射地址属性".into()))?;
 
+        if message.class != MessageClass::SuccessResponse
+            || !family.accepts(mapped_addr)
+            || message
+                .response_origin()
+                .is_some_and(|a| !family.accepts(a))
+            || message.other_address().is_some_and(|a| !family.accepts(a))
+        {
+            return Err(Error::Stun("STUN response address family mismatch".into()));
+        }
         return Ok(StunResult {
             mapped_addr,
             response_origin: message.response_origin().or(Some(from)),
@@ -685,8 +703,22 @@ pub async fn query_binding(server: SocketAddr, timeout: Duration) -> Result<Stun
     } else {
         "[::]:0".parse().unwrap()
     };
-    let socket = UdpSocket::bind(bind).await?;
+    let socket = UdpSocket::from_std(crate::net::family::bind_udp(bind)?)?;
     query_binding_with(&socket, server, timeout).await
+}
+
+/// Resolve all native addresses of one family, independent of DNS answer order.
+pub async fn resolve_server_for(
+    spec: &str,
+    family: crate::net::AddressFamily,
+) -> Result<Vec<SocketAddr>> {
+    let mut addresses: Vec<_> = tokio::net::lookup_host(spec)
+        .await?
+        .filter(|addr| family.accepts(*addr))
+        .collect();
+    addresses.sort();
+    addresses.dedup();
+    Ok(addresses)
 }
 
 /// 解析 `host:port` 形式的 STUN 服务器地址。
@@ -701,6 +733,69 @@ pub async fn resolve_server(spec: &str) -> Result<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn ipv6_loopback_binding_xor_and_family_guard() {
+        use crate::net::{
+            AddressFamily,
+            family::{bind_udp, ipv6_test_available},
+        };
+        if !ipv6_test_available() {
+            return;
+        }
+        let server =
+            UdpSocket::from_std(bind_udp(AddressFamily::Ipv6.loopback(0)).unwrap()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let mut buffer = [0_u8; 1500];
+            let (n, from) = server.recv_from(&mut buffer).await.unwrap();
+            let request = Message::decode(&buffer[..n]).unwrap();
+            let response = Message {
+                method: Method::Binding,
+                class: MessageClass::SuccessResponse,
+                transaction_id: request.transaction_id,
+                attributes: vec![Attribute::XorMappedAddress(from)],
+            };
+            server.send_to(&response.encode(), from).await.unwrap();
+        });
+        let client =
+            UdpSocket::from_std(bind_udp(AddressFamily::Ipv6.loopback(0)).unwrap()).unwrap();
+        let local = client.local_addr().unwrap();
+        let result = query_binding_with(&client, server_addr, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(result.mapped_addr, local);
+        responder.await.unwrap();
+        let v4 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        assert!(
+            query_binding_with(&v4, server_addr, Duration::from_secs(2))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("socket cannot query")
+        );
+        assert!(
+            query_binding_with(&client, v4.local_addr().unwrap(), Duration::from_secs(2))
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), v4.recv_from(&mut [0_u8; 1500]))
+                .await
+                .is_err()
+        );
+        assert!(
+            resolve_server_for(&format!("[::1]:{}", local.port()), AddressFamily::Ipv4)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            resolve_server_for(&format!("[::1]:{}", local.port()), AddressFamily::Ipv6)
+                .await
+                .unwrap(),
+            vec![local]
+        );
+    }
 
     fn roundtrip(message: &Message) -> Message {
         Message::decode(&message.encode()).expect("解码应当成功")

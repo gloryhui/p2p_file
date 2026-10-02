@@ -1002,6 +1002,8 @@ struct DesktopShell {
     transfer_service: Option<transfer::TransferService>,
     network_session: Option<session::DesktopSessionHandle>,
     network_status: SharedString,
+    network_path_status: SharedString,
+    peer_path_status: HashMap<NodeId, (u64, String)>,
     peer_status: SharedString,
     network_epoch: u64,
     peer_generations: HashMap<NodeId, u64>,
@@ -2121,6 +2123,8 @@ impl DesktopShell {
                 let network_epoch = self.network_epoch;
                 self.peer_generations.clear();
                 self.peer_states.clear();
+                self.peer_path_status.clear();
+                self.network_path_status = "UDP 地址族正在准备".into();
                 self.tunnel_states.clear();
                 self.pending_resumes.clear();
                 self.network_session = Some(handle);
@@ -2134,6 +2138,12 @@ impl DesktopShell {
                                     return;
                                 }
                                 match event {
+                                    session::SessionEvent::NetworkPaths(detail) => {
+                                        shell.network_path_status = detail.into(); cx.notify();
+                                    }
+                                    session::SessionEvent::PeerPath { peer, generation, detail } => {
+                                        if ui_model::project_peer_path(&mut shell.peer_path_status, &shell.peer_generations, peer, generation, detail) { cx.notify(); }
+                                    }
                                     session::SessionEvent::Lifecycle(lifecycle) => {
                                         let label = lifecycle.label();
                                         if matches!(lifecycle,
@@ -2167,6 +2177,10 @@ impl DesktopShell {
                                             shell.peer_generations.remove(&oldest);
                                             shell.peer_states.remove(&oldest);
                                         }
+                                        if shell.peer_path_status.get(&peer).is_some_and(|(g, _)| *g < generation)
+                                            || matches!(state, network_state::PeerLifecycle::Disconnected | network_state::PeerLifecycle::Failed(_)) {
+                                            shell.peer_path_status.remove(&peer);
+                                        }
                                         shell.peer_generations.insert(peer, generation);
                                         shell.peer_states.insert(peer, state.clone());
                                         if state.outbound_authorized() {
@@ -2179,7 +2193,7 @@ impl DesktopShell {
                                                 "等待对端候选地址".to_owned()
                                             }
                                             network_state::PeerLifecycle::Punching => {
-                                                "正在验证 UDP 打洞来源".to_owned()
+                                                "正在探测 UDP 可达性".to_owned()
                                             }
                                             network_state::PeerLifecycle::Authenticating => {
                                                 "正在执行 QUIC 与身份认证".to_owned()
@@ -4613,6 +4627,20 @@ impl DesktopShell {
                     ),
             );
         }
+        card = card.child(
+            div()
+                .text_xs()
+                .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                .child(self.network_path_status.clone()),
+        );
+        for (_, detail) in self.peer_path_status.values() {
+            card = card.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                    .child(detail.clone()),
+            );
+        }
         card
     }
 }
@@ -4907,6 +4935,8 @@ pub fn run() {
                         transfer_service,
                         network_session: None,
                         network_status: initial_network_status.into(),
+                        network_path_status: "UDP 地址族尚未准备".into(),
+                        peer_path_status: HashMap::new(),
                         peer_status: "尚未连接对端".into(),
                         network_epoch: 0,
                         peer_generations: HashMap::new(),

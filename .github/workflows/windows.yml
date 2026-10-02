@@ -16,3 +16,5 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Run all Rust tests on Windows
         run: cargo test --all-targets --no-fail-fast
+      - name: Run native IPv6 regressions with capability diagnostics
+        run: cargo test ipv6 --all-targets -- --nocapture

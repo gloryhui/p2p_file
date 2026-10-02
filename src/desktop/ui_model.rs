@@ -9,6 +9,36 @@ use std::{
     collections::{HashMap, HashSet},
     time::{Duration, Instant},
 };
+/// Bounded UI diagnostics follow the same generation fence as peer lifecycle.
+pub(super) fn project_peer_path(
+    paths: &mut HashMap<NodeId, (u64, String)>,
+    generations: &HashMap<NodeId, u64>,
+    peer: NodeId,
+    generation: u64,
+    detail: String,
+) -> bool {
+    if generations
+        .get(&peer)
+        .is_some_and(|current| generation < *current)
+        || paths
+            .get(&peer)
+            .is_some_and(|(current, _)| generation < *current)
+    {
+        return false;
+    }
+    if paths.len() >= super::network_state::MAX_PEERS
+        && !paths.contains_key(&peer)
+        && let Some(oldest) = paths
+            .iter()
+            .min_by_key(|(_, (g, _))| *g)
+            .map(|(peer, _)| *peer)
+    {
+        paths.remove(&oldest);
+    }
+    paths.insert(peer, (generation, detail));
+    true
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct TaskRow {
     pub id: TaskId,
@@ -460,5 +490,56 @@ mod trusted_gui_tests {
             Some(&password),
             &[TrustedDevice::new(peer, "device".into(), None)]
         ));
+    }
+}
+
+#[cfg(test)]
+mod network_path_tests {
+    use super::*;
+    use crate::identity::Identity;
+    #[test]
+    fn gui_ipv6_winner_cannot_be_overwritten_by_stale_ipv4_generation() {
+        let peer = Identity::generate().node_id();
+        let generations = HashMap::from([(peer, 9)]);
+        let mut paths = HashMap::new();
+        assert!(project_peer_path(
+            &mut paths,
+            &generations,
+            peer,
+            9,
+            "IPv6 [::1]:9000 已认证".into()
+        ));
+        assert!(!project_peer_path(
+            &mut paths,
+            &generations,
+            peer,
+            8,
+            "IPv4 127.0.0.1:9000 已认证".into()
+        ));
+        assert!(paths[&peer].1.contains("IPv6"));
+        assert!(project_peer_path(
+            &mut paths,
+            &generations,
+            peer,
+            10,
+            "IPv4 新 transport".into()
+        ));
+        assert_eq!(paths[&peer].0, 10);
+    }
+    #[test]
+    fn gui_peer_path_diagnostics_remain_bounded() {
+        let mut paths = HashMap::new();
+        for generation in 1..=32 {
+            let peer = Identity::generate().node_id();
+            assert!(project_peer_path(
+                &mut paths,
+                &HashMap::new(),
+                peer,
+                generation,
+                "IPv6 / IPv4 候选".into()
+            ));
+        }
+        assert_eq!(paths.len(), super::super::network_state::MAX_PEERS);
+        assert!(paths.values().all(|(generation, _)| *generation > 16));
     }
 }

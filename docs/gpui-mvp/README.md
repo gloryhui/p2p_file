@@ -48,3 +48,17 @@ GUI 使用 GPUI，不以 WebView、网站、Tauri 或截图替代。复用现有
 
 T001—T012 均被控制 Agent 接收并合并，三平台交付与人工验收矩阵完成，控制 Agent 追加 FINAL_ACCEPTANCE，才关闭总控 Issue。
 缺少 Windows 10 或 Apple Silicon 实机验证时必须记录 BLOCKED / 待验证，不能将 GitHub runner 编译成功当作完整发布验收。
+
+## 原生 IPv6 运行说明
+
+Desktop 默认建立独立的 IPv4 / IPv6 UDP path，IPv6 socket 设置 V6ONLY；任一族绑定
+失败时网络卡片显示原因，并继续使用另一族。卡片保留本地两族 socket/STUN/Host、
+peer 候选数量、最终经过 QUIC + Ed25519/TLS binding 的 family/address。
+
+打包后的 Ubuntu、Windows、macOS 应允许本应用的 IPv4 和 IPv6 UDP 流量。公网 IPv6
+直连还要求路由器/云安全组开放 IPv6 入站 UDP；只有 link-local 地址时不会当作公网
+候选。IPv6 STUN 不可用时可用的 global/ULA Host 不会删除。路径切换仍按真实 NodeId
+重新完成身份、密码/Trusted Device 方向授权和 Tunnel allowlist 检查。
+
+CI 覆盖三个原生平台的 IPv6 loopback；真实公网 IPv6 双主机验收需在对应网络另行执行。
+没有新增账号、Relay、UPnP、scope-id 或 Multipath 功能。

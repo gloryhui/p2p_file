@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use tokio::net::UdpSocket;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::nat::stun::{StunResult, query_binding_with};
 
 /// RFC 5780 mapping probing 的证据等级。
@@ -132,7 +132,11 @@ impl MappingBehavior {
 /// 判定顺序：先看映射是否始终不变，再看变化是否只发生在跨 IP 时。
 pub fn classify_mapping(observations: &[StunObservation]) -> MappingBehavior {
     // 一次观测什么都证明不了，别给出过于乐观的结论。
-    if observations.len() < 2 {
+    if observations.len() < 2
+        || observations
+            .iter()
+            .any(|o| !o.server.is_ipv4() || !o.mapped_addr.is_ipv4())
+    {
         return MappingBehavior::Unknown;
     }
 
@@ -185,6 +189,12 @@ pub async fn probe_rfc5780(
     primary: SocketAddr,
     timeout: Duration,
 ) -> Result<MappingProbe> {
+    if !socket.local_addr()?.is_ipv4() || !primary.is_ipv4() {
+        return Err(Error::Stun(
+            "RFC 5780 NAT mapping classification requires IPv4".into(),
+        ));
+    }
+
     let first = query_binding_with(socket, primary, timeout).await?;
     let other_address = first.other_address;
     let mut observations = vec![StunObservation::from_result(primary, &first)];
@@ -315,6 +325,22 @@ mod tests {
 
     fn obs(server: &str, mapped: &str) -> StunObservation {
         StunObservation::new(server.parse().unwrap(), mapped.parse().unwrap())
+    }
+
+    #[test]
+    fn ipv6_observations_never_produce_ipv4_mapping_classification() {
+        let mapped = "203.0.113.5:4000".parse().unwrap();
+        let observations = vec![
+            StunObservation {
+                server: "198.51.100.1:3478".parse().unwrap(),
+                mapped_addr: mapped,
+            },
+            StunObservation {
+                server: "[2001:db8::1]:3478".parse().unwrap(),
+                mapped_addr: mapped,
+            },
+        ];
+        assert_eq!(classify_mapping(&observations), MappingBehavior::Unknown);
     }
 
     #[test]

@@ -433,9 +433,8 @@ A、B 的签名和随机数各自自洽，验证全过，但业务流量实际�
 1. **对称型 NAT 无解**，必须做中继（M3）。目前只能靠路由器手工端口映射 +
    `--advertise` 绕过。
 2. `classify` 只判映射行为，没判过滤行为；CLI 会明确显示 filtering 未测量。
-3. 只绑 IPv4。候选地址里的 IPv6 链路本地地址已被过滤掉（出了路由器没用），
-   全局 IPv6 要等双栈监听做完才能真正用上——而 IPv6 通常没有 NAT，
-   能直连就省掉大半麻烦，值得优先做。
+3. 原生 IPv6 与 IPv4 独立 path 已实现；公网 IPv6 可达性仍需两台真实主机验收。
+   链路本地 scope-id 不在实现范围。
 4. 打洞没有端口预测（birthday paradox 式扫描），对称 NAT 下救不回来。
 5. 文件读写用的是同步 IO，跑在大文件时会阻塞异步执行器，应挪进 `spawn_blocking`。
 6. 文件传输的分片数据和控制消息共用一条流，应拆成独立单向流；`speedtest` 已经
@@ -461,3 +460,33 @@ A、B 的签名和随机数各自自洽，验证全过，但业务流量实际�
       多对端需要多进程或者多 socket
 - [ ] CLI 优先，是否要 TUI / GUI
 - [ ] 是否要兼容浏览器（决定 QUIC 自研 vs WebRTC）
+
+## 4.8 地址族独立的 NetworkPath（Issue #57）
+
+`net::NetworkPath` 持有 family、实际本地 UDP 地址、QUIC endpoint、发送探测句柄、
+本族候选和 STUN 观测。IPv4 path 才持有 NAT mapping 分类；IPv6 observation 没有
+EIM/ADM/APDM 语义。DNS 对 STUN 返回的全部地址按族筛选，每族 独立
+probe，再将原 socket 交给 Quinn 的单一接收 dispatcher。IPv6 设置 V6ONLY 后才 bind。
+
+`net::race` 的候选 task 在本族 endpoint 上完成 QUIC 和完整 Ed25519/TLS binding
+握手。预先核对 expected NodeId，收到 Ready 后仍保留专用流的发送端。选择唯一 winner，
+abort 并 drain 所有 loser，随后只 finish winner 的身份流。`await_identity_commit`
+使接收方等待这个 FIN，才进入能力协商、Remote Auth 或 CLI serve 的业务分发。
+所以两族都完成身份握手也不会启动两套业务 handler；Ready 黑洞时另一族仍在竞速。
+原握手消息、签名域、协议版本保持不变；现有专用握手流调用者已在 Ready 后发送 FIN。
+LAN 文件传输不参与候选竞速，原有接收握手流程保持不变。
+
+Desktop 使用确定性的 NodeId dialer 规则。每个 path 独立注册同一代的 PunchToken，
+入站事件带 family，IPv4 只接纳该族 dispatcher 验证过的 token 来源；IPv6 可使用当前 pending generation 的
+完整候选地址作唯一、非歧义的路由提示，probe 不回也可尝试 QUIC。这个提示不提供任何
+身份或权限，之后必须核对预期 NodeId 的 Ed25519/TLS binding，再确认 winner FIN。
+重连 watch 按 token 保存两族 receiver，撤销和过期一次移除整组；actor 的 generation、
+transport stable_id 和授权 epoch 继续过滤旧回调。赢得 transport 后才协商 Remote Auth，
+Trusted grant 不从旧路径或旧 generation 复制。CLI 常驻 serve 同时 accept 两条 path，
+仍保留 pending-handshake / business-stream / file-receive 配额和全部 allowlist。
+
+回归覆盖 IPv6 XOR STUN、独立 bind 失败、同 socket/实际端口、两类黑洞、有界 fallback、
+唯一业务提交、错误 NodeId、Desktop 并发及跨族 trusted auto-start 恢复、IPv6 文件/测速/
+TCP Tunnel、CLI IPv6 send，以及 GPUI 旧 generation 诊断过滤。三平台 CI 的 `ipv6`
+过滤测试输出能力检测；仅当 native IPv6 bind 返回明确不支持错误时显式 SKIP。
+本地 loopback 不等同于不同运营商/公网 IPv6 的人工验收。

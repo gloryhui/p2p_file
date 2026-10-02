@@ -47,12 +47,12 @@ pub struct HandshakeOutcome {
 ///
 /// `binding` 必须是**当前** `quinn::Connection` 导出的会话绑定值；它会被写进
 /// 签名载荷，从而把这次认证钉死在这条 TLS 会话上。
-pub async fn handshake_initiator<S, R>(
+pub async fn prepare_handshake_initiator<S, R>(
     send: &mut S,
     recv: &mut R,
     identity: &Identity,
     binding: &ChannelBinding,
-) -> Result<HandshakeOutcome>
+) -> Result<PreparedHandshake>
 where
     S: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
@@ -116,34 +116,62 @@ where
         &signature_from_bytes(&signature)?,
     )?;
 
-    // 回签，让对端也确认我们的身份。
-    let our_signature = identity.sign(&payload);
-    write_handshake_frame(
-        send,
-        &ControlMessage::Auth {
-            signature: our_signature.to_bytes().to_vec(),
+    Ok(PreparedHandshake {
+        outcome: HandshakeOutcome {
+            peer_node_id,
+            peer_public_key,
         },
-        "发送 Auth",
-    )
-    .await?;
-
-    expect_ready(recv).await?;
-
-    Ok(HandshakeOutcome {
-        peer_node_id,
-        peer_public_key,
+        signature: identity.sign(&payload).to_bytes().to_vec(),
     })
+}
+
+/// The peer signature has been checked against this TLS session, but no Auth was
+/// sent. This phase permits expected-NodeId checks before sending our Auth.
+pub struct PreparedHandshake {
+    pub outcome: HandshakeOutcome,
+    signature: Vec<u8>,
+}
+impl PreparedHandshake {
+    pub async fn finish<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
+        self,
+        send: &mut S,
+        recv: &mut R,
+    ) -> Result<HandshakeOutcome> {
+        write_handshake_frame(
+            send,
+            &ControlMessage::Auth {
+                signature: self.signature,
+            },
+            "发送 Auth",
+        )
+        .await?;
+        expect_ready(recv).await?;
+        Ok(self.outcome)
+    }
+}
+
+/// Unchanged wire handshake for callers that do not race paths.
+pub async fn handshake_initiator<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
+    send: &mut S,
+    recv: &mut R,
+    identity: &Identity,
+    binding: &ChannelBinding,
+) -> Result<HandshakeOutcome> {
+    prepare_handshake_initiator(send, recv, identity, binding)
+        .await?
+        .finish(send, recv)
+        .await
 }
 
 /// 接收方握手。
 ///
 /// `binding` 同 [`handshake_initiator`]，必须是当前连接的会话绑定值。
-pub async fn handshake_responder<S, R>(
+pub async fn prepare_handshake_responder<S, R>(
     send: &mut S,
     recv: &mut R,
     identity: &Identity,
     binding: &ChannelBinding,
-) -> Result<HandshakeOutcome>
+) -> Result<VerifiedResponder>
 where
     S: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
@@ -213,12 +241,34 @@ where
         }
     }
 
-    write_handshake_frame(send, &ControlMessage::Ready, "发送 Ready").await?;
-
-    Ok(HandshakeOutcome {
-        peer_node_id,
-        peer_public_key,
+    Ok(VerifiedResponder {
+        outcome: HandshakeOutcome {
+            peer_node_id,
+            peer_public_key,
+        },
     })
+}
+
+/// Both signatures have been verified. Ready is still pending.
+pub struct VerifiedResponder {
+    outcome: HandshakeOutcome,
+}
+impl VerifiedResponder {
+    pub async fn finish<S: AsyncWrite + Unpin>(self, send: &mut S) -> Result<HandshakeOutcome> {
+        write_handshake_frame(send, &ControlMessage::Ready, "发送 Ready").await?;
+        Ok(self.outcome)
+    }
+}
+pub async fn handshake_responder<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
+    send: &mut S,
+    recv: &mut R,
+    identity: &Identity,
+    binding: &ChannelBinding,
+) -> Result<HandshakeOutcome> {
+    prepare_handshake_responder(send, recv, identity, binding)
+        .await?
+        .finish(send)
+        .await
 }
 
 fn check_version(version: u32) -> Result<()> {

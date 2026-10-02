@@ -162,7 +162,21 @@ pub async fn serve_session(
 ) -> Result<()> {
     info!("直连已就绪，等待对端接入：{}", link.describe());
 
-    let (endpoint, _signal) = link.into_parts();
+    let (network, _signal, mut probes) = link.into_parts();
+    let (incoming_tx, mut incoming_rx) = mpsc::channel(64);
+    let mut accept_tasks = JoinSet::new();
+    for path in &network.paths {
+        let endpoint = path.endpoint.clone();
+        let incoming_tx = incoming_tx.clone();
+        accept_tasks.spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                if incoming_tx.send(incoming).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    drop(incoming_tx);
     let active = Arc::new(ActiveState::new());
     let pending = Arc::new(Semaphore::new(config.max_pending_handshakes));
     let file_receives = Arc::new(Semaphore::new(config.max_file_receives));
@@ -174,7 +188,7 @@ pub async fn serve_session(
 
     loop {
         let incoming = tokio::select! {
-            incoming = endpoint.accept() => incoming,
+            incoming = incoming_rx.recv() => incoming,
             _ = tokio::time::sleep_until(idle_deadline) => {
                 if active.count.load(Ordering::Relaxed) == 0 {
                     // active 刚刚结束时，Drop 会记录真实的 idle 起点。即使
@@ -250,7 +264,12 @@ pub async fn serve_session(
 
     // 先关闭 endpoint，再结束所有握手/业务 task。这样 QUIC 不会继续保留任何
     // Connection 对 UDP socket 的引用，下一轮才能安全复用固定的本地端口。
-    endpoint.close(0u32.into(), b"serve session ended");
+    network.close();
+    accept_tasks.abort_all();
+    probes.abort_all();
+    while accept_tasks.join_next().await.is_some() {}
+    while probes.join_next().await.is_some() {}
+    drop(incoming_rx);
     for connection in connections.lock().unwrap().values() {
         connection.close(0u32.into(), b"serve session ended");
     }
@@ -267,7 +286,7 @@ pub async fn serve_session(
         let _ = tokio::time::timeout(Duration::from_secs(3), connection.closed()).await;
     }
     drop(_signal);
-    drop(endpoint);
+    drop(network);
     // quinn 的 endpoint driver 在 drop 后还需要一个调度机会收掉底层
     // socket 引用；显式让出执行权，保证下一轮固定端口 bind 不与清理竞态。
     for _ in 0..3 {
@@ -387,6 +406,8 @@ async fn serve_connection(
     let outcome =
         handshake_responder(&mut handshake_send, &mut handshake_recv, identity, &binding).await?;
     let _ = handshake_send.finish();
+
+    crate::transport::quic::await_identity_commit(&mut handshake_recv).await?;
 
     let peer_id = outcome.peer_node_id;
     if !config.peer_allowed(peer_id) {
@@ -906,7 +927,7 @@ pub async fn push_file(
         send_file_after_handshake(&connection, &path, chunk_size, link.peer_node_id).await?;
     connection.close(0u32.into(), b"done");
     // 等连接真正关掉，避免进程提前退出把最后一个包丢了。
-    link.endpoint.wait_idle().await;
+    link.network.wait_idle().await;
     Ok(report)
 }
 
@@ -995,6 +1016,164 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn ipv6_only_real_signaling_file_speedtest_and_allowlisted_tcp_tunnel() {
+        native_business_fixture(false).await;
+    }
+
+    #[tokio::test]
+    async fn ipv6_blackhole_falls_back_to_ipv4_winner_for_file_speedtest_and_tunnel() {
+        native_business_fixture(true).await;
+    }
+
+    async fn native_business_fixture(fallback: bool) {
+        use crate::net::{NetworkFamilies, family::ipv6_test_available};
+        use crate::speedtest::{SpeedTestDirection, run_speedtest};
+        if !ipv6_test_available() {
+            return;
+        }
+        let signal = spawn_signal_server().await; // IPv4 signaling, IPv6-only P2P data.
+        let server_id = Identity::generate();
+        let client_id = Identity::generate();
+        let mut sc = test_direct_config(signal, client_id.node_id());
+        sc.families = if fallback {
+            NetworkFamilies::DualStack
+        } else {
+            NetworkFamilies::Ipv6Only
+        };
+        let mut cc = test_direct_config(signal, server_id.node_id());
+        cc.families = sc.families;
+        let (server_link, client_link) =
+            tokio::join!(establish(&server_id, &sc), establish(&client_id, &cc));
+        let server_link = server_link.unwrap();
+        let client_link = client_link.unwrap();
+        if !fallback {
+            assert!(client_link.peer_candidates.iter().all(SocketAddr::is_ipv6));
+        }
+        let echo = TcpListener::bind("[::1]:0").await.unwrap();
+        let target = echo.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            let (mut tcp, _) = echo.accept().await.unwrap();
+            let mut data = [0; 7];
+            tcp.read_exact(&mut data).await.unwrap();
+            tcp.write_all(&data).await.unwrap();
+        });
+        let root =
+            std::env::temp_dir().join(format!("p2p-ipv6-business-{:032x}", rand::random::<u128>()));
+        let recv_dir = root.join("receive");
+        std::fs::create_dir_all(&recv_dir).unwrap();
+        let path = root.join("ipv6.bin");
+        let bytes = vec![77_u8; 200_000];
+        std::fs::write(&path, &bytes).unwrap();
+        let endpoints = server_link.endpoints();
+        let serve = tokio::spawn(serve_session(
+            server_link,
+            server_id.clone(),
+            ServeConfig {
+                allowed_peers: vec![client_id.node_id()],
+                forwards: vec![target],
+                recv_dir: Some(recv_dir.clone()),
+                re_punch_after: Duration::from_secs(30),
+                ..ServeConfig::new()
+            },
+        ));
+        // A held native UDP socket silently drops IPv6 QUIC packets. Exercise the
+        // production race with the real signaled IPv4 candidates, then run all
+        // business protocols on its selected and identity-verified connection.
+        let blackhole = crate::net::family::bind_udp("[::1]:0".parse().unwrap()).unwrap();
+        let connection = if fallback {
+            let mut candidates = vec![(
+                client_link
+                    .network
+                    .path(crate::net::AddressFamily::Ipv6)
+                    .unwrap()
+                    .endpoint
+                    .clone(),
+                blackhole.local_addr().unwrap(),
+            )];
+            let ipv4 = client_link
+                .network
+                .path(crate::net::AddressFamily::Ipv4)
+                .unwrap();
+            candidates.extend(
+                client_link
+                    .peer_candidates
+                    .iter()
+                    .filter(|addr| addr.is_ipv4())
+                    .map(|addr| (ipv4.endpoint.clone(), *addr)),
+            );
+            let started = std::time::Instant::now();
+            let connection =
+                crate::net::race::authenticated_race(candidates, &client_id, server_id.node_id())
+                    .await
+                    .unwrap();
+            assert!(started.elapsed() < Duration::from_secs(3));
+            connection
+        } else {
+            client_link.connect_authenticated(&client_id).await.unwrap()
+        };
+        assert_eq!(connection.remote_address().is_ipv4(), fallback);
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        write_frame(
+            &mut send,
+            &ControlMessage::TunnelOpen {
+                target: target.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut recv).await.unwrap(),
+            Some(ControlMessage::TunnelReady)
+        );
+        send.write_all(b"ipv6tcp").await.unwrap();
+        let mut response = [0; 7];
+        recv.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"ipv6tcp");
+        let _ = send.finish();
+        echo_task.await.unwrap();
+        let reports = run_speedtest(
+            &connection,
+            SpeedTestDirection::Both,
+            Duration::from_secs(1),
+            65536,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(reports.len(), 2);
+        assert!(
+            reports
+                .iter()
+                .all(|r| r.remote == connection.remote_address() && r.bytes > 0)
+        );
+        assert!(std::fs::read_dir(&recv_dir).unwrap().next().is_none());
+        send_file_after_handshake(&connection, &path, 65536, server_id.node_id())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(recv_dir.join("ipv6.bin")).unwrap(), bytes);
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        write_frame(
+            &mut send,
+            &ControlMessage::TunnelOpen {
+                target: "[::1]:1".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame(&mut recv).await.unwrap(),
+            Some(ControlMessage::TunnelError { .. })
+        ));
+        connection.close(0u32.into(), b"done");
+        for endpoint in endpoints {
+            endpoint.close(0u32.into(), b"done");
+        }
+        serve.await.unwrap().unwrap();
+        client_link.network.close();
+        client_link.network.wait_idle().await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn 允许列表为空时不限制节点() {
         let config = ServeConfig::new();
@@ -1501,31 +1680,26 @@ mod tests {
 
     /// 对端给的候选地址全是 IPv6 时，本机（只绑 IPv4）应当给出明确错误。
     #[tokio::test]
-    async fn 只有_ipv6_候选时给出明确错误() {
-        let signal_addr = spawn_signal_server().await;
-        let server_identity = Identity::generate();
-        let client_identity = Identity::generate();
-
-        // 客户端手工登记一个只有 IPv6 的候选，服务端解析时应当报错。
-        let mut client_config = test_direct_config(signal_addr, server_identity.node_id());
-        client_config.include_loopback = false;
-        // 屏蔽掉本机的 IPv4 地址，只留 IPv6。
-        client_config.advertise = vec!["[2001:db8::1]:9000".parse().unwrap()];
-
-        let server_config = test_direct_config(signal_addr, client_identity.node_id());
-
-        let (_server, client) = tokio::join!(
-            establish(&server_identity, &server_config),
-            establish(&client_identity, &client_config),
-        );
-
-        // 客户端自己会用本机的 IPv4 地址，所以多半能通；这里主要确认
-        // 「IPv6 候选被过滤掉」这条路径不会 panic，且报错信息可读。
-        if let Err(err) = client {
-            let text = err.to_string();
+    async fn ipv4_only_rejects_ipv6_only_peer_without_cross_family_dial() {
+        use crate::net::{NetworkFamilies, family::ipv6_test_available};
+        if !ipv6_test_available() {
+            return;
+        }
+        let signal = spawn_signal_server().await;
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let mut ca = test_direct_config(signal, b.node_id());
+        ca.families = NetworkFamilies::Ipv4Only;
+        let mut cb = test_direct_config(signal, a.node_id());
+        cb.families = NetworkFamilies::Ipv6Only;
+        let (a_result, b_result) = tokio::join!(establish(&a, &ca), establish(&b, &cb));
+        for result in [a_result, b_result] {
             assert!(
-                text.contains("IPv6") || text.contains("打洞失败"),
-                "错误信息应当能说明原因，实际: {text}"
+                result
+                    .err()
+                    .expect("no common native family")
+                    .to_string()
+                    .contains("native path")
             );
         }
     }
@@ -1603,7 +1777,7 @@ mod tests {
         );
 
         connection.close(0u32.into(), b"done");
-        let _ = client_link.endpoint.wait_idle().await;
+        let _ = client_link.network.wait_idle().await;
         serve_task.abort();
         let _ = std::fs::remove_dir_all(&recv_dir);
     }

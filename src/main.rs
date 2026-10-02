@@ -118,87 +118,43 @@ fn cmd_id(key_file: &Option<PathBuf>) -> Result<()> {
 }
 
 async fn cmd_stun(servers: &[String], timeout_secs: u64) -> Result<()> {
-    use p2p_file::nat::{MappingBehavior, MappingEvidence, probe_rfc5780, resolve_server};
-
-    // 没指定就用默认的那几个。要判断 NAT 类型至少需要两个不同的观测点。
-    let specs: Vec<String> = if servers.is_empty() {
-        p2p_file::net::DEFAULT_STUN_SERVERS
-            .iter()
-            .map(|spec| spec.to_string())
-            .collect()
-    } else {
-        servers.to_vec()
-    };
-
-    let mut addrs = Vec::new();
-    for spec in &specs {
-        match resolve_server(spec).await {
-            Ok(addr) => addrs.push(addr),
-            Err(err) => println!("跳过 {spec}：{err}"),
-        }
+    let mut config = p2p_file::net::DesktopNetworkConfig::default();
+    if !servers.is_empty() {
+        config.stun_servers = servers.to_vec();
     }
-    if addrs.is_empty() {
-        return Err(Error::Discovery("没有一个 STUN 服务器能解析出地址".into()));
+    config.stun_timeout = Duration::from_secs(timeout_secs);
+    let network = p2p_file::net::prepare_desktop_network(&config).await?;
+    for diagnostic in &network.diagnostics {
+        println!("{diagnostic}");
     }
-
-    // 所有查询必须共用同一个 socket。换个 socket 就是换个本地端口，
-    // 也就换了一个 NAT 映射，观测结果之间就没法比较了。
-    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
-    println!(
-        "本地端口 {}，向 {} 个 STUN 服务器查询 ...",
-        socket.local_addr()?.port(),
-        addrs.len()
-    );
-    println!();
-
-    let timeout = Duration::from_secs(timeout_secs);
-    let mut reports = Vec::new();
-    for addr in addrs {
-        match probe_rfc5780(&socket, addr, timeout).await {
-            Ok(report) => {
-                for obs in &report.observations {
-                    println!("  {:<28} 看到的是 {}", obs.server, obs.mapped_addr);
-                }
-                reports.push(report);
+    if let Some(path) = network.path(p2p_file::net::AddressFamily::Ipv4) {
+        if let Some(report) = &path.mapping_probe {
+            for observation in &report.observations {
+                println!(
+                    "  {:<28} 看到的是 {}",
+                    observation.server, observation.mapped_addr
+                );
             }
-            Err(err) => println!("跳过 {addr}：{err}"),
+            println!("NAT 映射行为: {}", report.mapping.describe());
+            println!("mapping 证据: {}", report.evidence.describe());
+            println!("Filtering behavior: {}", report.filtering.describe());
+            println!(
+                "{}",
+                p2p_file::net::punch_diagnosis(report.mapping, path.public_addr)
+            );
+        } else {
+            println!("IPv4 STUN 没有响应；mapping 证据不足，filtering 未测量。");
         }
     }
-    if reports.is_empty() {
+    println!("IPv6 STUN 仅用于地址观测；IPv4 NAT mapping 不包含 IPv6 样本。");
+    let observed = network.paths.iter().any(|p| p.public_addr.is_some());
+    network.close();
+    network.wait_idle().await;
+    if !observed {
         return Err(Error::Discovery(
-            "所有 STUN 服务器都没有响应（网络不通或者被防火墙挡了）".into(),
+            "所有 STUN 服务器都没有响应（Host 候选仍可用于直连）".into(),
         ));
     }
-
-    let report = reports
-        .iter()
-        .find(|report| report.evidence == MappingEvidence::Rfc5780)
-        .unwrap_or(&reports[0]);
-    let behavior = report.mapping;
-    println!();
-    println!("NAT 映射行为: {}", behavior.describe());
-    println!("mapping 证据: {}", report.evidence.describe());
-    println!("Filtering behavior: 未测量（当前只测 mapping）");
-
-    match behavior {
-        MappingBehavior::EndpointIndependent => {
-            println!("mapping 对打洞较有利，但尚未测 filtering，不能保证最终可打洞。")
-        }
-        MappingBehavior::AddressDependent => {
-            println!("mapping 仅呈条件性地址相关；尚未测 filtering，不能宣称可以打洞。")
-        }
-        MappingBehavior::AddressAndPortDependent => {
-            println!("mapping 对直接打洞不利。可考虑端口映射或中继。")
-        }
-        MappingBehavior::Unknown => {
-            println!("证据不足，不能判断 NAT mapping，也不能宣称可以打洞。")
-        }
-    }
-
-    println!();
-    println!("注意：以上端口只是「这一次查询」看到的。打洞必须复用同一个本地端口，");
-    println!("否则 NAT 给出的会是另一个映射——这也是本项目把打洞和 QUIC 绑在同一个");
-    println!("socket 上的原因。");
     Ok(())
 }
 
@@ -307,6 +263,9 @@ async fn cmd_recv(key_file: &Option<PathBuf>, listen: SocketAddr, out_dir: PathB
                     report.chunk_count,
                     report.output_path.display()
                 );
+                // Complete has been queued after durable finalize. Let the sender
+                // consume it and close, rather than overtaking it with CONNECTION_CLOSE.
+                let _ = tokio::time::timeout(Duration::from_secs(3), connection.closed()).await;
             }
             Err(err) => eprintln!("从 {remote} 接收失败: {err}"),
         }
@@ -322,7 +281,7 @@ async fn cmd_send(
     chunk_size: u32,
 ) -> Result<()> {
     let identity = load_identity(key_file)?;
-    let endpoint = client_endpoint("0.0.0.0:0".parse().unwrap())?;
+    let endpoint = client_endpoint(p2p_file::net::AddressFamily::of(peer).wildcard(0))?;
 
     println!("本机节点: {}", identity.node_id());
     println!("连接 {peer} ...");
@@ -354,6 +313,7 @@ async fn cmd_send(
 fn direct_config(opts: &DirectOpts, peer: p2p_file::identity::NodeId) -> DirectConfig {
     let mut config = DirectConfig::new(opts.signal.clone(), peer);
     config.local_port = opts.port;
+    config.families = opts.ip_family;
     config.advertise = opts.advertise.clone();
     config.signal_timeout = Duration::from_secs(opts.wait);
     config.punch = PunchConfig {
@@ -396,6 +356,15 @@ async fn shutdown_signal() {
 }
 
 /// 关掉 QUIC 端点，让对端立刻知道我们走了。
+async fn close_endpoints(endpoints: &[quinn::Endpoint]) {
+    for endpoint in endpoints {
+        endpoint.close(0u32.into(), b"bye");
+    }
+    for endpoint in endpoints {
+        close_endpoint(endpoint).await;
+    }
+}
+
 async fn close_endpoint(endpoint: &quinn::Endpoint) {
     endpoint.close(0u32.into(), b"bye");
     // 给关闭帧一点时间发出去；连不上或对端没响应也不必死等。
@@ -501,17 +470,17 @@ async fn cmd_tunnel(
 
     let config = direct_config(&direct, peer);
     let link = establish(&identity, &config).await?;
-    println!("直连已建立：{}", link.describe());
+    println!("直连候选已准备：{}", link.describe());
     println!();
-    println!("隧道已就绪：连到 {listen} 就等于连到对端的 {to}");
+    println!("本地隧道将监听 {listen}，首次访问时认证对端并转发到 {to}。");
 
     let target = to.to_string();
-    let endpoint = link.endpoint.clone();
+    let endpoints = link.endpoints();
     tokio::select! {
         result = forward_tunnel(link, identity, target, listen) => result,
         _ = shutdown_signal() => {
             println!("\n收到退出信号，正在关闭隧道……");
-            close_endpoint(&endpoint).await;
+            close_endpoints(&endpoints).await;
             Ok(())
         }
     }
@@ -530,9 +499,9 @@ async fn cmd_push(
 
     let config = direct_config(&direct, peer);
     let link = establish(&identity, &config).await?;
-    println!("直连已建立：{}", link.describe());
+    println!("直连候选已准备：{}", link.describe());
 
-    let endpoint = link.endpoint.clone();
+    let endpoints = link.endpoints();
     tokio::select! {
         result = push_file(link, identity, file, chunk_size) => {
             let report = result?;
@@ -540,12 +509,12 @@ async fn cmd_push(
                 "发送完成：{} （{} 字节，{} 片，跳过 {} 片）",
                 report.file_name, report.total_len, report.chunk_count, report.chunks_skipped
             );
-            close_endpoint(&endpoint).await;
+            close_endpoints(&endpoints).await;
             Ok(())
         }
         _ = shutdown_signal() => {
             println!("\n收到退出信号，正在收尾……");
-            close_endpoint(&endpoint).await;
+            close_endpoints(&endpoints).await;
             Ok(())
         }
     }
@@ -565,7 +534,7 @@ async fn cmd_speedtest(
 
     let config = direct_config(&direct, peer);
     let link = establish(&identity, &config).await?;
-    println!("直连已建立：{}", link.describe());
+    println!("直连候选已准备：{}", link.describe());
 
     let connection = link.connect_authenticated(&identity).await?;
     println!("已完成 QUIC / Ed25519 认证，开始内存到内存测速。\n");
@@ -589,7 +558,7 @@ async fn cmd_speedtest(
     .await;
 
     connection.close(0u32.into(), b"speedtest done");
-    close_endpoint(&link.endpoint).await;
+    close_endpoints(&link.endpoints()).await;
 
     let reports = result?;
     println!();
