@@ -390,6 +390,45 @@ impl DesktopConfig {
         config.trusted_devices = devices;
         config.write_atomic(path)
     }
+    pub fn revoke_trusted_device(
+        path: &Path,
+        peer: crate::identity::NodeId,
+    ) -> Result<Vec<super::trusted_devices::TrustedDevice>, ConfigError> {
+        Self::mutate_trusted_devices(path, |devices| {
+            devices.retain(|device| device.node_id != peer.to_hex());
+            Ok(())
+        })
+    }
+    pub fn rename_trusted_device(
+        path: &Path,
+        peer: crate::identity::NodeId,
+        display_name: String,
+    ) -> Result<Vec<super::trusted_devices::TrustedDevice>, ConfigError> {
+        Self::mutate_trusted_devices(path, |devices| {
+            let device = devices
+                .iter_mut()
+                .find(|device| device.node_id == peer.to_hex())
+                .ok_or_else(|| ConfigError::Invalid("可信设备不存在".into()))?;
+            device.display_name = display_name;
+            device.updated_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .max(device.trusted_at);
+            Ok(())
+        })
+    }
+    fn mutate_trusted_devices(
+        path: &Path,
+        change: impl FnOnce(&mut Vec<super::trusted_devices::TrustedDevice>) -> Result<(), ConfigError>,
+    ) -> Result<Vec<super::trusted_devices::TrustedDevice>, ConfigError> {
+        let _guard = config_mutation_lock()?;
+        let mut config =
+            Self::load(path)?.ok_or_else(|| ConfigError::Invalid("请先保存远程认证配置".into()))?;
+        change(&mut config.trusted_devices)?;
+        config.write_atomic(path)?;
+        Ok(config.trusted_devices)
+    }
     pub fn load(path: &Path) -> Result<Option<Self>, ConfigError> {
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
@@ -1514,6 +1553,52 @@ mod tests {
         });
         let saved = DesktopConfig::load(&path).unwrap().unwrap();
         assert_eq!(saved.trusted_devices, vec![device]);
+        assert_eq!(saved.remote_auth, Some(verifier));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn offline_rename_and_revoke_serialize_without_restoring_stale_trust() {
+        use super::super::trusted_devices::TrustedDevice;
+        use crate::identity::Identity;
+        let root = temp_dir("offline-trust-mutation");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("settings.json");
+        let draft = valid_draft(root.clone());
+        draft.save_atomic(&path).unwrap();
+        let rename = Identity::generate().node_id();
+        let revoke = Identity::generate().node_id();
+        let untouched =
+            TrustedDevice::new(Identity::generate().node_id(), "untouched".into(), None);
+        DesktopConfig::save_trusted_devices(
+            &path,
+            vec![
+                TrustedDevice::new(rename, "before".into(), Some("100000124".into())),
+                TrustedDevice::new(revoke, "removed".into(), None),
+                untouched.clone(),
+            ],
+        )
+        .unwrap();
+        let verifier = super::super::remote_auth::RemoteVerifier::create(
+            &super::super::remote_auth::SecretPassword::new("Change9".into()).unwrap(),
+        )
+        .unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                DesktopConfig::rename_trusted_device(&path, rename, "after".into()).unwrap()
+            });
+            scope.spawn(|| DesktopConfig::revoke_trusted_device(&path, revoke).unwrap());
+            scope.spawn(|| DesktopConfig::save_remote_auth(&path, verifier.clone()).unwrap());
+            scope.spawn(|| draft.save_atomic(&path).unwrap());
+        });
+        let saved = DesktopConfig::load(&path).unwrap().unwrap();
+        assert_eq!(saved.trusted_devices.len(), 2);
+        assert_eq!(saved.trusted_devices[0].node_id, rename.to_hex());
+        assert_eq!(saved.trusted_devices[0].display_name, "after");
+        assert_eq!(
+            saved.trusted_devices[0].last_short_id.as_deref(),
+            Some("100000124")
+        );
+        assert_eq!(saved.trusted_devices[1], untouched);
         assert_eq!(saved.remote_auth, Some(verifier));
         fs::remove_dir_all(root).unwrap();
     }

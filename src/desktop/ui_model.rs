@@ -255,7 +255,7 @@ pub(super) fn can_trust_peer(
 ) -> bool {
     local.is_some_and(|local| local != peer)
         && !super::trusted_devices::contains(devices, peer)
-        && matches!(state, Some(super::network_state::PeerLifecycle::Connected(a)) if a.inbound.password || a.outbound.password)
+        && matches!(state, Some(super::network_state::PeerLifecycle::Connected(a)) if a.inbound.password)
 }
 
 #[cfg(test)]
@@ -407,7 +407,7 @@ mod trusted_gui_tests {
         identity::Identity,
     };
     #[test]
-    fn explicit_trust_button_requires_verified_password_not_short_id_or_trusted_grant() {
+    fn explicit_trust_button_requires_inbound_password_regardless_of_metadata() {
         let local = Identity::generate().node_id();
         let peer = Identity::generate().node_id();
         let trusted = PeerLifecycle::Connected(RemoteAuthorization {
@@ -417,25 +417,37 @@ mod trusted_gui_tests {
             },
             outbound: AuthorizationGrant::default(),
         });
+        let outbound_password = PeerLifecycle::Connected(RemoteAuthorization {
+            inbound: AuthorizationGrant::default(),
+            outbound: AuthorizationGrant::password(true),
+        });
+        let metadata = TrustedDevice::new(
+            Identity::generate().node_id(),
+            "same name".into(),
+            Some("100000124".into()),
+        );
         for state in [
             None,
             Some(&PeerLifecycle::RemoteAuthPending),
             Some(&trusted),
+            Some(&outbound_password),
             Some(&PeerLifecycle::Disconnected),
         ] {
             assert!(!can_trust_peer(peer, Some(local), state, &[]));
+            assert!(!can_trust_peer(
+                peer,
+                Some(local),
+                state,
+                std::slice::from_ref(&metadata)
+            ));
         }
         let password = PeerLifecycle::Connected(RemoteAuthorization {
             inbound: AuthorizationGrant::password(true),
             outbound: AuthorizationGrant::default(),
         });
         assert!(can_trust_peer(peer, Some(local), Some(&password), &[]));
+        assert!(!can_trust_peer(peer, None, Some(&password), &[]));
         assert!(!can_trust_peer(local, Some(local), Some(&password), &[]));
-        let metadata = TrustedDevice::new(
-            Identity::generate().node_id(),
-            "same name".into(),
-            Some("100000124".into()),
-        );
         assert!(can_trust_peer(
             peer,
             Some(local),

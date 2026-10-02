@@ -3137,40 +3137,13 @@ impl DesktopShell {
         }
         let session = self.network_session.clone();
         let path = self.config_file.clone();
-        let mut devices = self.settings.trusted_devices.clone();
         let background = cx.background_executor().clone();
         self.is_saving_settings = true;
         self.set_status("正在保存可信设备设置…", cx);
         cx.spawn(async move |shell, cx| {
             let result = background
                 .spawn(async move {
-                    if let Some(session) = session {
-                        session.change_trusted_device(change).await
-                    } else {
-                        match change {
-                            session::TrustedDeviceChange::Trust { .. } => {
-                                return Err("当前认证会话不可用，未信任设备".to_owned());
-                            }
-                            session::TrustedDeviceChange::Revoke { peer } => {
-                                devices.retain(|d| d.node_id != peer.to_hex())
-                            }
-                            session::TrustedDeviceChange::Rename { peer, display_name } => {
-                                let device = devices
-                                    .iter_mut()
-                                    .find(|d| d.node_id == peer.to_hex())
-                                    .ok_or("可信设备不存在")?;
-                                device.display_name = display_name;
-                                device.updated_at = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs()
-                                    .max(device.trusted_at);
-                            }
-                        }
-                        DesktopConfig::save_trusted_devices(&path, devices.clone())
-                            .map_err(|e| e.to_string())?;
-                        Ok(devices)
-                    }
+                    session::change_trusted_device(session.as_ref(), &path, change).await
                 })
                 .await;
             let _ = shell.update(cx, |shell, cx| {

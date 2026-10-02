@@ -387,6 +387,7 @@ impl DesktopSessionHandle {
     }
 }
 
+#[derive(Clone)]
 pub enum TrustedDeviceChange {
     Trust {
         peer: NodeId,
@@ -400,6 +401,39 @@ pub enum TrustedDeviceChange {
     Revoke {
         peer: NodeId,
     },
+}
+
+/// Shell mutations use a live actor for runtime revocation, or the latest
+/// durable configuration after the command channel has closed. Trust is live-only.
+pub(super) async fn change_trusted_device(
+    session: Option<&DesktopSessionHandle>,
+    path: &std::path::Path,
+    change: TrustedDeviceChange,
+) -> std::result::Result<Vec<super::trusted_devices::TrustedDevice>, String> {
+    if let Some(session) = session
+        && session.is_running()
+    {
+        let result = session.change_trusted_device(change.clone()).await;
+        if result.is_ok()
+            || session.is_running()
+            || matches!(change, TrustedDeviceChange::Trust { .. })
+        {
+            return result;
+        }
+        // Shutdown may close the channel after the running check. Only a dead
+        // actor permits the offline path; a live actor's errors stay failures.
+    }
+    match change {
+        TrustedDeviceChange::Trust { .. } => Err("当前认证会话不可用，未信任设备".into()),
+        TrustedDeviceChange::Revoke { peer } => {
+            super::config::DesktopConfig::revoke_trusted_device(path, peer)
+                .map_err(|e| e.to_string())
+        }
+        TrustedDeviceChange::Rename { peer, display_name } => {
+            super::config::DesktopConfig::rename_trusted_device(path, peer, display_name)
+                .map_err(|e| e.to_string())
+        }
+    }
 }
 enum SessionCommand {
     RetryCandidates {
@@ -866,11 +900,11 @@ async fn run_session(
                                 && authorizations.get(&peer).is_some_and(|(g, _, a)| {
                                     *g == generation && {
                                         let a = a.borrow();
-                                        a.inbound.password || a.outbound.password
+                                        a.inbound.password
                                     }
                                 });
                             if !valid {
-                                return Err("只能明确信任当前已经完成密码认证的真实设备".into());
+                                return Err("只能明确信任当前已证明知道本机密码的真实设备".into());
                             }
                             if super::trusted_devices::contains(&devices, peer) {
                                 return Err("设备已经受信任".into());
@@ -4989,7 +5023,7 @@ mod tests {
         .unwrap();
     }
     #[tokio::test]
-    async fn explicit_trust_is_durable_password_does_not_auto_trust_and_failed_save_cannot_grant() {
+    async fn explicit_trust_requires_inbound_password_and_failed_save_cannot_grant() {
         use super::super::{config::DesktopConfig, remote_auth::AuthorizationGrant};
         let root = std::env::temp_dir().join(format!(
             "p2p-explicit-trust-{:032x}",
@@ -4997,13 +5031,17 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("settings.json");
+        let client_path = root.join("client.json");
         security_config(&path, vec![]);
+        security_config(&client_path, vec![]);
         let (signal, server) = start_local_server().await;
         let a = Identity::generate();
         let b = Identity::generate();
         let mut cb = auth_config(signal);
         cb.config_path = Some(path.clone());
-        let (ha, mut ea) = spawn(a.clone(), auth_config(signal)).unwrap();
+        let mut ca = auth_config(signal);
+        ca.config_path = Some(client_path.clone());
+        let (ha, mut ea) = spawn(a.clone(), ca).unwrap();
         let (hb, mut eb) = spawn(b.clone(), cb).unwrap();
         wait_signal_online(&mut ea).await;
         wait_signal_online(&mut eb).await;
@@ -5019,6 +5057,23 @@ mod tests {
         };
         wait_grants(&mut ea, b.node_id(), expected_a).await;
         wait_grants(&mut eb, a.node_id(), expected_b).await;
+        let client_generation = inspect(&ha).await[&b.node_id()].0;
+        let error = ha
+            .change_trusted_device(TrustedDeviceChange::Trust {
+                peer: b.node_id(),
+                generation: client_generation,
+                display_name: "家里 Ubuntu".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(error.contains("本机密码"));
+        assert!(
+            super::super::config::SettingsDraft::from_config(
+                DesktopConfig::load(&client_path).unwrap().unwrap()
+            )
+            .trusted_devices
+            .is_empty()
+        );
         assert!(
             super::super::config::SettingsDraft::from_config(
                 DesktopConfig::load(&path).unwrap().unwrap()
@@ -5057,14 +5112,17 @@ mod tests {
             .trusted_devices
             .is_empty()
         );
-        let devices = hb
-            .change_trusted_device(TrustedDeviceChange::Trust {
+        let devices = change_trusted_device(
+            Some(&hb),
+            &path,
+            TrustedDeviceChange::Trust {
                 peer: a.node_id(),
                 generation,
                 display_name: "家里 Ubuntu".into(),
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(devices[0].node_id, a.node_id().to_hex());
         let mixed_b = RemoteAuthorization {
             inbound: AuthorizationGrant {
@@ -5089,9 +5147,13 @@ mod tests {
             inspect(&hb).await[&a.node_id()].1.stable_id(),
             connection.stable_id()
         );
-        hb.change_trusted_device(TrustedDeviceChange::Revoke { peer: a.node_id() })
-            .await
-            .unwrap();
+        change_trusted_device(
+            Some(&hb),
+            &path,
+            TrustedDeviceChange::Revoke { peer: a.node_id() },
+        )
+        .await
+        .unwrap();
         wait_grants(&mut ea, b.node_id(), expected_a).await;
         wait_grants(&mut eb, a.node_id(), expected_b).await;
         assert!(connection.close_reason().is_none());
@@ -5123,6 +5185,227 @@ mod tests {
             .await
             .is_err()
         );
+        ha.shutdown();
+        hb.shutdown();
+        drop((ha, hb));
+        server.abort();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn dead_session_allows_durable_rename_revoke_but_never_trust_or_restart_grant() {
+        use super::super::{
+            config::{DesktopConfig, SettingsDraft},
+            remote_auth::AuthorizationGrant,
+            trusted_devices::TrustedDevice,
+        };
+        let root =
+            std::env::temp_dir().join(format!("p2p-dead-trust-{:032x}", rand::random::<u128>()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("settings.json");
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let other = Identity::generate().node_id();
+        security_config(
+            &path,
+            vec![
+                TrustedDevice::new(a.node_id(), "same name".into(), Some("100000124".into())),
+                TrustedDevice::new(other, "same name".into(), Some("100000124".into())),
+            ],
+        );
+        let load = || SettingsDraft::from_config(DesktopConfig::load(&path).unwrap().unwrap());
+        let (signal, server) = start_local_server().await;
+        let mut cb = auth_config(signal);
+        cb.config_path = Some(path.clone());
+        cb.trusted_devices = load().trusted_devices;
+        let (hb, mut eb) = spawn(b.clone(), cb).unwrap();
+        let (ha, mut ea) = spawn(a.clone(), auth_config(signal)).unwrap();
+        wait_signal_online(&mut eb).await;
+        wait_signal_online(&mut ea).await;
+        ha.connect_peer_trusted(b.node_id()).unwrap();
+        let only_trust = AuthorizationGrant {
+            password: false,
+            trusted_device: true,
+        };
+        wait_grants(
+            &mut ea,
+            b.node_id(),
+            RemoteAuthorization {
+                inbound: AuthorizationGrant::default(),
+                outbound: only_trust,
+            },
+        )
+        .await;
+        wait_grants(
+            &mut eb,
+            a.node_id(),
+            RemoteAuthorization {
+                inbound: only_trust,
+                outbound: AuthorizationGrant::default(),
+            },
+        )
+        .await;
+        let generation = inspect(&hb).await[&a.node_id()].0;
+        let error = hb
+            .change_trusted_device(TrustedDeviceChange::Trust {
+                peer: a.node_id(),
+                generation,
+                display_name: "same name".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("本机密码"),
+            "Trusted-only must fail the password gate: {error}"
+        );
+        hb.shutdown();
+        ha.shutdown();
+        time::timeout(Duration::from_secs(5), async {
+            while hb.is_running() || ha.is_running() {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("sessions must close their command channels");
+        // Keep the closed handle, exactly as the shell does after network exit.
+        let renamed = change_trusted_device(
+            Some(&hb),
+            &path,
+            TrustedDeviceChange::Rename {
+                peer: a.node_id(),
+                display_name: "renamed offline".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(renamed[0].display_name, "renamed offline");
+        assert_eq!(load().trusted_devices, renamed);
+        let saved = std::fs::read(&path).unwrap();
+        assert!(
+            change_trusted_device(
+                Some(&hb),
+                &path,
+                TrustedDeviceChange::Trust {
+                    peer: Identity::generate().node_id(),
+                    generation,
+                    display_name: "new offline".into(),
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            change_trusted_device(
+                None,
+                &path,
+                TrustedDeviceChange::Trust {
+                    peer: a.node_id(),
+                    generation,
+                    display_name: "no session".into(),
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            change_trusted_device(
+                Some(&hb),
+                &path,
+                TrustedDeviceChange::Rename {
+                    peer: a.node_id(),
+                    display_name: "\n".into(),
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+        #[cfg(unix)]
+        {
+            let link = root.join("linked.json");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert!(
+                change_trusted_device(
+                    Some(&hb),
+                    &link,
+                    TrustedDeviceChange::Revoke { peer: a.node_id() }
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), saved);
+        }
+        std::fs::write(&path, b"invalid config").unwrap();
+        assert!(
+            change_trusted_device(
+                Some(&hb),
+                &path,
+                TrustedDeviceChange::Revoke { peer: a.node_id() }
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"invalid config");
+        std::fs::write(&path, &saved).unwrap();
+        let revoked = change_trusted_device(
+            Some(&hb),
+            &path,
+            TrustedDeviceChange::Revoke { peer: a.node_id() },
+        )
+        .await
+        .unwrap();
+        assert_eq!(revoked.len(), 1);
+        assert_eq!(revoked[0].node_id, other.to_hex());
+        assert_eq!(load().trusted_devices, revoked);
+        let renamed = change_trusted_device(
+            None,
+            &path,
+            TrustedDeviceChange::Rename {
+                peer: other,
+                display_name: "no session rename".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(load().trusted_devices, renamed);
+        drop((ha, hb));
+        // New real QUIC/Ed25519 sessions load the edited file: no password and
+        // no trusted identity for A must fail, despite matching display metadata.
+        let mut cb = auth_config(signal);
+        cb.config_path = Some(path.clone());
+        cb.trusted_devices = load().trusted_devices;
+        let (hb, mut eb) = spawn(b.clone(), cb).unwrap();
+        let (ha, mut ea) = spawn(a.clone(), auth_config(signal)).unwrap();
+        wait_signal_online(&mut eb).await;
+        wait_signal_online(&mut ea).await;
+        ha.connect_peer_trusted(b.node_id()).unwrap();
+        time::timeout(Duration::from_secs(20), async {
+            while let Some(event) = ea.recv().await {
+                match event {
+                    SessionEvent::PeerState {
+                        peer,
+                        state: PeerLifecycle::Failed(detail),
+                        ..
+                    } if peer == b.node_id() => {
+                        assert!(
+                            detail.contains("认证失败"),
+                            "expected authentication denial, got: {detail}"
+                        );
+                        return;
+                    }
+                    SessionEvent::PeerState {
+                        peer,
+                        state: PeerLifecycle::Connected(auth),
+                        ..
+                    } if peer == b.node_id() => {
+                        panic!("revoked peer reauthorized after restart: {auth:?}")
+                    }
+                    _ => {}
+                }
+            }
+            panic!("restarted session closed before authorization failure");
+        })
+        .await
+        .expect("passwordless revoked peer must fail on a fresh transport");
         ha.shutdown();
         hb.shutdown();
         drop((ha, hb));

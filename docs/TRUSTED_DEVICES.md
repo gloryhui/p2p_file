@@ -5,6 +5,9 @@
 首次连接输入对端设备 ID 和 Remote Password。连接或密码认证成功不会写入可信名单。
 在连接页或设置页明确点击「信任此设备」，才允许这个真实 NodeId 以后免输入本机密码。
 这是一项单向授权：B 信任 A，只允许 A 访问 B；B 访问 A 仍需密码或 A 的明确授权。
+首次 Trust 必须有当前会话的 `inbound.password`：对端已证明知道本机密码。
+A 输入 B 密码后，应由 B 手动信任 A；A 的 `outbound.password` 不能授权 B 访问 A。
+GUI 按钮和 Session 后端都检查这个方向；Trusted-only、Short ID 或名称不能替代密码证明。
 
 设置页的「可信设备」显示本地备注、历史 Short ID、真实 NodeId 和信任日期，支持复制
 完整 NodeId、改名和取消信任。名称及 Short ID 只用于展示。连接页密码可留空，客户端
@@ -33,8 +36,12 @@ binding → Desktop 能力协商 → Remote Auth → 发布业务连接。CLI �
 
 密码、可信名单和一般设置写入通过同一锁串行化；旧设置草稿不能覆盖最新安全字段。
 可信操作先持久化，成功后才更新 runtime。添加信任还要再次核对当前连接、generation
-以及真实 Password grant；断线或旧 GUI 回调不能新增信任。密码轮换保留名单，撤销
+以及真实 inbound Password grant；断线或旧 GUI 回调不能新增信任。密码轮换保留名单，撤销
 旧 transport 后可在新的身份绑定连接上重新获得 Trusted grant。
+
+网络会话不存在或 command channel 已关闭时，改名和撤销仍可持久化，包括保留关闭
+handle 的情况。离线操作在配置写入锁内读取最新名单、只修改目标身份并安全原子写入；
+损坏配置或链接路径会失败，GUI 仅在保存成功后更新名单。离线永远不能新增 Trust。
 
 取消信任立即移除本机 inbound Trusted 来源并通知对端。业务流读取当前 transport 的
 动态权限，按方向中断文件、测速和 Tunnel；仍有 Password grant 的方向继续运行。
@@ -54,9 +61,10 @@ binding → Desktop 能力协商 → Remote Auth → 发布业务连接。CLI �
 - Remote Auth：单向 Trusted only、Password only、混合来源精确撤销、密码失败统计、
   旧 capability、身份/挑战/TLS session/序号重放、认证中撤销、快速撤销再授权。
 - Session：真实 Ed25519 连接上的手动信任、旧 generation 点击、失败写入不授权、
+  outbound Password / Trusted-only 拒绝首次 Trust、关闭 handle 的改名/撤销及重启不恢复授权、
   断线拒绝信任、免密重启 auto_start、活动 Tunnel 撤销后密码恢复、双向文件传输中
   精确保留 Password 方向，以及既有文件/目录/恢复/测速/Tunnel allowlist 回归。
-- GUI：按钮只基于已验证会话及 Password 来源，排除本机、已可信、待认证和断线 peer；
+- GUI：按钮只基于已验证会话及 inbound Password 来源，排除本机、已可信、待认证和断线 peer；
   Short ID/名称相同不能产生信任，状态显示明确区分授权来源与方向。
 - 三平台 GPUI workflow 运行完整 GUI 库测试、原生编译及打包；Windows full tests
   workflow 继续检查 CLI/NAT/storage 行为。
