@@ -3848,7 +3848,12 @@ mod tests {
                 outbound: AuthorizationGrant::password(true),
             };
             pair.b.revoke_authorization(pair.ia, rights).await.unwrap();
-            release.send(()).unwrap();
+            if revoke_request_direction {
+                // Cancellation can already have dropped the gated data future.
+                let _ = release.send(());
+            } else {
+                release.send(()).unwrap();
+            }
             let result = tokio::time::timeout(Duration::from_secs(5), job)
                 .await
                 .unwrap()

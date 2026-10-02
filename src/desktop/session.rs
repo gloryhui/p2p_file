@@ -3479,6 +3479,17 @@ mod tests {
         assert!(inspect(&hb).await.is_empty());
         ha.connect_peer_with_password(b.node_id(), test_password())
             .unwrap();
+        // The automatic no-password attempt may already have reported failure.
+        // Verify this explicit password request's real grant before waiting on the listener.
+        wait_grants(
+            &mut ea,
+            b.node_id(),
+            RemoteAuthorization {
+                inbound: crate::desktop::remote_auth::AuthorizationGrant::default(),
+                outbound: crate::desktop::remote_auth::AuthorizationGrant::password(true),
+            },
+        )
+        .await;
         wait_specific_tunnel_state(&mut ea, &rule.id, TunnelRuntimeState::Running).await;
         wait_grants(
             &mut eb,
@@ -3549,6 +3560,17 @@ mod tests {
         assert!(inspect(&ha).await.is_empty()); // Command barrier before authentication.
         ha.connect_peer_with_password(b.node_id(), test_password())
             .unwrap();
+        // The automatic no-password attempt may already have reported failure.
+        // Verify this explicit password request's real grant before waiting on the listener.
+        wait_grants(
+            &mut ea,
+            b.node_id(),
+            RemoteAuthorization {
+                inbound: crate::desktop::remote_auth::AuthorizationGrant::default(),
+                outbound: crate::desktop::remote_auth::AuthorizationGrant::password(true),
+            },
+        )
+        .await;
         wait_specific_tunnel_state(&mut ea, &rules[0].id, TunnelRuntimeState::Running).await;
         for rule in &rules[1..] {
             assert!(
@@ -4095,11 +4117,23 @@ mod tests {
 
     #[tokio::test]
     async fn signal_restart_re_registers_the_same_identity_after_bounded_backoff() {
-        let (signal_server, server) = start_local_server_with(SignalServerConfig {
-            idle_timeout: Duration::from_millis(250),
-            ..SignalServerConfig::for_tests()
-        })
-        .await;
+        // Keep ownership of the ephemeral port across server epochs. Releasing
+        // it lets an unrelated parallel fixture reuse it before the restart
+        // (observed as AddrInUse on macOS). The old client tasks still terminate.
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        reserved.set_nonblocking(true).unwrap();
+        let signal_server = reserved.local_addr().unwrap();
+        let initial = TcpListener::from_std(reserved.try_clone().unwrap()).unwrap();
+        let server = tokio::spawn(async move {
+            let _ = run_signal_server_on_with(
+                initial,
+                SignalServerConfig {
+                    idle_timeout: Duration::from_millis(250),
+                    ..SignalServerConfig::for_tests()
+                },
+            )
+            .await;
+        });
         let identity = Identity::generate();
         let (handle, mut events) = spawn(identity.clone(), local_config(signal_server)).unwrap();
         wait_signal_online(&mut events).await;
@@ -4119,7 +4153,7 @@ mod tests {
         .await
         .expect("session should detect signaling disconnect and schedule bounded retry");
 
-        let listener = TcpListener::bind(signal_server).await.unwrap();
+        let listener = TcpListener::from_std(reserved).unwrap();
         let restarted_server = tokio::spawn(async move {
             let _ = run_signal_server_on_with(listener, SignalServerConfig::for_tests()).await;
         });
