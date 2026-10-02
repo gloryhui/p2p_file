@@ -303,7 +303,8 @@ $BIN --log info tunnel --signal $SIGNAL --peer $HOME_ID --listen 127.0.0.1:2222 
 
 **实测过**（`./scripts/e2e.sh`，每次改代码都会跑）：
 
-- 真起三个进程跑完整链路：信令牵线 → UDP 打洞 → QUIC 直连 → 隧道转发 → 文件落盘校验。
+- 真起进程跑完整链路：信令牵线 → 原生 IPv4/IPv6 QUIC 直连或认证 UDP Relay 兜底
+  → 隧道转发 → 文件落盘校验；Relay fixture 使用可控直连黑洞，不依赖公网服务器。
 - 隧道搬运 1MB 随机数据无损，支持多条并发连接。
 - 文件直推 2MB，sha256 一致。
 - 断开后 `serve` 重新打洞，再连一次仍然成功。
@@ -401,8 +402,8 @@ Tunnel 的 peer/target allowlist。
 
 IPv6 仍需要操作系统、路由器和云安全组允许相应 UDP 端口。没有 global IPv6 的网络可
 通过 IPv4 path 工作；跨网络公网 IPv6 是否可达需要两台真实主机验证。自动化覆盖原生
-IPv6 loopback 和可控黑洞，不代表已实测公网 IPv6 穿透。未实现 Relay/TURN、UPnP、
-NAT-PMP、PCP、link-local scope-id、Multipath QUIC。
+IPv6 loopback 和可控黑洞，不代表已实测公网 IPv6 穿透。可选认证 UDP Relay 兜底见上节；
+未实现完整 TURN/ICE、TCP/TLS Relay、UPnP、NAT-PMP、PCP、link-local scope-id、Multipath QUIC。
 
 ## 局域网直连（不经过信令服务器）
 
