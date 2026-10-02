@@ -5,7 +5,7 @@ use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
-// A zero first byte cannot collide with QUIC's required fixed/header bits.
+// Relay endpoints disable fixed-bit greasing; zero cannot collide with their QUIC headers.
 pub const MAGIC: &[u8] = b"\0P2PF-RELAY/1";
 pub const VERSION: u32 = 1;
 pub const MAX_CONTROL: usize = 512;

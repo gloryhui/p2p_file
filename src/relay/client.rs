@@ -218,7 +218,15 @@ async fn bind_with_progress(
             "Relay UDP {family} 已就绪；等待端到端 QUIC 身份认证"
         ));
     }
-    let endpoint = crate::transport::quic::endpoint_from_socket(socket.into_std()?)?;
+    // Keep the admission magic disjoint from these endpoints' QUIC headers.
+    // Quinn defaults to accepting/advertising fixed-bit greasing (RFC 9287).
+    // Direct paths keep their existing default; both Relay peers opt out.
+    let mut endpoint_config = quinn::EndpointConfig::default();
+    endpoint_config.grease_quic_bit(false);
+    let endpoint = crate::transport::quic::endpoint_from_socket_with_config(
+        socket.into_std()?,
+        endpoint_config,
+    )?;
     if endpoint.local_addr()? != local {
         return Err(Error::Transport(
             "Relay socket changed at Quinn handoff".into(),

@@ -508,7 +508,8 @@ native Direct IPv6 + IPv4 race
 不修改 `SignalMessage` variant 或既有注册签名/线格式。无 Relay 配置保持原有直连分支，
 既不解析 Relay DNS，也不创建 UDP attempt。
 
-UDP control 有不可能与合法 QUIC 首字节冲突的 magic、严格版本、固定大小数组字段、
+Relay Quinn endpoint 仅关闭 fixed-bit greasing，使 UDP control magic 与合法 QUIC 首字节
+严格分离；Direct 保留原有配置。UDP control 另有严格版本、固定大小数组字段、
 512-byte 上限和 trailing-byte 拒绝。Hello 校验真实 pair、公钥 hash 与有效 Ed25519 key；
 随机 server/client nonce、token、两个 NodeId、公钥和真实 source tuple 均纳入独立
 `p2p_file/relay-bind/v1` 域的签名。严格 Ed25519 验签后一次性消费 challenge；
@@ -529,7 +530,9 @@ rebinding，也不为 session 分配服务器新端口。部署者放通 TCP 信
 RelayReady 后仍必须验证端到端身份。每次 Relay attempt 的 socket 完成交接后由其
 PreparedTransport/ConnectionGuard 持有，取消/错误/loser 立即关闭连接，胜者 Endpoint
 由有界、带 shutdown fence 的 network pool 保留。Desktop 复用相同 peer generation、
-角色规则与 actor publication gate；迟到 completion 不覆盖新 transport。
+角色规则与 actor publication gate；迟到 completion 不覆盖新 transport。真实 pairing 若先于旧 Relay transport 的 close callback
+到达，只保存有界 deferred offer，等实际 closure 后才在新 generation 重新认证；不会凭
+signaling 事件替换健康的现有 winner，也不等待 blackhole direct probe 来确认 closure。
 CLI 的业务客户端提交全局 winner FIN，业务服务端等 FIN；Relay QUIC connect/accept
 仍按 NodeId 排序决定，与业务角色独立，不产生两套 handler。CLI 重连重新登记并取得
 真实 fresh pairing，新 socket、新 TLS、重新验证身份。三平台测试覆盖两种 QUIC 角色。

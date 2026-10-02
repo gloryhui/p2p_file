@@ -525,6 +525,8 @@ enum SessionCommand {
         tunnel_rules: Vec<super::config::TunnelRule>,
     },
     #[cfg(test)]
+    InspectDeferred(NodeId, oneshot::Sender<Option<PunchToken>>),
+    #[cfg(test)]
     Inspect(oneshot::Sender<HashMap<NodeId, (u64, quinn::Connection)>>),
 }
 
@@ -914,6 +916,10 @@ async fn run_session(
             continue;
         }
         match wake {
+            #[cfg(test)]
+            Wake::Command(Some(SessionCommand::InspectDeferred(peer, reply))) => {
+                let _ = reply.send(deferred_candidates.get(&peer).map(|(_, token)| *token));
+            }
             #[cfg(test)]
             Wake::Command(Some(SessionCommand::Inspect(reply))) => {
                 let _ = reply.send(connections.clone());
@@ -1341,6 +1347,9 @@ async fn run_session(
                     continue;
                 }
                 if !reuse_authorized {
+                    if network.relay.is_some() {
+                        deferred_candidates.remove(&peer);
+                    }
                     if let Some((_, attempt)) = peer_attempts.remove(&peer) {
                         attempt.abort();
                     }
@@ -1741,6 +1750,17 @@ async fn run_session(
                         continue;
                     }
                     let canonical = canonical_candidates(&candidates);
+                    if network.relay.is_some()
+                        && peers
+                            .state(node_id)
+                            .is_some_and(PeerLifecycle::is_connected)
+                    {
+                        // A real pairing may precede the old transport's close callback.
+                        // Direct probes cannot confirm an unchanged blackhole candidate on
+                        // a Relay path. Preserve the offer without replacing any live winner;
+                        // only actual closure may consume it for a fresh generation.
+                        deferred_candidates.insert(node_id, (candidates.clone(), token));
+                    }
                     if peers
                         .state(node_id)
                         .is_some_and(PeerLifecycle::is_connected)
@@ -2372,6 +2392,12 @@ async fn run_session(
                         let _ = command_tx.try_send(SessionCommand::ConnectPeer(peer));
                     }
                     peer_candidates.remove(&peer);
+                    let relay_retry = if network.relay.is_some() {
+                        reconnect_probes.remove(&peer); // retire old token/source routes first
+                        deferred_candidates.remove(&peer)
+                    } else {
+                        None
+                    };
                     if peers.transition(peer, generation, PeerLifecycle::Disconnected) {
                         emit_peer_state(&events, peer, generation, PeerLifecycle::Disconnected)
                             .await;
@@ -2383,6 +2409,13 @@ async fn run_session(
                             },
                         )
                         .await;
+                    }
+                    if let Some((candidates, token)) = relay_retry {
+                        let _ = command_tx.try_send(SessionCommand::RetryCandidates {
+                            peer,
+                            candidates,
+                            token,
+                        });
                     }
                 }
             }
@@ -4028,6 +4061,85 @@ mod tests {
             .unwrap();
         pool.close();
         drop((guard, remote));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn relay_pairing_before_close_keeps_live_winner_then_reconnects_on_fresh_tls() {
+        async fn deferred(handle: &DesktopSessionHandle, peer: NodeId) -> Option<PunchToken> {
+            let (tx, rx) = oneshot::channel();
+            handle
+                .commands
+                .send(SessionCommand::InspectDeferred(peer, tx))
+                .await
+                .unwrap();
+            time::timeout(Duration::from_secs(2), rx)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+        let (signal, relay, server) = crate::relay::tests::signaling_fixture().await;
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let blackhole_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let blackhole_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut ca = auth_config(signal);
+        let mut cb = auth_config(signal);
+        for (config, blackhole) in [(&mut ca, &blackhole_a), (&mut cb, &blackhole_b)] {
+            config.network.families = crate::net::NetworkFamilies::Ipv4Only;
+            config.network.relay_server = Some(relay.to_string());
+            config.network.advertise_only = true;
+            config.network.advertise = vec![blackhole.local_addr().unwrap()];
+        }
+        let (ha, mut ea) = spawn(a.clone(), ca).unwrap();
+        let (hb, mut eb) = spawn(b.clone(), cb).unwrap();
+        wait_signal_online(&mut ea).await;
+        wait_signal_online(&mut eb).await;
+        ha.connect_peer_with_password(b.node_id(), test_password())
+            .unwrap();
+        let rights_a = wait_authorization(&mut ea, b.node_id()).await;
+        let rights_b = wait_authorization(&mut eb, a.node_id()).await;
+        let (old_generation, old) = inspect(&ha).await[&b.node_id()].clone();
+        let old_b = inspect(&hb).await[&a.node_id()].1.clone();
+        let binding = ChannelBinding::from_connection(&old).unwrap();
+        ha.connect_peer(b.node_id()).unwrap(); // Actual server signs/registers/pairs; no synthetic token.
+        time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let (Some(a), Some(b)) = (
+                    deferred(&ha, b.node_id()).await,
+                    deferred(&hb, a.node_id()).await,
+                ) && a == b
+                {
+                    break;
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            inspect(&ha).await[&b.node_id()].1.stable_id(),
+            old.stable_id()
+        );
+        assert_eq!(
+            inspect(&hb).await[&a.node_id()].1.stable_id(),
+            old_b.stable_id()
+        );
+        assert!(old.close_reason().is_none()); // Signaling alone cannot replace a live winner.
+        while ea.try_recv().is_ok() {}
+        while eb.try_recv().is_ok() {}
+        old_b.close(0u32.into(), b"force pairing-before-close ordering");
+        assert_eq!(wait_authorization(&mut ea, b.node_id()).await, rights_a);
+        assert_eq!(wait_authorization(&mut eb, a.node_id()).await, rights_b);
+        let (generation, fresh) = inspect(&ha).await[&b.node_id()].clone();
+        assert_ne!(generation, old_generation);
+        assert_eq!(fresh.remote_address(), relay);
+        assert_ne!(ChannelBinding::from_connection(&fresh).unwrap(), binding);
+        assert_eq!(inspect(&ha).await.len(), 1);
+        ha.shutdown();
+        hb.shutdown();
+        drop((ha, hb));
         server.abort();
         let _ = server.await;
     }
