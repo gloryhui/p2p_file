@@ -5,8 +5,9 @@
 - **传文件** —— 分片、BLAKE3 逐片校验、断点续传。
 - **通用 TCP 隧道** —— 把本机一个端口转发到对端的任意服务（`ssh`、`rdp`、`http`……）。
 
-两种情况下的业务数据都是**点对点**的。中间只需要一台公网机器帮忙**牵线**
-（交换双方的地址），它一个字节的业务数据都看不到。
+直连成功时服务器只交换地址，不承载业务数据。用户配置 Relay 且直连尚未认证成功时，
+Relay UDP 服务延迟转发**加密 QUIC datagram**；QUIC / Ed25519 仍是两台设备端到端，
+服务器看不到业务明文。
 
 ## 快速开始
 
@@ -43,7 +44,7 @@ export SIGNAL=0.0.0.0:7000
 $BIN signal-server --listen $SIGNAL
 ```
 
-记得在**云厂商的安全组**里放通 TCP 7000。这是唯一需要对外开放的端口。
+直连模式在**云厂商的安全组**里放通 TCP 7000；启用 Relay 时还需放通对应 UDP 端口。
 
 它只做牵线，1 核 1M 带宽都绰绰有余。开机自启见[部署](#部署为-systemd-服务)。
 
@@ -319,8 +320,52 @@ $BIN --log info tunnel --signal $SIGNAL --peer $HOME_ID --listen 127.0.0.1:2222 
 
 **没做**：
 
-- 对称型 NAT 的中继兜底（TURN / relay）。
+- 完整 TURN / ICE、TCP/TLS Relay、Multipath QUIC、自动连接迁移。
 - UPnP / NAT-PMP 自动端口映射（`nat::portmap` 是空壳，暂时用 `--advertise` 手工替代）。
+
+## 可选认证 UDP Relay 兜底（M3）
+
+双方使用同一 signaling 服务签发的 pairing，配置其 Relay UDP 地址：
+
+```bash
+# 自建服务器：TCP 信令 + 固定 UDP Relay listener
+p2p_file signal-server --listen 0.0.0.0:7000 --relay-listen 0.0.0.0:7001
+# 可再加一个原生 IPv6 listener；不用 IPv4-mapped socket
+# --relay-listen '[::]:7001'
+
+# 双方在现有 serve / tunnel / push / speedtest 命令中加：
+# --relay relay.example.com:7001
+p2p_file serve --signal signal.example.com:7000 --relay relay.example.com:7001 \
+  --allow <PEER_NODE_ID> --forward 127.0.0.1:22
+p2p_file tunnel --signal signal.example.com:7000 --relay relay.example.com:7001 \
+  --peer <SERVER_NODE_ID> --listen 127.0.0.1:2222 --to 127.0.0.1:22
+```
+
+云安全组与主机防火墙放通 **TCP 7000 + UDP 7001**（端口可自选）。
+Relay 需要实际转发带宽；直连成功时仍不走服务器。GPUI 的“高级网络设置”增加
+**Relay Server**，填写 `HOST:UDP_PORT`、`IPv4:PORT` 或 `[IPv6]:PORT`，留空保持直连。
+保存按原有安全配置写入路径进行，网络设置变更会关闭旧 transport 并重新认证。
+
+连接顺序：原生 IPv6 / IPv4 直连竞速 → 2.5 秒无 authenticated winner → 延迟解析并
+尝试 Relay。未配置时没有 Relay DNS、UDP socket 或 admission 请求。每个 peer/地址族
+attempt 使用独立 socket，challenge-response + Ed25519 admission 后，收到 RelayReady
+才将**同一个 socket**交给 Quinn。RelayReady 只是 UDP 就绪，身份仍需真实 NodeId、
+双边 Ed25519 签名、当前 TLS exporter binding 和 Ready；仅一个 winner 提交 FIN。
+
+Relay ticket 只来自真实在线节点 pairing，有 TTL、并发数量与单 IP pending 上限。
+第三方 source、未知 ticket、错 pair/公钥/签名与重放均拒绝。两边绑定前丢弃数据，
+不排队；绑定后的 source 不能漂移或抢占，断线重新 pairing。Relay 不解码 QUIC 或
+文件/Tunnel/Speedtest，不解密、不落盘；恶意服务器可以阻断，不能冒充设备。
+Remote Password / Trusted Device / 单向授权 / Tunnel allowlist 语义均保持原样，
+新 transport 的授权必须重新绑定，Relay 不自动建立信任，也不保存对端密码。
+
+运行时区分 `IPv6 Direct`、`IPv4 Direct`、`Relay IPv6`、`Relay IPv4`，日志包含
+`path_kind`、family、remote。GPUI 依次显示 fallback、UDP 就绪、最终认证路径。
+
+`./scripts/e2e.sh` 依次测试 IPv4、IPv6 和确定性的本地 Relay fixture；后者公布实际
+被持有且不回应的 blackhole candidates（`--advertise-only` 诊断选项），验证真实
+pairing → admission → 端到端 QUIC → 1MB Tunnel / 多连接 / 文件 hash / Speedtest / 重连。
+原生三平台 loopback 测试不依赖公网；跨 NAT 的真实部署可达性仍需实际网络验收。
 
 ## IPv6 原生直连与双栈竞速
 
@@ -425,7 +470,8 @@ Ed25519 握手承担。但光有握手还不够——如果签名不绑定当前
 `A ↔ M ↔ B` 两条独立连接，把 `Hello / HelloAck / Auth` 原样搬过去，让两边都验证通过。
 现在签名覆盖了当前会话绑定值，这种转发必然验不过，**中间人无法透明代理握手**。
 
-信令服务器知道**谁在跟谁说话**（节点 ID 和 IP），但看不到任何业务数据；登记内容
+信令服务器知道**谁在跟谁说话**（节点 ID 和 IP）；启用的 Relay 还能观察包大小与时序，
+但看不到业务明文。登记内容
 已由私钥签名认证，所以没人能冒充别人的节点 ID 去登记。
 
 安全边界要说准确：信令走的是**明文 TCP**，而且注册签名的保护范围只到

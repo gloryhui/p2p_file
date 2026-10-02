@@ -4,9 +4,9 @@
 //!
 //! 1. 节点上线时登记自己的节点 ID 和候选地址；
 //! 2. 一方查询另一方时，把双方候选互相推送；
-//! 3. 之后双方自行打洞，数据走直连，服务器不参与。
+//! 3. 之后双方自行直连；可选独立 Relay UDP task 只转发加密 datagram。
 //!
-//! 走 TCP + 长度前缀 postcard，这样只要放通一个 TCP 端口就能用。
+//! 信令走 TCP + 长度前缀 postcard；启用 Relay 还需放通配置的 UDP 端口。
 //!
 //! # 信令本身是明文的，所以注册必须自证身份
 //!
@@ -97,6 +97,8 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// 默认值面向公网部署；测试用更小的值来快速验证边界行为。
 #[derive(Clone, Debug)]
 pub struct SignalServerConfig {
+    /// None preserves the direct-only server startup and wire protocol.
+    pub relay: Option<crate::relay::server::RelayServerConfig>,
     /// Persistent by default. None explicitly opts into an ephemeral embedded/test registry.
     pub short_id_database: Option<PathBuf>,
     /// New durable mappings only; reconnects do not consume these budgets.
@@ -137,6 +139,7 @@ pub struct SignalServerConfig {
 impl Default for SignalServerConfig {
     fn default() -> Self {
         Self {
+            relay: None,
             short_id_database: Some(PathBuf::from("signal-device-ids.sqlite3")),
             max_short_id_mappings: 1_000_000,
             short_id_allocations_per_minute: 120,
@@ -427,6 +430,7 @@ struct WaiterKey {
 /// 内存里的在线表。进程重启即清空——客户端会重新登记。
 #[derive(Default)]
 struct Registry {
+    relay: Option<crate::relay::server::Admission>,
     short_lookup_ips: HashMap<IpAddr, LookupWindow>,
     peers: HashMap<NodeId, PeerRecord>,
     /// 谁在等谁上线：`waiters[target] = { (requester, connection_id), ... }`。
@@ -647,6 +651,11 @@ impl Registry {
         // 顺序写进双方的发送队列，两边读到的第一条必然是同一次牵线的，
         // `同一对节点拿到的令牌必须一致` 这条测试盯着这个不变量。
         let token = PunchToken::random();
+        if let Some(relay) = &self.relay
+            && !relay.issue(token, a, b)
+        {
+            tracing::warn!("Relay ticket capacity unavailable; direct pairing still proceeds");
+        }
 
         tracing::info!(
             a = %a.short(),
@@ -731,9 +740,35 @@ pub(crate) async fn run_signal_server_on_borrowed(
     config: SignalServerConfig,
 ) -> Result<()> {
     let local = listener.local_addr()?;
-    tracing::info!(%local, "信令服务器已启动，等待节点接入（只牵线，不过数据）");
+    tracing::info!(%local, "信令服务器已启动，等待节点接入");
 
-    let registry = Arc::new(Mutex::new(Registry::default()));
+    let mut relay_tasks = tokio::task::JoinSet::new();
+    let relay = if let Some(relay_config) = &config.relay {
+        relay_config.validate()?;
+        if relay_config.listen.is_empty() {
+            return Err(Error::Discovery(
+                "enabled Relay requires a UDP listener".into(),
+            ));
+        }
+        let admission = crate::relay::server::Admission::new(relay_config.clone())?;
+        let mut sockets = Vec::new();
+        for address in &relay_config.listen {
+            let socket = tokio::net::UdpSocket::from_std(crate::net::family::bind_udp(*address)?)?;
+            sockets.push(socket);
+        }
+        relay_tasks.spawn(crate::relay::server::run_listeners(
+            sockets,
+            admission.clone(),
+        ));
+        Some(admission)
+    } else {
+        tracing::info!("Relay UDP disabled; signal exchanges candidates only");
+        None
+    };
+    let registry = Arc::new(Mutex::new(Registry {
+        relay,
+        ..Registry::default()
+    }));
     let short_ids = ShortIdResources::new(&config)?;
     let config = Arc::new(config);
 
@@ -745,6 +780,9 @@ pub(crate) async fn run_signal_server_on_borrowed(
         let accepted = tokio::select! {
             accepted = listener.accept() => accepted,
             _ = clients.join_next(), if !clients.is_empty() => continue,
+            ended = relay_tasks.join_next(), if !relay_tasks.is_empty() => {
+                return Err(Error::Discovery(format!("Relay UDP task stopped: {ended:?}")));
+            },
         };
         let (stream, remote) = match accepted {
             Ok(pair) => pair,

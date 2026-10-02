@@ -99,6 +99,7 @@ impl SpeedtestDirection {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SettingsDraft {
+    pub relay_server: Option<String>,
     pub signal_host: String,
     pub signal_port: String,
     pub receive_directory: Option<PathBuf>,
@@ -189,6 +190,7 @@ fn new_rule_id() -> String {
 impl SettingsDraft {
     pub fn defaults(downloads_dir: Option<PathBuf>) -> Self {
         Self {
+            relay_server: None,
             signal_host: String::new(),
             signal_port: String::new(),
             receive_directory: downloads_dir,
@@ -210,6 +212,7 @@ impl SettingsDraft {
             direction => direction,
         };
         Self {
+            relay_server: config.relay_server,
             signal_host: config
                 .signal
                 .as_ref()
@@ -250,6 +253,7 @@ impl SettingsDraft {
         }
 
         let config = DesktopConfig {
+            relay_server: self.relay_server.clone(),
             schema_version: CONFIG_SCHEMA_VERSION,
             signal: Some(SignalConfig {
                 host: host.to_owned(),
@@ -319,6 +323,8 @@ impl DesktopConfig {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DesktopConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    relay_server: Option<String>,
     schema_version: u32,
     signal: Option<SignalConfig>,
     receive_directory: Option<PathBuf>,
@@ -365,6 +371,7 @@ impl DesktopConfig {
         let mut config = match Self::load(path)? {
             Some(config) => config,
             None => Self {
+                relay_server: None,
                 schema_version: CONFIG_SCHEMA_VERSION,
                 signal: None,
                 receive_directory: None,
@@ -457,6 +464,7 @@ impl DesktopConfig {
                     return Err(ConfigError::Corrupt("旧配置版本字段不一致".into()));
                 }
                 Self {
+                    relay_server: None,
                     schema_version: CONFIG_SCHEMA_VERSION,
                     signal: Some(legacy.signal),
                     receive_directory: Some(legacy.receive_directory),
@@ -513,6 +521,10 @@ impl DesktopConfig {
             if signal.port == 0 {
                 return Err(ConfigError::Invalid("信令端口必须在 1..65535 内".into()));
             }
+        }
+        if let Some(relay) = &self.relay_server {
+            crate::relay::client::validate_server_spec(relay)
+                .map_err(|e| ConfigError::Invalid(e.to_string()))?;
         }
         validate_send_concurrency(self.send_concurrency)?;
         validate_speedtest_seconds(self.speedtest_seconds)?;
@@ -927,6 +939,7 @@ mod tests {
 
     fn valid_draft(receive_directory: PathBuf) -> SettingsDraft {
         SettingsDraft {
+            relay_server: None,
             signal_host: "relay.example.test".into(),
             signal_port: "7000".into(),
             receive_directory: Some(receive_directory),
@@ -1003,6 +1016,7 @@ mod tests {
             SpeedtestDirection::Upload
         );
         let upgraded = SettingsDraft::from_config(DesktopConfig {
+            relay_server: None,
             schema_version: CONFIG_SCHEMA_VERSION,
             signal: Some(SignalConfig {
                 host: "relay.example.test".into(),
@@ -1151,6 +1165,65 @@ mod tests {
         for value in [0, 31, 90, 660] {
             assert!(validate_speedtest_seconds(value).is_err());
         }
+    }
+
+    #[test]
+    fn relay_optional_persistence_validation_and_password_rotation() {
+        let root = temp_dir("relay-settings");
+        let receive = root.join("receive");
+        fs::create_dir_all(&receive).unwrap();
+        let path = root.join("settings.json");
+        let mut draft = valid_draft(receive);
+        let old = serde_json::to_value(draft.to_config().unwrap()).unwrap();
+        assert!(old.get("relay_server").is_none());
+        draft.relay_server = Some("relay.example.invalid:7001".into());
+        draft.save_atomic(&path).unwrap();
+        let loaded = DesktopConfig::load(&path).unwrap().unwrap();
+        assert_eq!(
+            SettingsDraft::from_config(loaded).relay_server,
+            draft.relay_server
+        );
+        DesktopConfig::save_trusted_devices(
+            &path,
+            vec![super::super::trusted_devices::TrustedDevice::new(
+                crate::identity::Identity::generate().node_id(),
+                "trusted".into(),
+                None,
+            )],
+        )
+        .unwrap();
+        let secret = super::super::remote_auth::SecretPassword::new("Relay9Pass".into()).unwrap();
+        DesktopConfig::save_remote_auth(
+            &path,
+            super::super::remote_auth::RemoteVerifier::create(&secret).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            SettingsDraft::from_config(DesktopConfig::load(&path).unwrap().unwrap()).relay_server,
+            draft.relay_server
+        );
+        draft.relay_server = Some("[::ffff:127.0.0.1]:7001".into());
+        assert!(draft.save_atomic(&path).is_err());
+        assert_eq!(
+            SettingsDraft::from_config(DesktopConfig::load(&path).unwrap().unwrap())
+                .relay_server
+                .as_deref(),
+            Some("relay.example.invalid:7001")
+        );
+        draft.relay_server = None;
+        draft.save_atomic(&path).unwrap();
+        assert!(
+            SettingsDraft::from_config(DesktopConfig::load(&path).unwrap().unwrap())
+                .relay_server
+                .is_none()
+        );
+        assert_eq!(
+            SettingsDraft::from_config(DesktopConfig::load(&path).unwrap().unwrap())
+                .trusted_devices
+                .len(),
+            1
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

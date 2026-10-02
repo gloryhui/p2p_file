@@ -13,21 +13,47 @@ pub const CANDIDATE_STAGGER: Duration = Duration::from_millis(50);
 pub const PATH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Close on errors, task cancellation and losers, even if Quinn has other handles.
-pub struct ConnectionGuard(Option<quinn::Connection>);
+pub struct ConnectionGuard {
+    connection: Option<quinn::Connection>,
+    relay_endpoint: Option<quinn::Endpoint>,
+}
 impl ConnectionGuard {
     pub fn new(connection: quinn::Connection) -> Self {
-        Self(Some(connection))
+        Self {
+            connection: Some(connection),
+            relay_endpoint: None,
+        }
     }
     pub fn connection(&self) -> &quinn::Connection {
-        self.0.as_ref().unwrap()
+        self.connection.as_ref().unwrap()
     }
     pub fn release(mut self) -> quinn::Connection {
-        self.0.take().unwrap()
+        assert!(
+            self.relay_endpoint.is_none(),
+            "Relay endpoint ownership must be retained before releasing its connection"
+        );
+        self.connection.take().unwrap()
+    }
+    pub fn own_relay_endpoint(&mut self, endpoint: quinn::Endpoint) {
+        self.relay_endpoint = Some(endpoint);
+    }
+    pub fn retain_relay_endpoint(
+        &mut self,
+        pool: &crate::relay::client::EndpointPool,
+    ) -> Result<()> {
+        if let Some(endpoint) = &self.relay_endpoint {
+            pool.retain(self.connection(), endpoint.clone())?;
+        }
+        self.relay_endpoint.take();
+        Ok(())
+    }
+    pub fn is_relay(&self) -> bool {
+        self.relay_endpoint.is_some()
     }
 }
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        if let Some(connection) = &self.0 {
+        if let Some(connection) = &self.connection {
             connection.close(0u32.into(), b"unselected or cancelled transport");
         }
     }
@@ -41,6 +67,47 @@ pub struct PreparedTransport {
     _recv: quinn::RecvStream,
 }
 impl PreparedTransport {
+    pub async fn accept(
+        incoming: quinn::Incoming,
+        identity: &Identity,
+        expected: NodeId,
+    ) -> Result<Self> {
+        let connection = incoming
+            .await
+            .map_err(|e| Error::Transport(e.to_string()))?;
+        let guard = ConnectionGuard::new(connection);
+        let binding = ChannelBinding::from_connection(guard.connection())?;
+        let (mut send, mut recv) = guard
+            .connection()
+            .accept_bi()
+            .await
+            .map_err(|e| Error::Transport(e.to_string()))?;
+        let verified = crate::transport::handshake::prepare_handshake_responder(
+            &mut send, &mut recv, identity, &binding,
+        )
+        .await?;
+        if verified.outcome.peer_node_id != expected {
+            return Err(Error::Identity("unexpected Relay peer NodeId".into()));
+        }
+        verified.finish(&mut send).await?;
+        Ok(Self {
+            guard,
+            send,
+            _recv: recv,
+        })
+    }
+    pub fn own_relay_endpoint(&mut self, endpoint: quinn::Endpoint) {
+        self.guard.own_relay_endpoint(endpoint);
+    }
+    /// The peer selects among its candidates. FIN is the selection commit, not
+    /// RelayReady; this also supports CLI application roles independent of QUIC roles.
+    pub async fn wait_for_selection(mut self) -> Result<ConnectionGuard> {
+        self.send
+            .finish()
+            .map_err(|e| Error::Transport(e.to_string()))?;
+        crate::transport::quic::await_identity_commit(&mut self._recv).await?;
+        Ok(self.guard)
+    }
     pub async fn dial(
         endpoint: &quinn::Endpoint,
         remote: SocketAddr,
@@ -109,6 +176,15 @@ pub async fn authenticated_race_with_probes(
     identity: &Identity,
     expected: NodeId,
 ) -> Result<quinn::Connection> {
+    finish_prepared_race(prepared_tasks(candidates, observations, identity, expected)).await
+}
+
+pub fn prepared_tasks(
+    candidates: Vec<(quinn::Endpoint, SocketAddr)>,
+    observations: Vec<ProbeObservation>,
+    identity: &Identity,
+    expected: NodeId,
+) -> JoinSet<Result<PreparedTransport>> {
     let has_v6 = candidates.iter().any(|(_, addr)| addr.is_ipv6());
     let mut counts = [0_u32; 2];
     let mut tasks = JoinSet::new();
@@ -155,7 +231,7 @@ pub async fn authenticated_race_with_probes(
             .map_err(|_| Error::Transport("probe observation timeout".into()))?
         });
     }
-    finish_prepared_race(tasks).await
+    tasks
 }
 
 pub async fn select_prepared(
@@ -182,13 +258,19 @@ pub async fn select_prepared(
 pub async fn finish_prepared_race(
     tasks: JoinSet<Result<PreparedTransport>>,
 ) -> Result<quinn::Connection> {
+    Ok(finish_prepared_guard(tasks).await?.release())
+}
+
+pub async fn finish_prepared_guard(
+    tasks: JoinSet<Result<PreparedTransport>>,
+) -> Result<ConnectionGuard> {
     let selected = select_prepared(tasks).await?;
     let guard = tokio::time::timeout(PATH_TIMEOUT, selected.finish())
         .await
         .map_err(|_| Error::Transport("selected identity handshake timed out".into()))??;
-    let connection = guard.release();
-    tracing::info!(family = %AddressFamily::of(connection.remote_address()), remote = %connection.remote_address(), "authenticated winner transport");
-    Ok(connection)
+    let connection = guard.connection();
+    tracing::info!(path_kind = if guard.is_relay() { "relay" } else { "direct" }, family = %AddressFamily::of(connection.remote_address()), remote = %connection.remote_address(), "authenticated winner transport");
+    Ok(guard)
 }
 
 #[cfg(test)]

@@ -1,11 +1,11 @@
 # 架构设计
 
-> 状态：M0~M2 已实现并真机验证，M3（中继兜底）未开始。
+> 状态：M0~M2 已实现并真机验证，M3 认证 UDP Relay 已实现；验收以本地回归与 CI 为准。
 
 ## 1. 总体目标
 
 两台设备跨公网直接传输文件。中心服务器只做**信令 / 发现**，数据尽量走 P2P 直连；
-NAT 打洞失败时回退到中继（TURN / circuit relay），保证「能连上」优先于「一定直连」。
+配置 Relay 后，直连竞速无 authenticated winner 时延迟回退到认证 UDP Relay，保证「能连上」优先于「一定直连」。
 
 ## 2. 分层结构
 
@@ -67,7 +67,7 @@ src/
 | 网卡枚举 | `if-addrs` 0.15 | 取本机非环回地址，供 mDNS 公告与候选排序 |
 | 命令行 | `clap` 4（derive） | 标准选择 |
 | 日志 | `tracing` + `tracing-subscriber` | 结构化日志，`RUST_LOG` 可覆盖 |
-| 端口映射 | `igd`（UPnP）、NAT-PMP | **尚未引入**，见 M3；先不占依赖 |
+| 端口映射 | `igd`（UPnP）、NAT-PMP | **尚未引入**，不属于 UDP Relay 范围 |
 
 实际锁定的版本以 `Cargo.toml` 和 `Cargo.lock` 为准（`Cargo.lock` 应当提交，
 因为这是二进制程序）。
@@ -174,7 +174,7 @@ RST（`Err`），提前返回，节点就永远留在「在线」表里——服
 
 ## 4.5 信令协议
 
-极简的 TCP + 长度前缀 postcard，**只牵线，不碰业务数据**：
+信令的 TCP + 长度前缀 postcard 只交换控制消息；可选独立 UDP Relay 见 §4.9：
 
 ```
 [u32 小端长度][postcard 负载]
@@ -379,7 +379,7 @@ A、B 的签名和随机数各自自洽，验证全过，但业务流量实际�
 - **M0** ✅ 工具链 + cargo 项目骨架，能 `cargo run`
 - **M1** ✅ 局域网：mDNS 发现 + QUIC 直连，传单个文件，校验与续传跑通
 - **M2** ✅ 公网：STUN + 信令牵线 + 令牌鉴权打洞 + 通用 TCP 隧道，端到端跑通
-- **M3** 🚧 兜底：对称 NAT 下走中继（未开始）；UPnP / NAT-PMP（空壳，暂用 `--advertise` 替代）
+- **M3** ✅ 认证 UDP Relay fallback（可选；原生 socket、真实 pairing、端到端 QUIC）；UPnP / NAT-PMP 仍未实现
 - **M4** ⛔ 完善：多文件 / 目录、进度条、断点续传状态管理
 
 ### 实现进度与验证情况
@@ -430,8 +430,8 @@ A、B 的签名和随机数各自自洽，验证全过，但业务流量实际�
 
 ### 已知问题 / 下一步
 
-1. **对称型 NAT 无解**，必须做中继（M3）。目前只能靠路由器手工端口映射 +
-   `--advertise` 绕过。
+1. 直连失败可配置认证 UDP Relay；服务器带宽与 UDP 可达性由部署者负责。
+   公网 NAT 场景不由本地 loopback 测试证明。
 2. `classify` 只判映射行为，没判过滤行为；CLI 会明确显示 filtering 未测量。
 3. 原生 IPv6 与 IPv4 独立 path 已实现；公网 IPv6 可达性仍需两台真实主机验收。
    链路本地 scope-id 不在实现范围。
@@ -455,7 +455,7 @@ A、B 的签名和随机数各自自洽，验证全过，但业务流量实际�
 - [x] 信令服务器的部署形态与协议 → 极简 TCP + 长度前缀 postcard，systemd 常驻
 - [x] 信令服务器要不要加鉴权 / 限流 → 私钥挑战认证 + 有界队列 + 数量上限 + 超时（§4.5）
 - [ ] 是否需要 DHT 去中心化发现，还是先依赖中心信令
-- [ ] 中继自建（TURN）还是复用 libp2p relay
+- [x] 自建固定端口认证 UDP Relay；完整 TURN / ICE 不在范围
 - [ ] 多对端：现在 `serve` 只接受一个 `--allow`（打洞是点对点的），
       多对端需要多进程或者多 socket
 - [ ] CLI 优先，是否要 TUI / GUI
@@ -490,3 +490,56 @@ Trusted grant 不从旧路径或旧 generation 复制。CLI 常驻 serve 同时 
 TCP Tunnel、CLI IPv6 send，以及 GPUI 旧 generation 诊断过滤。三平台 CI 的 `ipv6`
 过滤测试输出能力检测；仅当 native IPv6 bind 返回明确不支持错误时显式 SKIP。
 本地 loopback 不等同于不同运营商/公网 IPv6 的人工验收。
+
+
+## 4.9 认证 UDP Relay fallback（Issue #59）
+
+```text
+native Direct IPv6 + IPv4 race
+    └─ 2.5s without authenticated winner → Relay DNS/native family race
+       → fresh per-peer socket → UDP Ed25519 admission → same socket to Quinn
+       → deterministic QUIC role → expected NodeId / both signatures / TLS exporter / Ready
+       → single selector FIN → capabilities / Remote Auth / business
+```
+
+`src/relay/{wire,server,client}.rs` 不依赖业务协议。`signal-server --relay-listen`
+建立独立原生 UDP listener task，与信令 Registry 只共享 admission ticket issuer。
+`Registry::try_pair` 在两端真实登记且两端 outbox 已预留后签发 `{token, node_a, node_b, expiry}`。
+不修改 `SignalMessage` variant 或既有注册签名/线格式。无 Relay 配置保持原有直连分支，
+既不解析 Relay DNS，也不创建 UDP attempt。
+
+UDP control 有不可能与合法 QUIC 首字节冲突的 magic、严格版本、固定大小数组字段、
+512-byte 上限和 trailing-byte 拒绝。Hello 校验真实 pair、公钥 hash 与有效 Ed25519 key；
+随机 server/client nonce、token、两个 NodeId、公钥和真实 source tuple 均纳入独立
+`p2p_file/relay-bind/v1` 域的签名。严格 Ed25519 验签后一次性消费 challenge；
+不能把 signaling 注册签名、旧 challenge 或同 IP 新端口当作新 source 的证明。
+
+固定 listener 用 source tuple 索引 session，目的地一经配对不再改变。每个 ticket
+最多四个有界 candidate arm，支持多 A/AAAA 地址竞速及两个 native listener 间跨族
+转发；每个 arm 的两端 socket 均独立认证、互不串包，额外候选不能重绑已有 arm。
+未双边 ready 时所有业务包丢弃，已 ready 后逐包原样 send_to；无数据队列/业务缓存。
+数据报上限 2048 bytes，接收缓冲固定 65536 bytes，超限丢弃（兼容 Windows UDP
+WSAEMSGSIZE 行为）；回应不大于触发报文，双边 Ready notice 总量也受 Register 大小约束。
+
+默认：ticket 60s（上限 300s）、challenge 5s、session idle 90s（上限 3600s）、
+512 sessions（最大 4096）、单 IP 8 pending（最大 128）、总 pending/tickets 各受
+session cap 两倍限制。清理同步移除 source/ticket/challenge 索引；既不放宽 NAT
+rebinding，也不为 session 分配服务器新端口。部署者放通 TCP 信令端口与 UDP listener。
+
+RelayReady 后仍必须验证端到端身份。每次 Relay attempt 的 socket 完成交接后由其
+PreparedTransport/ConnectionGuard 持有，取消/错误/loser 立即关闭连接，胜者 Endpoint
+由有界、带 shutdown fence 的 network pool 保留。Desktop 复用相同 peer generation、
+角色规则与 actor publication gate；迟到 completion 不覆盖新 transport。
+CLI 的业务客户端提交全局 winner FIN，业务服务端等 FIN；Relay QUIC connect/accept
+仍按 NodeId 排序决定，与业务角色独立，不产生两套 handler。CLI 重连重新登记并取得
+真实 fresh pairing，新 socket、新 TLS、重新验证身份。三平台测试覆盖两种 QUIC 角色。
+
+恶意 Relay 只能阻断、丢包或观察包长/时序/IP/NodeId；没有 TLS 私钥/密码/明文，
+不能代替对端通过 Ed25519/TLS exporter 验证。Direct ↔ Relay 是重新建立 transport，
+不做 active migration；Password 和 Trusted grant 均重新经过当前 session binding。
+保存信任仍须本机用户明确操作与 inbound password proof，路径不能授予反向权限。
+
+测试分层：admission/core 的资源与重放边界；真实 native IPv4/IPv6/跨族 QUIC fixture；
+真实 signaling 的 CLI 文件续传、测速、allowlisted 多 TCP Tunnel；Desktop 单 winner、
+密码错误、新 grant、Trusted auto_start 的 direct→relay→direct；本地脚本 blackhole E2E。
+这些测试不证明公网 UDP/NAT 配置，也不替代原生 GUI 人工交互验收。

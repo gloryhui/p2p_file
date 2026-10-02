@@ -978,6 +978,7 @@ struct DesktopShell {
     concurrency_input: Entity<TextField>,
     signal_host: Entity<TextField>,
     signal_port: Entity<TextField>,
+    relay_server: Entity<TextField>,
     allowed_name: Entity<TextField>,
     allowed_target: Entity<TextField>,
     allowed_peers: Entity<TextField>,
@@ -1091,6 +1092,7 @@ impl DesktopShell {
             vec![
                 self.signal_host.clone(),
                 self.signal_port.clone(),
+                self.relay_server.clone(),
                 self.local_password.clone(),
                 self.allowed_name.clone(),
                 self.allowed_target.clone(),
@@ -2634,12 +2636,16 @@ impl DesktopShell {
         let mut draft = self.settings.clone();
         draft.signal_host = self.signal_host.read(cx).content.to_string();
         draft.signal_port = self.signal_port.read(cx).content.to_string();
+        let relay = self.relay_server.read(cx).content.trim().to_owned();
+        draft.relay_server = (!relay.is_empty()).then_some(relay);
+        let relay_server = draft.relay_server.clone();
         let config_file = self.config_file.clone();
         let signal_server = signal_server_spec(&draft.signal_host, &draft.signal_port);
         let saved_receive_root = draft.receive_directory.clone();
         let saved_send_limit = draft.send_concurrency;
         let signal_changed = draft.signal_host != self.settings.signal_host
-            || draft.signal_port != self.settings.signal_port;
+            || draft.signal_port != self.settings.signal_port
+            || draft.relay_server != self.settings.relay_server;
         let saved_draft = draft.clone();
         let background = cx.background_executor().clone();
         self.is_saving_settings = true;
@@ -2688,7 +2694,10 @@ impl DesktopShell {
                                     shell.set_status("设置已保存；现有任务和连接继续运行", cx);
                                     return;
                                 }
-                                match session.reconfigure_signal(signal_server.clone()) {
+                                match session.reconfigure_network(
+                                    signal_server.clone(),
+                                    relay_server.clone(),
+                                ) {
                                     Ok(()) => {
                                         shell.network_status = "正在使用新信令配置重连".into();
                                         shell.set_status(shell.network_status.clone(), cx);
@@ -2706,6 +2715,7 @@ impl DesktopShell {
                             if !started {
                                 shell.network_session = None;
                                 let mut config = session::DesktopSessionConfig::new(signal_server);
+                                config.network.relay_server = relay_server;
                                 config.allowed_forward_targets =
                                     shell.settings.enabled_forward_targets();
                                 config.tunnel_rules = shell.settings.tunnel_rules.clone();
@@ -4583,6 +4593,11 @@ impl DesktopShell {
                                 .child(Self::text_field_frame(&self.signal_port, window, cx)),
                         ),
                 )
+                .child(ui_components::field_label(
+                    "Relay Server（可选，HOST:UDP_PORT）",
+                ))
+                .child(Self::text_field_frame(&self.relay_server, window, cx))
+                .child("留空仅直连；配置后直连优先，失败时延迟尝试加密 UDP Relay")
                 .child(self.port_forward_settings(window, cx))
                 .child(
                     div()
@@ -4821,11 +4836,14 @@ pub fn run() {
         let initial_concurrency = settings.send_concurrency;
         let initial_host = settings.signal_host.clone();
         let initial_port = settings.signal_port.clone();
+        let initial_relay = settings.relay_server.clone().unwrap_or_default();
         let startup_session_config = if has_saved_network_config && identity.is_some() {
-            Some(session::DesktopSessionConfig::new(signal_server_spec(
+            let mut config = session::DesktopSessionConfig::new(signal_server_spec(
                 &settings.signal_host,
                 &settings.signal_port,
-            )))
+            ));
+            config.network.relay_server = settings.relay_server.clone();
+            Some(config)
         } else {
             None
         };
@@ -4873,6 +4891,11 @@ pub fn run() {
                     field.content = initial_port.into();
                     field
                 });
+                let relay_server = cx.new(|cx| {
+                    let mut field = TextField::new(cx, "留空或 relay.example:7001 / [IPv6]:7001");
+                    field.content = initial_relay.into();
+                    field
+                });
                 let allowed_name = cx.new(|cx| TextField::new(cx, "例如：SSH"));
                 let allowed_target = cx.new(|cx| TextField::new(cx, "127.0.0.1:22"));
                 let allowed_peers =
@@ -4911,6 +4934,7 @@ pub fn run() {
                         concurrency_input,
                         signal_host,
                         signal_port,
+                        relay_server,
                         allowed_name,
                         allowed_target,
                         allowed_peers,
