@@ -66,6 +66,10 @@ pub const SHORT_ID_PROTOCOL_VERSION: u32 = 3;
 const SHORT_LOOKUP_WINDOW: Duration = Duration::from_secs(10);
 const MAX_SHORT_LOOKUP_IPS: usize = 1024;
 const SHORT_LOOKUP_UNAVAILABLE: &str = "设备查询不可用或请求过多，请稍后重试";
+pub const NODE_LOOKUP_WINDOW: Duration = Duration::from_secs(10);
+pub const DEFAULT_NODE_LOOKUPS_PER_CONNECTION: u32 = 64;
+pub const DEFAULT_NODE_LOOKUPS_PER_IP: u32 = 256;
+const MAX_NODE_LOOKUP_IPS: usize = 1024;
 
 /// 注册 challenge 长度（256 bit）。
 pub const CHALLENGE_LEN: usize = 32;
@@ -108,6 +112,9 @@ pub struct SignalServerConfig {
     pub short_lookups_per_connection: u32,
     pub short_lookups_per_ip: u32,
     pub max_short_lookup_misses: u32,
+    /// Ordinary NodeId requests, independently of offline waiter capacity.
+    pub node_lookups_per_connection: u32,
+    pub node_lookups_per_ip: u32,
     /// 单节点候选地址上限。
     pub max_candidates: usize,
     /// 在线节点总数上限。
@@ -147,6 +154,8 @@ impl Default for SignalServerConfig {
             short_lookups_per_connection: 5,
             short_lookups_per_ip: 20,
             max_short_lookup_misses: 3,
+            node_lookups_per_connection: DEFAULT_NODE_LOOKUPS_PER_CONNECTION,
+            node_lookups_per_ip: DEFAULT_NODE_LOOKUPS_PER_IP,
             max_candidates: MAX_CANDIDATES,
             max_registered_peers: MAX_REGISTERED_PEERS,
             max_waiter_entries: MAX_WAITER_ENTRIES,
@@ -432,6 +441,7 @@ struct WaiterKey {
 struct Registry {
     relay: Option<crate::relay::server::Admission>,
     short_lookup_ips: HashMap<IpAddr, LookupWindow>,
+    node_lookup_ips: HashMap<IpAddr, LookupWindow>,
     peers: HashMap<NodeId, PeerRecord>,
     /// 谁在等谁上线：`waiters[target] = { (requester, connection_id), ... }`。
     waiters: HashMap<NodeId, HashSet<WaiterKey>>,
@@ -550,6 +560,19 @@ impl ShortIdResources {
 }
 
 impl Registry {
+    fn take_node_lookup(&mut self, ip: IpAddr, config: &SignalServerConfig) -> bool {
+        self.node_lookup_ips
+            .retain(|_, bucket| !bucket.expired_after(NODE_LOOKUP_WINDOW));
+        if !self.node_lookup_ips.contains_key(&ip)
+            && self.node_lookup_ips.len() >= MAX_NODE_LOOKUP_IPS
+        {
+            return false;
+        }
+        self.node_lookup_ips
+            .entry(ip)
+            .or_insert_with(LookupWindow::new)
+            .take_in_window(config.node_lookups_per_ip, u32::MAX, NODE_LOOKUP_WINDOW)
+    }
     fn take_short_lookup(&mut self, ip: IpAddr, config: &SignalServerConfig) -> bool {
         self.short_lookup_ips.retain(|_, window| !window.expired());
         if !self.short_lookup_ips.contains_key(&ip)
@@ -841,6 +864,7 @@ async fn handle_signal_client(
 ) -> Result<()> {
     let remote_ip = stream.peer_addr()?.ip();
     let mut short_window = LookupWindow::new();
+    let mut node_window = LookupWindow::new();
     // 信令消息都很小，别让 Nagle 拖慢牵线。
     let _ = stream.set_nodelay(true);
     let (read_half, write_half) = stream.into_split();
@@ -1157,18 +1181,6 @@ async fn handle_signal_client(
                 let me = registration.node_id;
                 let my_connection = registration.connection_id;
 
-                if me == target {
-                    if !send_or_close(
-                        &outbox,
-                        SignalMessage::Error {
-                            reason: "别查自己".into(),
-                        },
-                    ) {
-                        break "待写队列已满";
-                    }
-                    continue;
-                }
-
                 let mut reg = registry.lock().await;
                 // 所有权：本连接必须仍然是这个节点的当前记录。否则说明该节点
                 // 已经在别处重新登记，这条连接不能再代表它。
@@ -1180,6 +1192,40 @@ async fn handle_signal_client(
                     drop(reg);
                     reject(&outbox, "本连接已被该节点的新连接取代");
                     break "连接所有权已被取代";
+                }
+
+                // Gate every ordinary lookup before observing target availability,
+                // pairing/ticket issuance, or offline waiter mutation. Both budgets
+                // belong to the actual TCP connection/source IP, not the requested ID.
+                if !node_window.take_in_window(
+                    config.node_lookups_per_connection,
+                    u32::MAX,
+                    NODE_LOOKUP_WINDOW,
+                ) || !reg.take_node_lookup(remote_ip, &config)
+                {
+                    drop(reg);
+                    if !send_or_close(
+                        &outbox,
+                        SignalMessage::Error {
+                            reason: SHORT_LOOKUP_UNAVAILABLE.into(),
+                        },
+                    ) {
+                        break "待写队列已满";
+                    }
+                    continue;
+                }
+
+                if me == target {
+                    drop(reg);
+                    if !send_or_close(
+                        &outbox,
+                        SignalMessage::Error {
+                            reason: "别查自己".into(),
+                        },
+                    ) {
+                        break "待写队列已满";
+                    }
+                    continue;
                 }
 
                 if reg.peers.contains_key(&target) {
@@ -2309,6 +2355,228 @@ mod tests {
                 other => panic!("注册应当成功，实际 {other:?}"),
             }
         }
+    }
+
+    async fn node_lookup_reply(raw: &mut Raw, target: NodeId) -> SignalMessage {
+        raw.send(&SignalMessage::Lookup { node_id: target }).await;
+        tokio::time::timeout(Duration::from_secs(5), raw.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn lookup_pair(a: &mut Raw, a_id: NodeId, b: &mut Raw, b_id: NodeId) -> PunchToken {
+        let SignalMessage::PeerCandidates { node_id, token, .. } = node_lookup_reply(a, b_id).await
+        else {
+            panic!("lookup must pair")
+        };
+        assert_eq!(node_id, b_id);
+        let other = tokio::time::timeout(Duration::from_secs(5), b.recv())
+            .await
+            .unwrap();
+        assert!(
+            matches!(other, Some(SignalMessage::PeerCandidates {node_id, token: other, ..}) if node_id == a_id && other == token)
+        );
+        token
+    }
+
+    async fn assert_target_has_no_candidates(raw: &mut Raw) {
+        // A FIFO Ping barrier proves all earlier target pushes have been consumed,
+        // without sleeping or assuming a quiet interval means no flood.
+        raw.send(&SignalMessage::Ping).await;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), raw.recv())
+                .await
+                .unwrap(),
+            Some(SignalMessage::Pong)
+        ));
+    }
+
+    #[tokio::test]
+    async fn node_lookup_connection_limit_stops_pairing_tickets_and_target_flood_and_recovers() {
+        for enable_relay in [false, true] {
+            let (addr, registry) = spawn_signal_server_with(SignalServerConfig {
+                node_lookups_per_connection: 3,
+                node_lookups_per_ip: 20,
+                ..SignalServerConfig::for_tests()
+            })
+            .await;
+            let admission = crate::relay::server::Admission::new(Default::default()).unwrap();
+            if enable_relay {
+                registry.lock().await.relay = Some(admission.clone());
+            }
+            let a = Identity::generate();
+            let b = Identity::generate();
+            let mut ra = Raw::connect(addr).await;
+            let mut rb = Raw::connect(addr).await;
+            ra.full_register(&a, vec![]).await;
+            rb.full_register(&b, vec![]).await;
+            let mut tokens = HashSet::new();
+            for _ in 0..3 {
+                let token = lookup_pair(&mut ra, a.node_id(), &mut rb, b.node_id()).await;
+                assert!(tokens.insert(*token.as_bytes()));
+            }
+            let ticket_count = if enable_relay { 3 } else { 0 };
+            assert_eq!(admission.ticket_count(), ticket_count);
+            for target in [b.node_id(), Identity::generate().node_id(), a.node_id()]
+                .into_iter()
+                .cycle()
+                .take(12)
+            {
+                assert!(
+                    matches!(node_lookup_reply(&mut ra, target).await, SignalMessage::Error {reason} if reason == SHORT_LOOKUP_UNAVAILABLE)
+                );
+            }
+            assert_target_has_no_candidates(&mut rb).await;
+            assert_eq!(admission.ticket_count(), ticket_count);
+            assert_eq!(registry.lock().await.waiter_entries(), 0);
+            // Both connection and IP windows expire; an actual Lookup pairs again.
+            tokio::time::pause();
+            tokio::time::advance(NODE_LOOKUP_WINDOW).await;
+            tokio::time::resume();
+            let token = lookup_pair(&mut ra, a.node_id(), &mut rb, b.node_id()).await;
+            assert!(tokens.insert(*token.as_bytes()));
+            assert_eq!(admission.ticket_count(), if enable_relay { 4 } else { 0 });
+            assert_eq!(registry.lock().await.relay.is_some(), enable_relay);
+        }
+    }
+
+    #[tokio::test]
+    async fn node_lookup_ip_limit_survives_new_identity_and_connection_then_recovers() {
+        let (addr, registry) = spawn_signal_server_with(SignalServerConfig {
+            node_lookups_per_connection: 10,
+            node_lookups_per_ip: 2,
+            ..SignalServerConfig::for_tests()
+        })
+        .await;
+        let admission = crate::relay::server::Admission::new(Default::default()).unwrap();
+        registry.lock().await.relay = Some(admission.clone());
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let c = Identity::generate();
+        let d = Identity::generate();
+        let mut ra = Raw::connect(addr).await;
+        let mut rb = Raw::connect(addr).await;
+        let mut rc = Raw::connect(addr).await;
+        ra.full_register(&a, vec![]).await;
+        rb.full_register(&b, vec![]).await;
+        rc.full_register(&c, vec![]).await;
+        lookup_pair(&mut ra, a.node_id(), &mut rb, b.node_id()).await;
+        lookup_pair(&mut rc, c.node_id(), &mut rb, b.node_id()).await;
+        let mut reconnect = Raw::connect(addr).await;
+        reconnect.full_register(&a, vec![]).await;
+        let mut fresh_identity = Raw::connect(addr).await;
+        fresh_identity.full_register(&d, vec![]).await;
+        for raw in [&mut reconnect, &mut fresh_identity, &mut rc] {
+            assert!(
+                matches!(node_lookup_reply(raw, b.node_id()).await, SignalMessage::Error {reason} if reason == SHORT_LOOKUP_UNAVAILABLE)
+            );
+        }
+        assert_eq!(admission.ticket_count(), 2);
+        assert_target_has_no_candidates(&mut rb).await;
+        tokio::time::pause();
+        tokio::time::advance(NODE_LOOKUP_WINDOW).await;
+        tokio::time::resume();
+        lookup_pair(&mut fresh_identity, d.node_id(), &mut rb, b.node_id()).await;
+        assert_eq!(admission.ticket_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn node_lookup_ip_buckets_are_bounded_and_expired_entries_are_reclaimed() {
+        let config = SignalServerConfig {
+            node_lookups_per_ip: 2,
+            ..SignalServerConfig::for_tests()
+        };
+        let mut registry = Registry::default();
+        for n in 0..MAX_NODE_LOOKUP_IPS {
+            assert!(
+                registry.take_node_lookup(IpAddr::V6(std::net::Ipv6Addr::from(n as u128)), &config)
+            );
+        }
+        let first = IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED);
+        assert!(registry.take_node_lookup(first, &config)); // Existing bucket still works at capacity.
+        assert!(!registry.take_node_lookup(first, &config));
+        let fresh = "192.0.2.1".parse().unwrap();
+        assert!(!registry.take_node_lookup(fresh, &config));
+        assert_eq!(registry.node_lookup_ips.len(), MAX_NODE_LOOKUP_IPS);
+        assert!(registry.take_short_lookup(fresh, &config)); // Independent Short ID limiter.
+        for bucket in registry.node_lookup_ips.values_mut() {
+            bucket.started -= NODE_LOOKUP_WINDOW;
+        }
+        assert!(registry.take_node_lookup(fresh, &config));
+        assert_eq!(registry.node_lookup_ips.len(), 1);
+        assert!(registry.take_node_lookup(first, &config));
+        assert_eq!(registry.node_lookup_ips.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn node_lookup_rate_limit_keeps_offline_waiter_until_registration_and_releases_pending_quota()
+     {
+        let (addr, registry) = spawn_signal_server_with(SignalServerConfig {
+            node_lookups_per_connection: 2,
+            max_pending_lookups: 1,
+            ..SignalServerConfig::for_tests()
+        })
+        .await;
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let c = Identity::generate().node_id();
+        let mut ra = Raw::connect(addr).await;
+        ra.full_register(&a, vec![]).await;
+        for _ in 0..2 {
+            assert!(
+                matches!(node_lookup_reply(&mut ra, b.node_id()).await, SignalMessage::PeerPending {node_id} if node_id == b.node_id())
+            );
+        }
+        assert_eq!(registry.lock().await.waiter_entries(), 1);
+        assert!(
+            matches!(node_lookup_reply(&mut ra, c).await, SignalMessage::Error {reason} if reason == SHORT_LOOKUP_UNAVAILABLE)
+        );
+        assert_eq!(registry.lock().await.waiter_entries(), 1);
+        let mut rb = Raw::connect(addr).await;
+        rb.full_register(&b, vec![]).await;
+        assert!(
+            matches!(ra.recv().await, Some(SignalMessage::PeerCandidates {node_id, ..}) if node_id == b.node_id())
+        );
+        assert!(
+            matches!(rb.recv().await, Some(SignalMessage::PeerCandidates {node_id, ..}) if node_id == a.node_id())
+        );
+        let reg = registry.lock().await;
+        assert_eq!(reg.waiter_entries(), 0);
+        assert!(reg.pending_by_connection.is_empty());
+        drop(reg);
+        tokio::time::pause();
+        tokio::time::advance(NODE_LOOKUP_WINDOW).await;
+        tokio::time::resume();
+        assert!(
+            matches!(node_lookup_reply(&mut ra, c).await, SignalMessage::PeerPending {node_id} if node_id == c)
+        );
+        assert_eq!(registry.lock().await.waiter_entries(), 1);
+    }
+
+    #[tokio::test]
+    async fn relay_pairing_ticket_quota_does_not_starve_unrelated_real_node_lookups() {
+        let (addr, registry) = spawn_signal_server_with(SignalServerConfig::for_tests()).await;
+        let admission = crate::relay::server::Admission::new(Default::default()).unwrap();
+        registry.lock().await.relay = Some(admission.clone());
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let c = Identity::generate();
+        let d = Identity::generate();
+        let mut ra = Raw::connect(addr).await;
+        let mut rb = Raw::connect(addr).await;
+        let mut rc = Raw::connect(addr).await;
+        let mut rd = Raw::connect(addr).await;
+        for (raw, id) in [(&mut ra, &a), (&mut rb, &b), (&mut rc, &c), (&mut rd, &d)] {
+            raw.full_register(id, vec![]).await;
+        }
+        let quota = crate::relay::server::MAX_TICKETS_PER_PAIR;
+        for _ in 0..quota + 4 {
+            lookup_pair(&mut ra, a.node_id(), &mut rb, b.node_id()).await;
+        }
+        assert_eq!(admission.ticket_count(), quota);
+        lookup_pair(&mut rc, c.node_id(), &mut rd, d.node_id()).await;
+        assert_eq!(admission.ticket_count(), quota + 1);
     }
 
     #[test]

@@ -354,6 +354,13 @@ attempt 使用独立 socket，challenge-response + Ed25519 admission 后，收�
 双边 Ed25519 签名、当前 TLS exporter binding 和 Ready；仅一个 winner 提交 FIN。
 
 Relay ticket 只来自真实在线节点 pairing，有 TTL、并发数量与单 IP pending 上限。
+普通 NodeId Lookup 另有固定 10 秒窗口：默认每 signaling connection 64 次、每 source IP
+256 次；IP bucket 最多 1024 项并清理过期项。超限在 pairing 前返回统一错误，不签发
+ticket、不向目标推送候选，也不新增 offline waiter；`max_pending_lookups` 仍只限制
+真实挂起的离线查询。少量重复查询、重新连接和直连模式继续使用原有协议与 CLI。
+Admission 的 outstanding ticket 默认每 unordered NodeId pair 最多 16 张、每 NodeId
+最多 64 张；小容量服务还将两者分别限制在全局 ticket 池的一半。quota 直接依据真实
+ticket map，TTL 到期自动释放；已 Ready 的转发 session 仍按原有 idle timeout 运行。
 第三方 source、未知 ticket、错 pair/公钥/签名与重放均拒绝。两边绑定前丢弃数据，
 不排队；绑定后的 source 不能漂移或抢占，断线重新 pairing。Relay 不解码 QUIC 或
 文件/Tunnel/Speedtest，不解密、不落盘；恶意服务器可以阻断，不能冒充设备。

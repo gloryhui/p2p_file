@@ -524,7 +524,16 @@ WSAEMSGSIZE 行为）；回应不大于触发报文，双边 Ready notice 总量
 
 默认：ticket 60s（上限 300s）、challenge 5s、session idle 90s（上限 3600s）、
 512 sessions（最大 4096）、单 IP 8 pending（最大 128）、总 pending/tickets 各受
-session cap 两倍限制。清理同步移除 source/ticket/challenge 索引；既不放宽 NAT
+session cap 两倍限制。`Admission::issue` 另从真实 ticket map 计算 unordered pair/node
+quota，默认分别 16/64 张，且各自不超过全局 ticket 池的一半；双方 NodeId 均计入，
+不使用独立计数器。ticket 到期释放 quota；已 Ready session 按既有 idle timeout 继续
+转发，未 Ready session/pending 按 TTL 清理，仍 active 的 token 禁止重新分配。
+普通 NodeId Lookup 在连接所有权校验后、查询目标状态/修改 waiter/调用 `try_pair`
+之前限流：固定 10s 窗口，每连接默认 64 次、每 source IP 默认 256 次。IP bucket
+表上限 1024 项，每次 IP 检查清理过期项；超限统一返回查询不可用错误，无 pairing、
+Relay ticket 或目标候选推送。Rust `SignalServerConfig` 可调整这两个请求预算，
+既有 CLI 不要求新参数。此预算独立于 `max_pending_lookups` 和 Short ID 查询预算。
+清理同步移除 source/ticket/challenge 索引；既不放宽 NAT
 rebinding，也不为 session 分配服务器新端口。部署者放通 TCP 信令端口与 UDP listener。
 
 RelayReady 后仍必须验证端到端身份。每次 Relay attempt 的 socket 完成交接后由其

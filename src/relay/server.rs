@@ -4,7 +4,7 @@ use crate::identity::{NodeId, public_key_from_bytes};
 use crate::nat::punch::PunchToken;
 use crate::net::AddressFamily;
 use crate::{Error, Result};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,6 +15,8 @@ pub const DEFAULT_TICKET_TTL: u64 = 60;
 pub const DEFAULT_IDLE_TIMEOUT: u64 = 90;
 pub const DEFAULT_MAX_SESSIONS: usize = 512;
 pub const DEFAULT_PENDING_PER_IP: usize = 8;
+pub const MAX_TICKETS_PER_PAIR: usize = 16;
+pub const MAX_TICKETS_PER_NODE: usize = 64;
 pub const MAX_DATAGRAM: usize = 2048;
 const CHALLENGE_TTL: Duration = Duration::from_secs(5);
 
@@ -126,9 +128,33 @@ impl Admission {
             return false;
         };
         state.cleanup(Instant::now());
+        // The bounded ticket map is the sole quota authority: no counters can
+        // drift on expiry/rejection. Either order of a pair consumes one budget;
+        // both nodes consume a budget even when one rotates its counterpart.
+        // Clamp to half the global pool for small server configurations too.
+        let pair_limit = MAX_TICKETS_PER_PAIR.min(state.config.max_sessions);
+        let node_limit = MAX_TICKETS_PER_NODE.min(state.config.max_sessions);
         if a == b
             || state.tickets.contains_key(token.as_bytes())
+            || state
+                .sessions
+                .keys()
+                .any(|(active, _)| active == token.as_bytes())
             || state.tickets.len() >= state.config.max_sessions * 2
+            || state
+                .tickets
+                .values()
+                .filter(|t| t.nodes.contains(&a) && t.nodes.contains(&b))
+                .count()
+                >= pair_limit
+            || [a, b].into_iter().any(|node| {
+                state
+                    .tickets
+                    .values()
+                    .filter(|t| t.nodes.contains(&node))
+                    .count()
+                    >= node_limit
+            })
         {
             return false;
         }
@@ -141,6 +167,10 @@ impl Admission {
             },
         );
         true
+    }
+    #[cfg(test)]
+    pub(crate) fn ticket_count(&self) -> usize {
+        self.0.lock().unwrap().tickets.len()
     }
     fn control(
         &self,
@@ -203,9 +233,9 @@ impl State {
         });
         self.sources
             .retain(|_, (key, _)| self.sessions.contains_key(key));
-        let active_tokens: HashSet<_> = self.sessions.keys().map(|(token, _)| *token).collect();
-        self.tickets
-            .retain(|token, t| now < t.expires || active_tokens.contains(token));
+        // Tickets authorize new binds only. Expiry releases their quota even if
+        // an already Ready session remains alive under its existing idle rule.
+        self.tickets.retain(|_, t| now < t.expires);
     }
     fn validate_hello(&self, hello: Hello, now: Instant) -> Option<usize> {
         let ticket = self.tickets.get(hello.token.as_bytes())?;
@@ -686,9 +716,16 @@ mod tests {
         let (_, _, _) = bind_side(&admission, &a, b.node_id(), token, source(9001));
         let (_, _, _) = bind_side(&admission, &b, a.node_id(), token, source(9002));
         let next = PunchToken::random();
-        assert!(admission.issue(next, a.node_id(), b.node_id()));
+        let c = Identity::generate();
+        let d = Identity::generate();
+        assert!(admission.issue(next, c.node_id(), d.node_id()));
         assert!(!admission.issue(PunchToken::random(), a.node_id(), b.node_id()));
-        assert!(challenge(&admission, Hello::new(&a, b.node_id(), next), source(9003)).is_none());
+        assert!(!admission.issue(
+            PunchToken::random(),
+            Identity::generate().node_id(),
+            Identity::generate().node_id()
+        ));
+        assert!(challenge(&admission, Hello::new(&c, d.node_id(), next), source(9003)).is_none());
         let mut state = admission.0.lock().unwrap();
         let expired = Instant::now() + state.config.idle_timeout + state.config.ticket_ttl;
         state.cleanup(expired);
@@ -707,6 +744,168 @@ mod tests {
             .unwrap()
             .expires = Instant::now();
         assert!(challenge(&admission, Hello::new(&a, b.node_id(), next), source(9001)).is_none());
+    }
+    #[test]
+    fn relay_unordered_pair_ticket_quota_reserves_capacity_for_unrelated_peers() {
+        let (admission, a, b, _) = fixture(128, 8);
+        for i in 1..MAX_TICKETS_PER_PAIR {
+            let (a, b) = if i % 2 == 0 {
+                (a.node_id(), b.node_id())
+            } else {
+                (b.node_id(), a.node_id())
+            };
+            assert!(admission.issue(PunchToken::random(), a, b));
+        }
+        assert_eq!(admission.ticket_count(), MAX_TICKETS_PER_PAIR);
+        for _ in 0..32 {
+            assert!(!admission.issue(PunchToken::random(), b.node_id(), a.node_id()));
+        }
+        assert_eq!(admission.ticket_count(), MAX_TICKETS_PER_PAIR);
+        assert!(admission.issue(
+            PunchToken::random(),
+            Identity::generate().node_id(),
+            Identity::generate().node_id()
+        ));
+        assert_eq!(admission.ticket_count(), MAX_TICKETS_PER_PAIR + 1);
+    }
+    #[test]
+    fn relay_node_ticket_quota_covers_rotating_peers_and_both_pair_positions() {
+        let (admission, a, _, _) = fixture(128, 8);
+        for i in 1..MAX_TICKETS_PER_NODE {
+            let peer = Identity::generate().node_id();
+            let (a, b) = if i % 2 == 0 {
+                (a.node_id(), peer)
+            } else {
+                (peer, a.node_id())
+            };
+            assert!(admission.issue(PunchToken::random(), a, b));
+        }
+        assert_eq!(admission.ticket_count(), MAX_TICKETS_PER_NODE);
+        for (a, b) in [
+            (a.node_id(), Identity::generate().node_id()),
+            (Identity::generate().node_id(), a.node_id()),
+        ] {
+            assert!(!admission.issue(PunchToken::random(), a, b));
+        }
+        assert!(admission.issue(
+            PunchToken::random(),
+            Identity::generate().node_id(),
+            Identity::generate().node_id()
+        ));
+        assert_eq!(admission.ticket_count(), MAX_TICKETS_PER_NODE + 1);
+    }
+    #[test]
+    fn relay_ticket_quotas_scale_to_small_global_pools_without_starving_other_pairs() {
+        for max_sessions in [1, 4, 16] {
+            let (admission, a, b, _) = fixture(max_sessions, 8);
+            for _ in 1..MAX_TICKETS_PER_PAIR.min(max_sessions) {
+                assert!(admission.issue(PunchToken::random(), a.node_id(), b.node_id()));
+            }
+            assert!(!admission.issue(PunchToken::random(), a.node_id(), b.node_id()));
+            assert!(admission.issue(
+                PunchToken::random(),
+                Identity::generate().node_id(),
+                Identity::generate().node_id()
+            ));
+            let (admission, a, _, _) = fixture(max_sessions, 8);
+            for _ in 1..MAX_TICKETS_PER_NODE.min(max_sessions) {
+                assert!(admission.issue(
+                    PunchToken::random(),
+                    a.node_id(),
+                    Identity::generate().node_id()
+                ));
+            }
+            assert!(!admission.issue(
+                PunchToken::random(),
+                Identity::generate().node_id(),
+                a.node_id()
+            ));
+            assert!(admission.issue(
+                PunchToken::random(),
+                Identity::generate().node_id(),
+                Identity::generate().node_id()
+            ));
+        }
+    }
+    #[test]
+    fn relay_ticket_expiry_releases_pair_node_quotas_without_retiring_ready_session() {
+        let (admission, a, b, token) = fixture(MAX_TICKETS_PER_PAIR, 8);
+        bind_side(&admission, &a, b.node_id(), token, source(9001));
+        bind_side(&admission, &b, a.node_id(), token, source(9002));
+        for _ in 1..MAX_TICKETS_PER_PAIR {
+            assert!(admission.issue(PunchToken::random(), a.node_id(), b.node_id()));
+        }
+        assert!(!admission.issue(PunchToken::random(), a.node_id(), b.node_id()));
+        {
+            let mut state = admission.0.lock().unwrap();
+            let now = Instant::now();
+            for ticket in state.tickets.values_mut() {
+                ticket.expires = now;
+            }
+            state.cleanup(now);
+            assert!(state.tickets.is_empty());
+            assert!(state.pending.is_empty());
+            assert_eq!(state.sessions.len(), 1);
+            assert_eq!(state.sources.len(), 2);
+        }
+        assert_eq!(
+            admission.forward(source(9001), AddressFamily::Ipv4, Instant::now()),
+            Some(source(9002))
+        );
+        assert_eq!(
+            admission.forward(source(9002), AddressFamily::Ipv4, Instant::now()),
+            Some(source(9001))
+        );
+        assert!(challenge(&admission, Hello::new(&a, b.node_id(), token), source(9003)).is_none());
+        assert!(!admission.issue(token, a.node_id(), b.node_id())); // An active token cannot be reassigned.
+        let fresh = PunchToken::random();
+        assert!(admission.issue(fresh, a.node_id(), b.node_id()));
+        assert!(challenge(&admission, Hello::new(&a, b.node_id(), fresh), source(9001)).is_none());
+        for _ in 1..MAX_TICKETS_PER_PAIR {
+            assert!(admission.issue(PunchToken::random(), a.node_id(), b.node_id()));
+        }
+        assert!(!admission.issue(PunchToken::random(), a.node_id(), b.node_id()));
+        let mut state = admission.0.lock().unwrap();
+        let after_idle = Instant::now() + state.config.idle_timeout;
+        state.cleanup(after_idle);
+        assert!(state.sessions.is_empty());
+        assert!(state.sources.is_empty());
+    }
+    #[test]
+    fn relay_concurrent_ticket_issuance_cannot_exceed_pair_or_node_quota() {
+        for rotating in [false, true] {
+            let admission = Admission::new(RelayServerConfig::default()).unwrap();
+            let a = Identity::generate().node_id();
+            let b = Identity::generate().node_id();
+            let barrier = std::sync::Barrier::new(4);
+            let accepted = std::sync::atomic::AtomicUsize::new(0);
+            std::thread::scope(|scope| {
+                for _ in 0..4 {
+                    let (admission, barrier, accepted) = (&admission, &barrier, &accepted);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        for i in 0..32 {
+                            let peer = if rotating {
+                                Identity::generate().node_id()
+                            } else {
+                                b
+                            };
+                            let pair = if i % 2 == 0 { (a, peer) } else { (peer, a) };
+                            if admission.issue(PunchToken::random(), pair.0, pair.1) {
+                                accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
+                        }
+                    });
+                }
+            });
+            let quota = if rotating {
+                MAX_TICKETS_PER_NODE
+            } else {
+                MAX_TICKETS_PER_PAIR
+            };
+            assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), quota);
+            assert_eq!(admission.ticket_count(), quota);
+        }
     }
     #[test]
     fn relay_weak_ed25519_keys_and_unbounded_config_are_rejected() {
