@@ -1333,8 +1333,11 @@ mod tests {
         use crate::net::NetworkFamilies;
         use crate::speedtest::{SpeedTestDirection, run_speedtest};
         let (signal, relay, signal_task) = crate::relay::tests::signaling_fixture().await;
-        let server_id = Identity::generate();
-        let client_id = Identity::generate();
+        let mut server_id = Identity::generate();
+        let mut client_id = Identity::generate();
+        if server_id.node_id() > client_id.node_id() {
+            std::mem::swap(&mut server_id, &mut client_id);
+        }
         let blackhole_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let blackhole_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut sc = test_direct_config(signal, client_id.node_id());
@@ -1347,6 +1350,17 @@ mod tests {
         cc.relay_server = sc.relay_server.clone();
         cc.advertise_only = true;
         cc.advertise = vec![blackhole_b.local_addr().unwrap()];
+        let blackholes_v6 = if crate::net::family::ipv6_test_available() {
+            let a = crate::net::family::bind_udp("[::1]:0".parse().unwrap()).unwrap();
+            let b = crate::net::family::bind_udp("[::1]:0".parse().unwrap()).unwrap();
+            sc.families = NetworkFamilies::DualStack;
+            cc.families = sc.families;
+            sc.advertise.push(a.local_addr().unwrap());
+            cc.advertise.push(b.local_addr().unwrap());
+            Some((a, b))
+        } else {
+            None
+        };
         let (sl, cl) = tokio::join!(establish(&server_id, &sc), establish(&client_id, &cc));
         let sl = sl.unwrap();
         let cl = cl.unwrap();
@@ -1496,18 +1510,30 @@ mod tests {
         cl.network.wait_idle().await;
         signal_task.abort();
         let _ = signal_task.await;
+        drop(blackholes_v6);
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
     async fn relay_configured_fast_direct_wins_without_any_relay_udp_request() {
+        fast_direct_relay_fixture(crate::net::NetworkFamilies::Ipv4Only).await;
+    }
+    #[tokio::test]
+    async fn relay_configured_fast_ipv6_direct_wins_without_any_relay_udp_request() {
+        if crate::net::family::ipv6_test_available() {
+            fast_direct_relay_fixture(crate::net::NetworkFamilies::Ipv6Only).await;
+        }
+    }
+    async fn fast_direct_relay_fixture(families: crate::net::NetworkFamilies) {
         let signal = spawn_signal_server().await;
         let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let a = Identity::generate();
         let b = Identity::generate();
         let mut sc = test_direct_config(signal, a.node_id());
+        sc.families = families;
         sc.relay_server = Some(relay.local_addr().unwrap().to_string());
         let mut cc = test_direct_config(signal, b.node_id());
+        cc.families = families;
         cc.relay_server = sc.relay_server.clone();
         let (sl, cl) = tokio::join!(establish(&b, &sc), establish(&a, &cc));
         let sl = sl.unwrap();
@@ -1529,6 +1555,10 @@ mod tests {
                 .unwrap()
                 .endpoints
                 .is_relay(&connection)
+        );
+        assert_eq!(
+            connection.remote_address().is_ipv6(),
+            families == crate::net::NetworkFamilies::Ipv6Only
         );
         let mut bytes = [0; 512];
         assert!(
