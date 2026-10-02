@@ -1604,7 +1604,10 @@ mod tests {
             ca.authorize_session(&c, true, a, b, verifier, None, caps)
                 .await
         });
-        waiting.await.unwrap();
+        tokio::time::timeout(AUTH_TIMEOUT + Duration::from_secs(5), waiting)
+            .await
+            .expect("authentication must reach the publication barrier")
+            .unwrap();
         sa.set_trusted(&[]);
         release.send(()).unwrap();
         assert!(server_auth.await.unwrap().is_err());

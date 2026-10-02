@@ -3215,7 +3215,9 @@ mod tests {
     use tokio::task::JoinHandle;
 
     use super::*;
-    use crate::discovery::signal::{SignalServerConfig, run_signal_server_on_with};
+    use crate::discovery::signal::{
+        SignalServerConfig, run_signal_server_on_borrowed, run_signal_server_on_with,
+    };
 
     fn auth_config(server: SocketAddr) -> DesktopSessionConfig {
         let mut config = local_config(server);
@@ -4117,22 +4119,22 @@ mod tests {
 
     #[tokio::test]
     async fn signal_restart_re_registers_the_same_identity_after_bounded_backoff() {
-        // Keep ownership of the ephemeral port across server epochs. Releasing
-        // it lets an unrelated parallel fixture reuse it before the restart
-        // (observed as AddrInUse on macOS). The old client tasks still terminate.
-        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        reserved.set_nonblocking(true).unwrap();
+        // Keep one registered listener across epochs. Releasing the port lets
+        // parallel fixtures reuse it; cloning/re-registering its socket can spin
+        // on accept errors on Windows. Only the server and client tasks restart.
+        let reserved = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
         let signal_server = reserved.local_addr().unwrap();
-        let initial = TcpListener::from_std(reserved.try_clone().unwrap()).unwrap();
+        let initial = Arc::clone(&reserved);
         let server = tokio::spawn(async move {
-            let _ = run_signal_server_on_with(
-                initial,
+            run_signal_server_on_borrowed(
+                &initial,
                 SignalServerConfig {
                     idle_timeout: Duration::from_millis(250),
                     ..SignalServerConfig::for_tests()
                 },
             )
-            .await;
+            .await
+            .unwrap();
         });
         let identity = Identity::generate();
         let (handle, mut events) = spawn(identity.clone(), local_config(signal_server)).unwrap();
@@ -4153,9 +4155,10 @@ mod tests {
         .await
         .expect("session should detect signaling disconnect and schedule bounded retry");
 
-        let listener = TcpListener::from_std(reserved).unwrap();
         let restarted_server = tokio::spawn(async move {
-            let _ = run_signal_server_on_with(listener, SignalServerConfig::for_tests()).await;
+            run_signal_server_on_borrowed(&reserved, SignalServerConfig::for_tests())
+                .await
+                .unwrap();
         });
         time::timeout(Duration::from_secs(12), async {
             while let Some(event) = events.recv().await {
@@ -4967,11 +4970,14 @@ mod tests {
     ) {
         time::timeout(Duration::from_secs(20), async {
             loop {
-                if let Some(SessionEvent::PeerState {
+                if let SessionEvent::PeerState {
                     peer: id,
                     state: PeerLifecycle::Connected(auth),
                     ..
-                }) = events.recv().await
+                } = events
+                    .recv()
+                    .await
+                    .expect("session closed before expected grants")
                     && id == peer
                     && auth == expected
                 {

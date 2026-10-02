@@ -721,6 +721,15 @@ pub async fn run_signal_server_on_with(
     listener: TcpListener,
     config: SignalServerConfig,
 ) -> Result<()> {
+    run_signal_server_on_borrowed(&listener, config).await
+}
+
+// Borrowing also lets restart fixtures retain the same registered listener:
+// duplicating and re-registering one underlying socket is not portable to IOCP.
+pub(crate) async fn run_signal_server_on_borrowed(
+    listener: &TcpListener,
+    config: SignalServerConfig,
+) -> Result<()> {
     let local = listener.local_addr()?;
     tracing::info!(%local, "信令服务器已启动，等待节点接入（只牵线，不过数据）");
 
