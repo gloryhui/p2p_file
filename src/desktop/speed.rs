@@ -217,6 +217,18 @@ impl SpeedPeer {
             active.cancel.send_replace(true);
         }
     }
+    pub fn revoke_authorization(&self, authorization: super::remote_auth::RemoteAuthorization) {
+        if let Some(active) = self.0.state.lock().unwrap().active.as_ref() {
+            let authorized = if active.lease.owner == self.0.local {
+                authorization.outbound_authorized()
+            } else {
+                authorization.inbound_authorized()
+            };
+            if !authorized {
+                active.cancel.send_replace(true);
+            }
+        }
+    }
     fn prepare(
         &self,
         owner: NodeId,

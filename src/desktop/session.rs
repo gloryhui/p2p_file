@@ -52,6 +52,8 @@ fn is_current_signal_generation(current: u64, result_generation: u64) -> bool {
 pub struct DesktopSessionConfig {
     pub signal_server: String,
     pub remote_auth: Option<RemoteVerifier>,
+    pub trusted_devices: Vec<super::trusted_devices::TrustedDevice>,
+    pub config_path: Option<std::path::PathBuf>,
     #[cfg(test)]
     pub test_outgoing_password: Option<SecretPassword>,
     pub network: DesktopNetworkConfig,
@@ -65,6 +67,8 @@ impl DesktopSessionConfig {
         Self {
             signal_server: signal_server.into(),
             remote_auth: None,
+            trusted_devices: Vec::new(),
+            config_path: None,
             #[cfg(test)]
             test_outgoing_password: None,
             network: DesktopNetworkConfig::default(),
@@ -86,6 +90,7 @@ pub enum TunnelRuntimeState {
 
 #[derive(Clone, Debug)]
 pub enum SessionEvent {
+    TrustedDevicesChanged(Vec<super::trusted_devices::TrustedDevice>),
     Lifecycle(NetworkLifecycle),
     PeerState {
         peer: NodeId,
@@ -201,8 +206,35 @@ impl DesktopSessionHandle {
         password: SecretPassword,
     ) -> std::result::Result<(), String> {
         self.commands
-            .try_send(SessionCommand::ConnectShort { short_id, password })
+            .try_send(SessionCommand::ConnectShort {
+                short_id,
+                password: Some(password),
+            })
             .map_err(|_| "网络会话暂时无法接收短 ID 查询".into())
+    }
+    pub fn connect_peer_trusted(&self, peer: NodeId) -> std::result::Result<(), String> {
+        self.commands
+            .try_send(SessionCommand::ConnectTrusted(peer))
+            .map_err(|_| "连接请求队列不可用".into())
+    }
+    pub fn connect_short_id_trusted(&self, short_id: ShortId) -> std::result::Result<(), String> {
+        self.commands
+            .try_send(SessionCommand::ConnectShort {
+                short_id,
+                password: None,
+            })
+            .map_err(|_| "短 ID 查询队列不可用".into())
+    }
+    pub async fn change_trusted_device(
+        &self,
+        change: TrustedDeviceChange,
+    ) -> std::result::Result<Vec<super::trusted_devices::TrustedDevice>, String> {
+        let (done, result) = oneshot::channel();
+        self.commands
+            .send(SessionCommand::ChangeTrustedDevice { change, done })
+            .await
+            .map_err(|_| "会话已关闭".to_owned())?;
+        result.await.map_err(|_| "会话已关闭".to_owned())?
     }
     pub async fn update_remote_auth(
         &self,
@@ -355,7 +387,32 @@ impl DesktopSessionHandle {
     }
 }
 
+pub enum TrustedDeviceChange {
+    Trust {
+        peer: NodeId,
+        generation: u64,
+        display_name: String,
+    },
+    Rename {
+        peer: NodeId,
+        display_name: String,
+    },
+    Revoke {
+        peer: NodeId,
+    },
+}
 enum SessionCommand {
+    RetryCandidates {
+        peer: NodeId,
+        candidates: Vec<Candidate>,
+        token: PunchToken,
+    },
+    ChangeTrustedDevice {
+        change: TrustedDeviceChange,
+        done: oneshot::Sender<
+            std::result::Result<Vec<super::trusted_devices::TrustedDevice>, String>,
+        >,
+    },
     StartSpeed {
         peer: NodeId,
         direction: super::config::SpeedtestDirection,
@@ -383,13 +440,14 @@ enum SessionCommand {
         id: super::task_model::TaskId,
     },
     ConnectPeer(NodeId),
+    ConnectTrusted(NodeId),
     ConnectAuthenticated {
         peer: NodeId,
         password: SecretPassword,
     },
     ConnectShort {
         short_id: ShortId,
-        password: SecretPassword,
+        password: Option<SecretPassword>,
     },
     UpdateRemoteAuth {
         verifier: RemoteVerifier,
@@ -423,6 +481,11 @@ impl SessionCommand {
 }
 
 enum SessionInput {
+    AuthorizationChanged {
+        peer: NodeId,
+        generation: u64,
+        transport: usize,
+    },
     Incoming(Box<quinn::Incoming>),
     SignalConnected {
         generation: u64,
@@ -438,6 +501,7 @@ enum SessionInput {
         generation: u64,
         capabilities: u64,
         authorization: RemoteAuthorization,
+        control: Option<Box<super::remote_auth::TrustedControl>>,
         connection: quinn::Connection,
     },
     PeerFailed {
@@ -492,6 +556,8 @@ pub fn spawn(
     identity: Identity,
     config: DesktopSessionConfig,
 ) -> std::io::Result<(DesktopSessionHandle, mpsc::Receiver<SessionEvent>)> {
+    super::trusted_devices::validate(&config.trusted_devices)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CAPACITY);
     let session_command_tx = command_tx.clone();
     let (event_tx, event_rx) = mpsc::channel(EVENT_CAPACITY);
@@ -590,8 +656,17 @@ async fn run_session(
 
     let mut remote_verifier = config.remote_auth.clone();
     let auth_context = AuthContext::default();
+    let mut trusted_devices = config.trusted_devices.clone();
+    auth_context.set_trusted(&trusted_devices);
+    let mut authorizations: HashMap<
+        NodeId,
+        (u64, usize, super::remote_auth::AuthorizationPublisher),
+    > = HashMap::new();
     let mut credentials: HashMap<NodeId, SecretPassword> = HashMap::new();
-    let mut short_queries: HashMap<ShortId, (SecretPassword, time::Instant)> = HashMap::new();
+    let mut credential_retries = HashSet::new();
+    let mut resolved_short_ids: HashMap<NodeId, ShortId> = HashMap::new();
+    let mut short_queries: HashMap<ShortId, (Option<SecretPassword>, time::Instant)> =
+        HashMap::new();
     let local_node = identity.node_id();
     let endpoint = network.endpoint.clone();
     let (input_tx, mut inputs) = mpsc::channel(SESSION_INPUT_CAPACITY);
@@ -604,6 +679,8 @@ async fn run_session(
 
     let semaphore = Arc::new(Semaphore::new(MAX_PENDING_PEERS));
     let mut peer_tasks = JoinSet::new();
+    let mut peer_attempts: HashMap<NodeId, (PunchToken, tokio::task::AbortHandle)> = HashMap::new();
+    let mut deferred_candidates: HashMap<NodeId, (Vec<Candidate>, PunchToken)> = HashMap::new();
     let mut tunnel_tasks: JoinSet<TunnelTaskResult> = JoinSet::new();
     let selection_workers = Arc::new(Semaphore::new(3));
     let selection_jobs = Arc::new(Semaphore::new(64));
@@ -732,6 +809,18 @@ async fn run_session(
             task = tunnel_tasks.join_next(), if !tunnel_tasks.is_empty() => Wake::TunnelTask(task),
         };
 
+        let wake = match wake {
+            Wake::Command(Some(SessionCommand::RetryCandidates {
+                peer,
+                candidates,
+                token,
+            })) => Wake::Signal(Ok(SignalMessage::PeerCandidates {
+                node_id: peer,
+                candidates,
+                token,
+            })),
+            wake => wake,
+        };
         // One authorization gate covers outgoing sensitive commands. Local cancellation,
         // settings, and listener startup remain available while a peer is unavailable.
         if let Wake::Command(Some(command)) = &wake
@@ -758,6 +847,189 @@ async fn run_session(
             Wake::Command(Some(SessionCommand::Inspect(reply))) => {
                 let _ = reply.send(connections.clone());
             }
+            Wake::Command(Some(SessionCommand::ChangeTrustedDevice { change, done })) => {
+                let candidate: std::result::Result<
+                    Vec<super::trusted_devices::TrustedDevice>,
+                    String,
+                > = (|| {
+                    let mut devices = trusted_devices.clone();
+                    match change {
+                        TrustedDeviceChange::Trust {
+                            peer,
+                            generation,
+                            display_name,
+                        } => {
+                            let valid = peer != local_node
+                                && connections.get(&peer).is_some_and(|(g, c)| {
+                                    *g == generation && c.close_reason().is_none()
+                                })
+                                && authorizations.get(&peer).is_some_and(|(g, _, a)| {
+                                    *g == generation && {
+                                        let a = a.borrow();
+                                        a.inbound.password || a.outbound.password
+                                    }
+                                });
+                            if !valid {
+                                return Err("只能明确信任当前已经完成密码认证的真实设备".into());
+                            }
+                            if super::trusted_devices::contains(&devices, peer) {
+                                return Err("设备已经受信任".into());
+                            }
+                            devices.push(super::trusted_devices::TrustedDevice::new(
+                                peer,
+                                display_name,
+                                resolved_short_ids.get(&peer).map(ToString::to_string),
+                            ));
+                        }
+                        TrustedDeviceChange::Rename { peer, display_name } => {
+                            let device = devices
+                                .iter_mut()
+                                .find(|d| d.node_id == peer.to_hex())
+                                .ok_or("可信设备不存在")?;
+                            device.display_name = display_name;
+                            device.updated_at = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs()
+                                .max(device.trusted_at);
+                        }
+                        TrustedDeviceChange::Revoke { peer } => {
+                            devices.retain(|d| d.node_id != peer.to_hex())
+                        }
+                    }
+                    super::trusted_devices::validate(&devices).map_err(|e| e.to_string())?;
+                    let path = config
+                        .config_path
+                        .as_ref()
+                        .ok_or("配置路径不可用，未修改可信设备")?;
+                    super::config::DesktopConfig::save_trusted_devices(path, devices.clone())
+                        .map_err(|e| e.to_string())?;
+                    Ok(devices)
+                })();
+                if let Ok(devices) = &candidate {
+                    trusted_devices.clone_from(devices);
+                    // Publish revocation synchronously after durable success. No handshake callback can restore it.
+                    for (peer, (_, _, rights)) in &authorizations {
+                        rights.send_modify(|a| {
+                            a.inbound.trusted_device &=
+                                super::trusted_devices::contains(devices, *peer)
+                        });
+                    }
+                    auth_context.set_trusted(devices);
+                    for (peer, (generation, _, rights)) in &authorizations {
+                        let authorization = *rights.borrow();
+                        if peers.transition(
+                            *peer,
+                            *generation,
+                            PeerLifecycle::Connected(authorization),
+                        ) {
+                            emit_peer_state(
+                                &events,
+                                *peer,
+                                *generation,
+                                PeerLifecycle::Connected(authorization),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                let _ = done.send(candidate);
+            }
+            Wake::Input(Some(SessionInput::AuthorizationChanged {
+                peer,
+                generation,
+                transport,
+            })) => {
+                let Some((g, t, rights)) = authorizations.get(&peer) else {
+                    continue;
+                };
+                if *g != generation
+                    || *t != transport
+                    || !connections.get(&peer).is_some_and(|(g, c)| {
+                        *g == generation && c.stable_id() == transport && c.close_reason().is_none()
+                    })
+                {
+                    continue;
+                }
+                rights.send_if_modified(|a| {
+                    let old = *a;
+                    a.inbound.trusted_device &= auth_context.trusts(peer);
+                    old != *a
+                });
+                let authorization = *rights.borrow();
+                if !peers.transition(peer, generation, PeerLifecycle::Connected(authorization)) {
+                    continue;
+                }
+                emit_peer_state(
+                    &events,
+                    peer,
+                    generation,
+                    PeerLifecycle::Connected(authorization),
+                )
+                .await;
+                if let Some(service) = &config.transfer
+                    && let Err(error) = service.revoke_authorization(peer, authorization).await
+                {
+                    let _ = events
+                        .send(SessionEvent::Diagnostic(format!(
+                            "授权已撤销；任务中断状态保存失败：{error}"
+                        )))
+                        .await;
+                }
+                if authorization.outbound_authorized() {
+                    if let Some(updates) = peer_connection_updates.get(&peer) {
+                        updates.send_replace(
+                            connections.get(&peer).map(|(_, c)| c.clone()).filter(|_| {
+                                peer_capabilities
+                                    .get(&peer)
+                                    .is_some_and(|c| c & super::protocol::CAP_TCP_TUNNEL != 0)
+                            }),
+                        );
+                    }
+                    let ready = waiting_tunnels
+                        .values()
+                        .filter(|r: &&super::config::TunnelRule| r.peer_node_id == peer.to_hex())
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for rule in ready {
+                        start_tunnel_rule(
+                            rule,
+                            local_node,
+                            &connections,
+                            &peers,
+                            &credentials,
+                            credential_fallback,
+                            &mut waiting_tunnels,
+                            &peer_capabilities,
+                            &mut peer_connection_updates,
+                            &mut running_tunnels,
+                            &mut tunnel_tasks,
+                            &command_tx,
+                            &events,
+                        )
+                        .await;
+                    }
+                } else {
+                    if let Some(updates) = peer_connection_updates.get(&peer) {
+                        updates.send_replace(None);
+                    }
+                    for (id, running) in &running_tunnels {
+                        if running.rule.peer_node_id == peer.to_hex() {
+                            running.shutdown.send_replace(true);
+                            waiting_tunnels.insert(id.clone(), running.rule.clone());
+                            let _ = events
+                                .send(SessionEvent::TunnelState {
+                                    rule_id: id.clone(),
+                                    state: TunnelRuntimeState::WaitingAuthorization,
+                                })
+                                .await;
+                        }
+                    }
+                }
+            }
+            Wake::Command(Some(SessionCommand::RetryCandidates { .. })) => {
+                unreachable!("candidate retry normalized before dispatch")
+            }
             Wake::Command(None) => {
                 session_shutdown = true;
             }
@@ -767,33 +1039,65 @@ async fn run_session(
                 seconds,
             })) => {
                 if let Some(service) = config.transfer.clone() {
+                    let live = authorizations[&peer].2.live();
                     let events = events.clone();
                     peer_tasks.spawn(async move {
-                        let result = match direction {
-                            super::config::SpeedtestDirection::Both => {
-                                match service
-                                    .start_speed(
-                                        peer,
-                                        super::protocol::SpeedDirection::Upload,
-                                        seconds,
-                                    )
-                                    .await
-                                {
-                                    Ok(upload) => {
-                                        let _ = events
-                                            .send(SessionEvent::SpeedPhaseCompleted {
-                                                peer,
-                                                snapshot: upload,
-                                            })
-                                            .await;
-                                        let download = service
+                        let result = live
+                            .guard(false, async {
+                                match direction {
+                                    super::config::SpeedtestDirection::Both => {
+                                        match service
                                             .start_speed(
                                                 peer,
-                                                super::protocol::SpeedDirection::Download,
+                                                super::protocol::SpeedDirection::Upload,
                                                 seconds,
                                             )
+                                            .await
+                                        {
+                                            Ok(upload) => {
+                                                let _ = events
+                                                    .send(SessionEvent::SpeedPhaseCompleted {
+                                                        peer,
+                                                        snapshot: upload,
+                                                    })
+                                                    .await;
+                                                let download = service
+                                                    .start_speed(
+                                                        peer,
+                                                        super::protocol::SpeedDirection::Download,
+                                                        seconds,
+                                                    )
+                                                    .await;
+                                                if let Ok(snapshot) = &download {
+                                                    let _ = events
+                                                        .send(SessionEvent::SpeedPhaseCompleted {
+                                                            peer,
+                                                            snapshot: snapshot.clone(),
+                                                        })
+                                                        .await;
+                                                }
+                                                download
+                                            }
+                                            Err(error) => Err(error),
+                                        }
+                                    }
+                                    super::config::SpeedtestDirection::Upload
+                                    | super::config::SpeedtestDirection::Download => {
+                                        let wire_direction = match direction {
+                                            super::config::SpeedtestDirection::Upload => {
+                                                super::protocol::SpeedDirection::Upload
+                                            }
+                                            super::config::SpeedtestDirection::Download => {
+                                                super::protocol::SpeedDirection::Download
+                                            }
+                                            super::config::SpeedtestDirection::Both => {
+                                                unreachable!()
+                                            }
+                                        };
+                                        let result = service
+                                            .start_speed(peer, wire_direction, seconds)
                                             .await;
-                                        if let Ok(snapshot) = &download {
+                                        if let Ok(snapshot) = &result {
                                             let _ = events
                                                 .send(SessionEvent::SpeedPhaseCompleted {
                                                     peer,
@@ -801,35 +1105,11 @@ async fn run_session(
                                                 })
                                                 .await;
                                         }
-                                        download
+                                        result
                                     }
-                                    Err(error) => Err(error),
                                 }
-                            }
-                            super::config::SpeedtestDirection::Upload
-                            | super::config::SpeedtestDirection::Download => {
-                                let wire_direction = match direction {
-                                    super::config::SpeedtestDirection::Upload => {
-                                        super::protocol::SpeedDirection::Upload
-                                    }
-                                    super::config::SpeedtestDirection::Download => {
-                                        super::protocol::SpeedDirection::Download
-                                    }
-                                    super::config::SpeedtestDirection::Both => unreachable!(),
-                                };
-                                let result =
-                                    service.start_speed(peer, wire_direction, seconds).await;
-                                if let Ok(snapshot) = &result {
-                                    let _ = events
-                                        .send(SessionEvent::SpeedPhaseCompleted {
-                                            peer,
-                                            snapshot: snapshot.clone(),
-                                        })
-                                        .await;
-                                }
-                                result
-                            }
-                        };
+                            })
+                            .await;
                         if let Err(error) = result {
                             let _ = events
                                 .send(SessionEvent::Diagnostic(error.to_string()))
@@ -896,52 +1176,55 @@ async fn run_session(
                         .await;
                     continue;
                 };
+                let live = authorizations[&peer].2.live();
                 let selection_workers = selection_workers.clone();
                 let events = events.clone();
                 peer_tasks.spawn(async move {
                     let _permit = permit;
-                    let result = async {
-                        match command {
-                            SessionCommand::SendFile { source, .. } => {
-                                let _worker =
-                                    selection_workers.clone().acquire_owned().await.map_err(
-                                        |_| super::transfer_files::failure("扫描任务已关闭"),
-                                    )?;
-                                service.select_file(peer, source).await?;
-                                let _ = events
-                                    .send(SessionEvent::SelectionQueued { peer, count: 1 })
-                                    .await;
-                                Ok(())
-                            }
-                            SessionCommand::SendDirectory { source, .. } => {
-                                let _worker =
-                                    selection_workers.clone().acquire_owned().await.map_err(
-                                        |_| super::transfer_files::failure("扫描任务已关闭"),
-                                    )?;
-                                let ids = service.select_directory(peer, source).await?;
-                                let _ = events
-                                    .send(SessionEvent::SelectionQueued {
-                                        peer,
-                                        count: ids.len(),
-                                    })
-                                    .await;
-                                Ok(())
-                            }
-                            SessionCommand::ResumeTask { id, .. } => {
-                                let record = service.task(id.clone()).await?;
-                                if record.direction() == super::task_model::TaskDirection::Send {
-                                    service.enqueue_tasks(peer, vec![id]).await
-                                } else {
-                                    let connection = connection.ok_or_else(|| {
-                                        super::transfer_files::failure("请先连接任务绑定的对端")
-                                    })?;
-                                    service.resume(&connection, peer, id).await
+                    let result = live
+                        .guard(false, async {
+                            match command {
+                                SessionCommand::SendFile { source, .. } => {
+                                    let _worker =
+                                        selection_workers.clone().acquire_owned().await.map_err(
+                                            |_| super::transfer_files::failure("扫描任务已关闭"),
+                                        )?;
+                                    service.select_file(peer, source).await?;
+                                    let _ = events
+                                        .send(SessionEvent::SelectionQueued { peer, count: 1 })
+                                        .await;
+                                    Ok(())
                                 }
+                                SessionCommand::SendDirectory { source, .. } => {
+                                    let _worker =
+                                        selection_workers.clone().acquire_owned().await.map_err(
+                                            |_| super::transfer_files::failure("扫描任务已关闭"),
+                                        )?;
+                                    let ids = service.select_directory(peer, source).await?;
+                                    let _ = events
+                                        .send(SessionEvent::SelectionQueued {
+                                            peer,
+                                            count: ids.len(),
+                                        })
+                                        .await;
+                                    Ok(())
+                                }
+                                SessionCommand::ResumeTask { id, .. } => {
+                                    let record = service.task(id.clone()).await?;
+                                    if record.direction() == super::task_model::TaskDirection::Send
+                                    {
+                                        service.enqueue_tasks(peer, vec![id]).await
+                                    } else {
+                                        let connection = connection.ok_or_else(|| {
+                                            super::transfer_files::failure("请先连接任务绑定的对端")
+                                        })?;
+                                        service.resume(&connection, peer, id).await
+                                    }
+                                }
+                                _ => unreachable!(),
                             }
-                            _ => unreachable!(),
-                        }
-                    }
-                    .await;
+                        })
+                        .await;
                     if let Err(error) = result {
                         let _ = events
                             .send(SessionEvent::Diagnostic(error.to_string()))
@@ -974,11 +1257,35 @@ async fn run_session(
                                     .is_some_and(|(_, c)| c.close_reason().is_none()))
                     });
                 credentials.insert(peer, password);
+                if peers
+                    .state(peer)
+                    .is_some_and(|state| state.is_active() && !state.is_connected())
+                {
+                    // A pending lookup will read the new credential when it starts.
+                    // A running exchange finishes first, then retries on a fresh transport.
+                    // Neither path creates a competing punch token for the same attempt.
+                    if !same_credential && peer_attempts.contains_key(&peer) {
+                        credential_retries.insert(peer);
+                    }
+                    continue;
+                }
                 if !reuse_authorized {
+                    if let Some((_, attempt)) = peer_attempts.remove(&peer) {
+                        attempt.abort();
+                    }
                     reconnect_probes.remove(&peer);
                     // Explicit credentials upgrade rights on a fresh transport; never copy
                     // the previous generation's authorization into a new exchange.
                     if let Some((generation, connection)) = connections.remove(&peer) {
+                        if let Some((_, _, rights)) = authorizations.remove(&peer) {
+                            rights.send_replace(RemoteAuthorization::default());
+                        }
+                        retire_peer_listeners(
+                            peer,
+                            &running_tunnels,
+                            &mut waiting_tunnels,
+                            &mut restart_after_tunnel_stop,
+                        );
                         connection.close(0u32.into(), b"new explicit remote credential");
                         peer_capabilities.remove(&peer);
                         if let Some(updates) = peer_connection_updates.get(&peer) {
@@ -1021,6 +1328,19 @@ async fn run_session(
                         "信令尚未就绪，无法查询短设备 ID".into(),
                     ))
                     .await;
+            }
+            Wake::Command(Some(SessionCommand::ConnectTrusted(peer))) => {
+                let had_password = credentials.remove(&peer).is_some();
+                if peers
+                    .state(peer)
+                    .is_some_and(|state| state.is_active() && !state.is_connected())
+                {
+                    if had_password && peer_attempts.contains_key(&peer) {
+                        credential_retries.insert(peer);
+                    }
+                    continue;
+                }
+                let _ = command_tx.try_send(SessionCommand::ConnectPeer(peer));
             }
             Wake::Command(Some(SessionCommand::ConnectPeer(peer))) => {
                 if peer == local_node {
@@ -1096,6 +1416,10 @@ async fn run_session(
                     _ => unreachable!(),
                 }
                 short_queries.clear();
+                credential_retries.clear();
+                for (_, (_, _, rights)) in authorizations.drain() {
+                    rights.send_replace(RemoteAuthorization::default());
+                }
                 peer_candidates.clear();
                 reconnect_probes.clear();
                 let signal_changed = auth_updated.is_none();
@@ -1107,6 +1431,8 @@ async fn run_session(
                 for (_, (_, connection)) in connections.drain() {
                     connection.close(0u32.into(), b"desktop network reconfigured");
                 }
+                peer_attempts.clear();
+                deferred_candidates.clear();
                 peer_tasks.abort_all();
                 while peer_tasks.join_next().await.is_some() {}
                 if let Some(service) = &config.transfer {
@@ -1120,6 +1446,11 @@ async fn run_session(
                 }
                 for peer in peer_connection_updates.keys() {
                     emit_peer_tunnels_starting(*peer, &running_tunnels, &events).await;
+                }
+                for (id, running) in &running_tunnels {
+                    waiting_tunnels.insert(id.clone(), running.rule.clone());
+                    restart_after_tunnel_stop.insert(id.clone());
+                    running.shutdown.send_replace(true);
                 }
                 let tunnel_peers = running_tunnels
                     .values()
@@ -1158,6 +1489,11 @@ async fn run_session(
                         &mut connect_task,
                         &mut session_tasks,
                     );
+                }
+                for rule in waiting_tunnels.values() {
+                    if let Ok(peer) = NodeId::from_hex(&rule.peer_node_id) {
+                        let _ = command_tx.try_send(SessionCommand::ConnectPeer(peer));
+                    }
                 }
                 if let Some(done) = auth_updated {
                     let _ = done.send(());
@@ -1311,6 +1647,19 @@ async fn run_session(
                     candidates,
                     token,
                 } => {
+                    if peers
+                        .state(node_id)
+                        .is_some_and(|state| state.is_active() && !state.is_connected())
+                        && let Some((current_token, _)) = peer_attempts.get(&node_id)
+                    {
+                        // A new lookup can arrive before the old auth failure callback.
+                        // Retain its authenticated signaling candidates rather than losing
+                        // the only matching punch token or cancelling an active transport.
+                        if *current_token != token {
+                            deferred_candidates.insert(node_id, (candidates, token));
+                        }
+                        continue;
+                    }
                     let canonical = canonical_candidates(&candidates);
                     if peers
                         .state(node_id)
@@ -1371,6 +1720,15 @@ async fn run_session(
                         // Retire only this generation; new Punch/QUIC/identity/capability
                         // checks remain mandatory. Old closure callbacks are fenced.
                         if let Some((generation, connection)) = connections.remove(&node_id) {
+                            if let Some((_, _, rights)) = authorizations.remove(&node_id) {
+                                rights.send_replace(RemoteAuthorization::default());
+                            }
+                            retire_peer_listeners(
+                                node_id,
+                                &running_tunnels,
+                                &mut waiting_tunnels,
+                                &mut restart_after_tunnel_stop,
+                            );
                             connection.close(0u32.into(), b"peer mapping changed");
                             peer_capabilities.remove(&node_id);
                             if let Some(updates) = peer_connection_updates.get(&node_id) {
@@ -1390,7 +1748,7 @@ async fn run_session(
                         peer_candidates.remove(&node_id);
                         reconnect_probes.remove(&node_id);
                     }
-                    if let Some(generation) = start_peer_attempt(
+                    if let Some((generation, attempt)) = start_peer_attempt(
                         node_id,
                         candidates,
                         token,
@@ -1418,6 +1776,7 @@ async fn run_session(
                     )
                     .await
                     {
+                        peer_attempts.insert(node_id, (token, attempt));
                         peer_candidates.insert(node_id, (generation, canonical));
                     }
                 }
@@ -1430,13 +1789,20 @@ async fn run_session(
                             })
                             .await;
                         if let Some(peer) = node_id {
+                            if resolved_short_ids.len() < super::network_state::MAX_PEERS
+                                || resolved_short_ids.contains_key(&peer)
+                            {
+                                resolved_short_ids.insert(peer, short_id);
+                            }
                             if peer != local_node
                                 && (credentials.len() < super::network_state::MAX_PEERS
                                     || credentials.contains_key(&peer))
                             {
-                                let _ = command_tx.try_send(SessionCommand::ConnectAuthenticated {
-                                    peer,
-                                    password,
+                                let _ = command_tx.try_send(match password {
+                                    Some(password) => {
+                                        SessionCommand::ConnectAuthenticated { peer, password }
+                                    }
+                                    None => SessionCommand::ConnectTrusted(peer),
                                 });
                             }
                         } else {
@@ -1585,7 +1951,8 @@ async fn run_session(
                 peer,
                 generation,
                 capabilities,
-                authorization,
+                mut authorization,
+                control,
                 connection,
             })) => {
                 pending_inbound.remove(&(peer, generation));
@@ -1595,9 +1962,107 @@ async fn run_session(
                     connection.close(0u32.into(), b"duplicate or stale peer generation");
                     continue;
                 }
+                peer_attempts.remove(&peer);
+                if credential_retries.remove(&peer) {
+                    connection.close(
+                        0u32.into(),
+                        b"new explicit credential after pending attempt",
+                    );
+                    peers.transition(peer, generation, PeerLifecycle::Disconnected);
+                    let retry = deferred_candidates.remove(&peer).map_or(
+                        SessionCommand::ConnectPeer(peer),
+                        |(candidates, token)| SessionCommand::RetryCandidates {
+                            peer,
+                            candidates,
+                            token,
+                        },
+                    );
+                    let _ = command_tx.try_send(retry);
+                    continue;
+                }
+                if let Some((candidates, token)) = deferred_candidates.remove(&peer) {
+                    let _ = command_tx.try_send(SessionCommand::RetryCandidates {
+                        peer,
+                        candidates,
+                        token,
+                    });
+                }
+                authorization.inbound.trusted_device &= auth_context.trusts(peer);
+                let rights = super::remote_auth::AuthorizationPublisher::new(authorization);
+                let live = rights.subscribe();
+                let transport = connection.stable_id();
+                if let Some((_, _, old)) =
+                    authorizations.insert(peer, (generation, transport, rights.clone()))
+                {
+                    old.send_replace(RemoteAuthorization::default());
+                }
+                if let Some(control) = control {
+                    let control_rights = rights.clone();
+                    peer_tasks.spawn(async move {
+                        (*control).run(control_rights).await;
+                    });
+                }
+                let changed_inputs = input_tx.clone();
+                let mut changed = live.clone();
+                let changed_connection = connection.clone();
+                peer_tasks.spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = changed_connection.closed() => break,
+                            result = changed.changed() => {
+                                if result.is_err() { break; }
+                                if changed_inputs.send(SessionInput::AuthorizationChanged { peer, generation, transport }).await.is_err() { break; }
+                            }
+                        }
+                    }
+                });
+                let live = rights.live();
                 if !peers.transition(peer, generation, PeerLifecycle::Connected(authorization)) {
                     connection.close(0u32.into(), b"stale peer generation");
                     continue;
+                }
+                if let Some(short) = resolved_short_ids.get(&peer) {
+                    let mut updated = trusted_devices.clone();
+                    if let Some(device) = updated.iter_mut().find(|d| {
+                        d.node_id == peer.to_hex()
+                            && d.last_short_id.as_deref() != Some(short.to_string().as_str())
+                    }) {
+                        device.last_short_id = Some(short.to_string());
+                        device.updated_at = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs()
+                            .max(device.trusted_at);
+                        if let Some(path) = &config.config_path {
+                            match super::config::DesktopConfig::save_trusted_devices(
+                                path,
+                                updated.clone(),
+                            ) {
+                                Ok(()) => {
+                                    trusted_devices = updated;
+                                    let _ = events
+                                        .send(SessionEvent::TrustedDevicesChanged(
+                                            trusted_devices.clone(),
+                                        ))
+                                        .await;
+                                }
+                                Err(error) => {
+                                    let _ = events
+                                        .send(SessionEvent::Diagnostic(format!(
+                                            "可信设备 Short ID 备注未保存：{error}"
+                                        )))
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                }
+                if capabilities & super::protocol::CAP_TRUSTED_DEVICE_AUTH == 0 {
+                    let _ = events
+                        .send(SessionEvent::Diagnostic(
+                            "对端不支持可信设备授权；本次仅使用密码认证".into(),
+                        ))
+                        .await;
                 }
                 reconnect_probes.remove(&peer);
                 connections.insert(peer, (generation, connection.clone()));
@@ -1622,7 +2087,7 @@ async fn run_session(
                     .entry(peer)
                     .or_insert_with(|| watch::channel(None).0)
                     .send_replace(
-                        (authorization.outbound_authorized
+                        (authorization.outbound_authorized()
                             && capabilities & super::protocol::CAP_TCP_TUNNEL != 0)
                             .then(|| connection.clone()),
                     );
@@ -1634,7 +2099,7 @@ async fn run_session(
                 )
                 .await;
                 emit_lifecycle(&events, NetworkLifecycle::Connected { peer }).await;
-                if authorization.outbound_authorized {
+                if authorization.outbound_authorized() {
                     let ready = waiting_tunnels
                         .keys()
                         .filter_map(|id| tunnel_rules.get(id))
@@ -1672,7 +2137,7 @@ async fn run_session(
                                 transfer_connection,
                                 peer,
                                 local_node,
-                                authorization,
+                                live,
                                 allowed_forward_targets,
                             )
                             .await
@@ -1692,7 +2157,7 @@ async fn run_session(
                         if let Err(error) = super::tunnel::serve_peer(
                             tunnel_connection,
                             peer,
-                            authorization.inbound_authorized,
+                            live,
                             allowed_forward_targets,
                         )
                         .await
@@ -1719,6 +2184,24 @@ async fn run_session(
                 detail,
             })) => {
                 pending_inbound.remove(&(peer, generation));
+                if peers.is_current(peer, generation) {
+                    peer_attempts.remove(&peer);
+                    let candidate = deferred_candidates.remove(&peer);
+                    let credential_retry = credential_retries.remove(&peer);
+                    if candidate.is_some() || credential_retry {
+                        peers.transition(peer, generation, PeerLifecycle::Failed(detail));
+                        let retry = candidate.map_or(
+                            SessionCommand::ConnectPeer(peer),
+                            |(candidates, token)| SessionCommand::RetryCandidates {
+                                peer,
+                                candidates,
+                                token,
+                            },
+                        );
+                        let _ = command_tx.try_send(retry);
+                        continue;
+                    }
+                }
                 if peers.transition(peer, generation, PeerLifecycle::Failed(detail.clone())) {
                     peer_candidates.remove(&peer);
                     fail_peer_tunnels(peer, &detail, &running_tunnels, &mut forced_tunnel_errors);
@@ -1742,11 +2225,21 @@ async fn run_session(
                         .is_some_and(|(current, _)| *current == generation)
                 {
                     connections.remove(&peer);
+                    if let Some((_, _, rights)) = authorizations.remove(&peer) {
+                        rights.send_replace(RemoteAuthorization::default());
+                    }
                     peer_capabilities.remove(&peer);
                     if let Some(updates) = peer_connection_updates.get(&peer) {
                         updates.send_replace(None);
                     }
                     emit_peer_tunnels_starting(peer, &running_tunnels, &events).await;
+                    for (id, running) in &running_tunnels {
+                        if running.rule.peer_node_id == peer.to_hex() {
+                            waiting_tunnels.insert(id.clone(), running.rule.clone());
+                            restart_after_tunnel_stop.insert(id.clone());
+                            running.shutdown.send_replace(true);
+                        }
+                    }
                     let affected_rules = running_tunnels
                         .values()
                         .filter(|running| running.rule.peer_node_id == peer.to_hex())
@@ -1804,6 +2297,15 @@ async fn run_session(
                 }
                 reconnect_probes.remove(&peer);
                 if let Some((_, old)) = connections.remove(&peer) {
+                    if let Some((_, _, rights)) = authorizations.remove(&peer) {
+                        rights.send_replace(RemoteAuthorization::default());
+                    }
+                    retire_peer_listeners(
+                        peer,
+                        &running_tunnels,
+                        &mut waiting_tunnels,
+                        &mut restart_after_tunnel_stop,
+                    );
                     old.close(0u32.into(), b"peer requested fresh authenticated transport");
                     peer_capabilities.remove(&peer);
                     if let Some(updates) = peer_connection_updates.get(&peer) {
@@ -1814,7 +2316,7 @@ async fn run_session(
                     emit_peer_state(&events, peer, generation, PeerLifecycle::Disconnected).await;
                 }
                 let canonical = canonical_candidates(&candidates);
-                if let Some(generation) = start_peer_attempt(
+                if let Some((generation, attempt)) = start_peer_attempt(
                     peer,
                     candidates,
                     token,
@@ -1842,6 +2344,7 @@ async fn run_session(
                 )
                 .await
                 {
+                    peer_attempts.insert(peer, (token, attempt));
                     peer_candidates.insert(peer, (generation, canonical));
                 }
             }
@@ -1872,6 +2375,18 @@ async fn run_session(
                 for (peer, generation) in peers.expired_lookups(time::Instant::now()) {
                     let state = PeerLifecycle::Failed("目标离线或候选等待超时，请重试连接".into());
                     if peers.transition(peer, generation, state.clone()) {
+                        for (id, rule) in &waiting_tunnels {
+                            if rule.peer_node_id == peer.to_hex() {
+                                let _ = events
+                                    .send(SessionEvent::TunnelState {
+                                        rule_id: id.clone(),
+                                        state: TunnelRuntimeState::Error(
+                                            "目标离线或候选等待超时，请重试连接".into(),
+                                        ),
+                                    })
+                                    .await;
+                            }
+                        }
                         fail_peer_tunnels(
                             peer,
                             "目标离线或候选等待超时，请重试连接",
@@ -1919,6 +2434,9 @@ async fn run_session(
                 }
                 let result = forced_tunnel_errors.remove(&rule_id).map_or(result, Err);
                 let state = match result {
+                    Ok(()) if waiting_tunnels.contains_key(&rule_id) => {
+                        TunnelRuntimeState::WaitingAuthorization
+                    }
                     Ok(()) => TunnelRuntimeState::Stopped,
                     Err(detail) => TunnelRuntimeState::Error(detail),
                 };
@@ -1929,7 +2447,15 @@ async fn run_session(
                         state,
                     })
                     .await;
-                let should_restart = restart_after_tunnel_stop.remove(&rule_id);
+                let should_restart = restart_after_tunnel_stop.remove(&rule_id)
+                    || waiting_tunnels
+                        .get(&rule_id)
+                        .and_then(|r| NodeId::from_hex(&r.peer_node_id).ok())
+                        .is_some_and(|peer| {
+                            peers
+                                .state(peer)
+                                .is_some_and(PeerLifecycle::outbound_authorized)
+                        });
                 if should_restart
                     && !failed
                     && let Some(rule) = tunnel_rules.get(&rule_id).cloned()
@@ -1969,13 +2495,17 @@ async fn run_session(
                 .map(|(peer, (_, connection))| (*peer, connection.clone()))
                 .collect();
             for scheduled in service.dispatch_ready(&ready_connections) {
+                let live = authorizations[&scheduled.entry.peer].2.live();
                 let connection = ready_connections[&scheduled.entry.peer].clone();
                 let service = service.clone();
                 let events = events.clone();
                 // Same structured owner as receive/RPC workers: shutdown aborts
                 // and drains every executor before persisted interruption recovery.
                 peer_tasks.spawn(async move {
-                    if let Err(error) = service.execute_queued(scheduled, connection).await {
+                    if let Err(error) = live
+                        .guard(false, service.execute_queued(scheduled, connection))
+                        .await
+                    {
                         let _ = events
                             .send(SessionEvent::Diagnostic(error.to_string()))
                             .await;
@@ -1985,6 +2515,9 @@ async fn run_session(
         }
     }
 
+    for (_, (_, _, rights)) in authorizations.drain() {
+        rights.send_replace(RemoteAuthorization::default());
+    }
     if let Some(task) = connect_task.take() {
         task.abort();
     }
@@ -2011,6 +2544,21 @@ async fn run_session(
     while peer_tasks.join_next().await.is_some() {}
     while session_tasks.join_next().await.is_some() {}
     let _ = time::timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
+}
+
+fn retire_peer_listeners(
+    peer: NodeId,
+    running: &HashMap<String, RunningTunnel>,
+    waiting: &mut HashMap<String, super::config::TunnelRule>,
+    restart: &mut HashSet<String>,
+) {
+    for (id, tunnel) in running {
+        if tunnel.rule.peer_node_id == peer.to_hex() {
+            waiting.insert(id.clone(), tunnel.rule.clone());
+            restart.insert(id.clone());
+            tunnel.shutdown.send_replace(true);
+        }
+    }
 }
 
 async fn emit_peer_tunnels_starting(
@@ -2052,8 +2600,8 @@ async fn start_tunnel_rule(
     local_node: NodeId,
     connections: &HashMap<NodeId, (u64, quinn::Connection)>,
     peers: &PeerRegistry,
-    credentials: &HashMap<NodeId, SecretPassword>,
-    credential_fallback: bool,
+    _credentials: &HashMap<NodeId, SecretPassword>,
+    _credential_fallback: bool,
     waiting_tunnels: &mut HashMap<String, super::config::TunnelRule>,
     peer_capabilities: &HashMap<NodeId, u64>,
     peer_connection_updates: &mut HashMap<NodeId, watch::Sender<Option<quinn::Connection>>>,
@@ -2125,7 +2673,8 @@ async fn start_tunnel_rule(
         && connections
             .get(&peer)
             .is_some_and(|(_, c)| c.close_reason().is_none());
-    if !outbound_authorized && !credentials.contains_key(&peer) && !credential_fallback {
+    if !outbound_authorized {
+        let _ = command_tx.try_send(SessionCommand::ConnectPeer(peer));
         waiting_tunnels.insert(rule_id.clone(), rule.clone());
         let _ = events
             .send(SessionEvent::TunnelState {
@@ -2346,7 +2895,7 @@ async fn start_peer_attempt(
     auth: AuthContext,
     verifier: Option<RemoteVerifier>,
     password: Option<SecretPassword>,
-) -> Option<u64> {
+) -> Option<(u64, tokio::task::AbortHandle)> {
     if peer == local_node {
         return None;
     }
@@ -2407,7 +2956,7 @@ async fn start_peer_attempt(
     let input_sender = inputs.clone();
     let endpoint = network.endpoint.clone();
     let punch_socket = network.punch_socket.clone();
-    tasks.spawn(async move {
+    let attempt = tasks.spawn(async move {
         let result = run_peer_attempt(
             peer,
             generation,
@@ -2435,7 +2984,7 @@ async fn start_peer_attempt(
                 .await;
         }
     });
-    Some(generation)
+    Some((generation, attempt))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2506,7 +3055,7 @@ async fn run_peer_attempt(
         .await;
     let authorization = match verifier {
         Some(verifier) => {
-            auth.authorize(
+            auth.authorize_session(
                 &connection,
                 should_initiate_quic(local_node, peer),
                 local_node,
@@ -2532,7 +3081,8 @@ async fn run_peer_attempt(
             peer,
             generation,
             capabilities,
-            authorization,
+            authorization: authorization.authorization,
+            control: authorization.control.map(Box::new),
             connection,
         })
         .await
@@ -2930,13 +3480,15 @@ mod tests {
         ha.connect_peer_with_password(b.node_id(), test_password())
             .unwrap();
         wait_specific_tunnel_state(&mut ea, &rule.id, TunnelRuntimeState::Running).await;
-        assert_eq!(
-            wait_authorization(&mut eb, a.node_id()).await,
+        wait_grants(
+            &mut eb,
+            a.node_id(),
             RemoteAuthorization {
-                inbound_authorized: true,
-                outbound_authorized: false
-            }
-        );
+                inbound: crate::desktop::remote_auth::AuthorizationGrant::password(true),
+                outbound: crate::desktop::remote_auth::AuthorizationGrant::password(false),
+            },
+        )
+        .await;
         let mut tcp = tokio::net::TcpStream::connect(local).await.unwrap();
         tcp.write_all(b"request").await.unwrap();
         let (mut destination, _) = time::timeout(Duration::from_secs(5), target.accept())
@@ -3071,15 +3623,15 @@ mod tests {
         assert_eq!(
             wait_authorization(&mut ea, b.node_id()).await,
             RemoteAuthorization {
-                inbound_authorized: false,
-                outbound_authorized: true
+                inbound: crate::desktop::remote_auth::AuthorizationGrant::password(false),
+                outbound: crate::desktop::remote_auth::AuthorizationGrant::password(true)
             }
         );
         assert_eq!(
             wait_authorization(&mut eb, a.node_id()).await,
             RemoteAuthorization {
-                inbound_authorized: true,
-                outbound_authorized: false
+                inbound: crate::desktop::remote_auth::AuthorizationGrant::password(true),
+                outbound: crate::desktop::remote_auth::AuthorizationGrant::password(false)
             }
         );
         let conn_a = inspect(&ha).await[&b.node_id()].1.clone();
@@ -3390,6 +3942,8 @@ mod tests {
         DesktopSessionConfig {
             signal_server: signal_server.to_string(),
             remote_auth: Some(test_verifier()),
+            trusted_devices: Vec::new(),
+            config_path: None,
             test_outgoing_password: Some(test_password()),
             allowed_forward_targets: Vec::new(),
             tunnel_rules: Vec::new(),
@@ -3918,7 +4472,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offline_rule_stays_starting_rejects_tcp_and_closes_listener_on_failure() {
+    async fn offline_rule_waits_without_a_listener_and_reports_lookup_failure() {
         let (signal, server) = start_local_server().await;
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = probe.local_addr().unwrap().port();
@@ -3934,22 +4488,13 @@ mod tests {
         config.tunnel_rules.push(rule.clone());
         let (handle, mut events) = spawn(Identity::generate(), config).unwrap();
         wait_specific_tunnel_state(&mut events, &rule.id, TunnelRuntimeState::Starting).await;
-        let mut tcp = time::timeout(Duration::from_secs(2), async {
-            loop {
-                if let Ok(tcp) = tokio::net::TcpStream::connect(rule.listen).await {
-                    break tcp;
-                }
-                time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
-        let _ = tcp.write_all(b"offline").await;
-        let mut bytes = [0; 1];
-        let read = time::timeout(Duration::from_secs(1), tcp.read(&mut bytes))
-            .await
-            .expect("offline TCP must close promptly");
-        assert!(matches!(read, Ok(0) | Err(_)));
+        wait_specific_tunnel_state(
+            &mut events,
+            &rule.id,
+            TunnelRuntimeState::WaitingAuthorization,
+        )
+        .await;
+        assert!(tokio::net::TcpStream::connect(rule.listen).await.is_err());
         time::timeout(Duration::from_secs(25), async {
             while let Some(event) = events.recv().await {
                 if let SessionEvent::TunnelState { rule_id, state } = event
@@ -4134,18 +4679,31 @@ mod tests {
         let (handle_a, mut events_a) = spawn(identity_a.clone(), config_a).unwrap();
         let (handle_b, mut events_b) = spawn(identity_b.clone(), config_b).unwrap();
 
-        let conflict_state = wait_tunnel_state(&mut events_a, &conflict_rule.id).await;
-        let TunnelRuntimeState::Error(conflict_detail) = conflict_state else {
-            panic!("occupied local port should fail this rule independently");
-        };
+        let conflict_detail = time::timeout(Duration::from_secs(20), async {
+            let mut conflict = None;
+            let mut running = false;
+            while let Some(event) = events_a.recv().await {
+                if let SessionEvent::TunnelState { rule_id, state } = event {
+                    if rule_id == conflict_rule.id {
+                        if let TunnelRuntimeState::Error(detail) = state {
+                            conflict = Some(detail);
+                        }
+                    } else if rule_id == auto_rule.id && state == TunnelRuntimeState::Running {
+                        running = true;
+                    }
+                    if running && let Some(detail) = conflict.take() {
+                        return detail;
+                    }
+                }
+            }
+            panic!("both rules must settle independently");
+        })
+        .await
+        .unwrap();
         assert!(conflict_detail.contains("监听"), "{conflict_detail}");
         assert!(
             conflict_detail.contains("Address already in use") || conflict_detail.contains("10048"),
             "{conflict_detail}"
-        );
-        assert_eq!(
-            wait_tunnel_state(&mut events_a, &auto_rule.id).await,
-            TunnelRuntimeState::Running
         );
         wait_connected(&mut events_b, &[identity_a.node_id()]).await;
 
@@ -4360,5 +4918,443 @@ mod tests {
         drop((a, b));
         server.abort();
         let _ = server.await;
+    }
+    fn security_config(
+        path: &std::path::Path,
+        devices: Vec<super::super::trusted_devices::TrustedDevice>,
+    ) {
+        super::super::config::DesktopConfig::save_remote_auth(path, test_verifier()).unwrap();
+        super::super::config::DesktopConfig::save_trusted_devices(path, devices).unwrap();
+    }
+    async fn wait_grants(
+        events: &mut mpsc::Receiver<SessionEvent>,
+        peer: NodeId,
+        expected: RemoteAuthorization,
+    ) {
+        time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Some(SessionEvent::PeerState {
+                    peer: id,
+                    state: PeerLifecycle::Connected(auth),
+                    ..
+                }) = events.recv().await
+                    && id == peer
+                    && auth == expected
+                {
+                    return;
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn explicit_trust_is_durable_password_does_not_auto_trust_and_failed_save_cannot_grant() {
+        use super::super::{config::DesktopConfig, remote_auth::AuthorizationGrant};
+        let root = std::env::temp_dir().join(format!(
+            "p2p-explicit-trust-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("settings.json");
+        security_config(&path, vec![]);
+        let (signal, server) = start_local_server().await;
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let mut cb = auth_config(signal);
+        cb.config_path = Some(path.clone());
+        let (ha, mut ea) = spawn(a.clone(), auth_config(signal)).unwrap();
+        let (hb, mut eb) = spawn(b.clone(), cb).unwrap();
+        wait_signal_online(&mut ea).await;
+        wait_signal_online(&mut eb).await;
+        ha.connect_peer_with_password(b.node_id(), test_password())
+            .unwrap();
+        let expected_a = RemoteAuthorization {
+            inbound: AuthorizationGrant::default(),
+            outbound: AuthorizationGrant::password(true),
+        };
+        let expected_b = RemoteAuthorization {
+            inbound: AuthorizationGrant::password(true),
+            outbound: AuthorizationGrant::default(),
+        };
+        wait_grants(&mut ea, b.node_id(), expected_a).await;
+        wait_grants(&mut eb, a.node_id(), expected_b).await;
+        assert!(
+            super::super::config::SettingsDraft::from_config(
+                DesktopConfig::load(&path).unwrap().unwrap()
+            )
+            .trusted_devices
+            .is_empty()
+        );
+        let (generation, connection) = inspect(&hb).await[&a.node_id()].clone();
+        assert!(
+            hb.change_trusted_device(TrustedDeviceChange::Trust {
+                peer: a.node_id(),
+                generation: generation.wrapping_add(1),
+                display_name: "stale".into()
+            })
+            .await
+            .is_err()
+        );
+        let backup = root.join("saved.json");
+        std::fs::rename(&path, &backup).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(
+            hb.change_trusted_device(TrustedDeviceChange::Trust {
+                peer: a.node_id(),
+                generation,
+                display_name: "device".into()
+            })
+            .await
+            .is_err()
+        );
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&backup, &path).unwrap();
+        assert!(
+            super::super::config::SettingsDraft::from_config(
+                DesktopConfig::load(&path).unwrap().unwrap()
+            )
+            .trusted_devices
+            .is_empty()
+        );
+        let devices = hb
+            .change_trusted_device(TrustedDeviceChange::Trust {
+                peer: a.node_id(),
+                generation,
+                display_name: "家里 Ubuntu".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(devices[0].node_id, a.node_id().to_hex());
+        let mixed_b = RemoteAuthorization {
+            inbound: AuthorizationGrant {
+                password: true,
+                trusted_device: true,
+            },
+            outbound: AuthorizationGrant::default(),
+        };
+        let mixed_a = RemoteAuthorization {
+            inbound: AuthorizationGrant::default(),
+            outbound: mixed_b.inbound,
+        };
+        wait_grants(&mut ea, b.node_id(), mixed_a).await;
+        wait_grants(&mut eb, a.node_id(), mixed_b).await;
+        hb.change_trusted_device(TrustedDeviceChange::Rename {
+            peer: a.node_id(),
+            display_name: "renamed".into(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            inspect(&hb).await[&a.node_id()].1.stable_id(),
+            connection.stable_id()
+        );
+        hb.change_trusted_device(TrustedDeviceChange::Revoke { peer: a.node_id() })
+            .await
+            .unwrap();
+        wait_grants(&mut ea, b.node_id(), expected_a).await;
+        wait_grants(&mut eb, a.node_id(), expected_b).await;
+        assert!(connection.close_reason().is_none());
+        hb.change_trusted_device(TrustedDeviceChange::Trust {
+            peer: a.node_id(),
+            generation,
+            display_name: "retained".into(),
+        })
+        .await
+        .unwrap();
+        let verifier =
+            RemoteVerifier::create(&SecretPassword::new("Change9".into()).unwrap()).unwrap();
+        DesktopConfig::save_remote_auth(&path, verifier.clone()).unwrap();
+        hb.update_remote_auth(verifier).await.unwrap();
+        assert_eq!(
+            super::super::config::SettingsDraft::from_config(
+                DesktopConfig::load(&path).unwrap().unwrap()
+            )
+            .trusted_devices[0]
+                .node_id,
+            a.node_id().to_hex()
+        );
+        assert!(
+            hb.change_trusted_device(TrustedDeviceChange::Trust {
+                peer: a.node_id(),
+                generation,
+                display_name: "closed".into()
+            })
+            .await
+            .is_err()
+        );
+        ha.shutdown();
+        hb.shutdown();
+        drop((ha, hb));
+        server.abort();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn restart_auto_start_uses_fresh_identity_bound_trust_and_revoke_closes_running_tunnel() {
+        use super::super::{
+            config::{AllowedForwardTarget, DesktopConfig, TunnelRule},
+            remote_auth::AuthorizationGrant,
+            trusted_devices::TrustedDevice,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "p2p-trusted-restart-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("settings.json");
+        let a = Identity::generate();
+        let b = Identity::generate();
+        security_config(
+            &path,
+            vec![TrustedDevice::new(
+                a.node_id(),
+                "device".into(),
+                Some("100000124".into()),
+            )],
+        );
+        let (signal, server) = start_local_server().await;
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = probe.local_addr().unwrap();
+        drop(probe);
+        let mut rule = TunnelRule::new(
+            "trusted echo",
+            b.node_id().to_hex(),
+            listen.port(),
+            target.local_addr().unwrap(),
+        );
+        rule.auto_start = true;
+        let mut ca = auth_config(signal);
+        ca.tunnel_rules = vec![rule.clone()];
+        let mut cb = auth_config(signal);
+        cb.config_path = Some(path.clone());
+        cb.trusted_devices = DesktopConfig::load(&path)
+            .unwrap()
+            .map(super::super::config::SettingsDraft::from_config)
+            .unwrap()
+            .trusted_devices;
+        cb.allowed_forward_targets = vec![AllowedForwardTarget::new(
+            "echo",
+            target.local_addr().unwrap(),
+            vec![a.node_id().to_hex()],
+        )];
+        // Spawn the persisted owner first, then boot the passwordless auto-start client.
+        let (hb, mut eb) = spawn(b.clone(), cb).unwrap();
+        wait_signal_online(&mut eb).await;
+        let (ha, mut ea) = spawn(a.clone(), ca).unwrap();
+        wait_specific_tunnel_state(&mut ea, &rule.id, TunnelRuntimeState::Running).await;
+        let only_trust = AuthorizationGrant {
+            password: false,
+            trusted_device: true,
+        };
+        wait_grants(
+            &mut eb,
+            a.node_id(),
+            RemoteAuthorization {
+                inbound: only_trust,
+                outbound: AuthorizationGrant::default(),
+            },
+        )
+        .await;
+        let connection = inspect(&hb).await[&a.node_id()].1.clone();
+        let mut tcp = tokio::net::TcpStream::connect(listen).await.unwrap();
+        tcp.write_all(b"request").await.unwrap();
+        let (mut destination, _) = time::timeout(Duration::from_secs(3), target.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut bytes = [0; 7];
+        destination.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"request");
+        hb.change_trusted_device(TrustedDeviceChange::Revoke { peer: a.node_id() })
+            .await
+            .unwrap();
+        wait_specific_tunnel_state(&mut ea, &rule.id, TunnelRuntimeState::WaitingAuthorization)
+            .await;
+        time::timeout(Duration::from_secs(3), async {
+            loop {
+                if tokio::net::TcpStream::connect(listen).await.is_err() {
+                    break;
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut tail = Vec::new();
+        let result = time::timeout(Duration::from_secs(3), tcp.read_to_end(&mut tail)).await;
+        assert!(result.is_ok());
+        assert!(tail.is_empty());
+        assert!(connection.close_reason().is_none()); // Unrelated reverse rights are not killed by closing the whole transport.
+        assert!(
+            super::super::config::SettingsDraft::from_config(
+                DesktopConfig::load(&path).unwrap().unwrap()
+            )
+            .trusted_devices
+            .is_empty()
+        );
+        // Explicit password reconnect restores the listener; removed trust never follows it.
+        ha.connect_peer_with_password(b.node_id(), test_password())
+            .unwrap();
+        wait_specific_tunnel_state(&mut ea, &rule.id, TunnelRuntimeState::Running).await;
+        wait_grants(
+            &mut eb,
+            a.node_id(),
+            RemoteAuthorization {
+                inbound: AuthorizationGrant::password(true),
+                outbound: AuthorizationGrant::default(),
+            },
+        )
+        .await;
+        ha.shutdown();
+        hb.shutdown();
+        drop((ha, hb));
+        server.abort();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn revoking_trusted_file_direction_keeps_reverse_password_transfer_alive() {
+        use super::super::{
+            remote_auth::AuthorizationGrant, task_model::TaskState, task_store::TaskStore,
+            transfer::TransferService, trusted_devices::TrustedDevice,
+        };
+        let root =
+            std::env::temp_dir().join(format!("p2p-trusted-files-{:032x}", rand::random::<u128>()));
+        std::fs::create_dir_all(root.join("a-receive")).unwrap();
+        std::fs::create_dir_all(root.join("b-receive")).unwrap();
+        let (a_store, _) = TaskStore::open(&root.join("a-state/tasks.json")).unwrap();
+        let (b_store, _) = TaskStore::open(&root.join("b-state/tasks.json")).unwrap();
+        let a_service = TransferService::new(a_store, root.join("a-receive"));
+        let b_service = TransferService::new(b_store, root.join("b-receive"));
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let device = TrustedDevice::new(a.node_id(), "device".into(), None);
+        let path = root.join("settings.json");
+        security_config(&path, vec![device.clone()]);
+        let (signal, server) = start_local_server().await;
+        let mut ca = auth_config(signal);
+        ca.transfer = Some(a_service.clone());
+        let mut cb = auth_config(signal);
+        cb.transfer = Some(b_service.clone());
+        cb.trusted_devices = vec![device];
+        cb.config_path = Some(path);
+        let (ha, mut ea) = spawn(a.clone(), ca).unwrap();
+        let (hb, mut eb) = spawn(b.clone(), cb).unwrap();
+        wait_signal_online(&mut ea).await;
+        wait_signal_online(&mut eb).await;
+        hb.connect_peer_with_password(a.node_id(), test_password())
+            .unwrap();
+        let trusted = AuthorizationGrant {
+            password: false,
+            trusted_device: true,
+        };
+        wait_grants(
+            &mut ea,
+            b.node_id(),
+            RemoteAuthorization {
+                inbound: AuthorizationGrant::password(true),
+                outbound: trusted,
+            },
+        )
+        .await;
+        wait_grants(
+            &mut eb,
+            a.node_id(),
+            RemoteAuthorization {
+                inbound: trusted,
+                outbound: AuthorizationGrant::password(true),
+            },
+        )
+        .await;
+        let (a_reached, a_wait) = oneshot::channel();
+        let (a_release, a_resume) = oneshot::channel();
+        *a_service.first_chunk_gate.lock().unwrap() = Some((a_reached, a_resume));
+        let (b_reached, b_wait) = oneshot::channel();
+        let (b_release, b_resume) = oneshot::channel();
+        *b_service.first_chunk_gate.lock().unwrap() = Some((b_reached, b_resume));
+        let bytes = vec![0x5a; 1024 * 1024];
+        std::fs::write(root.join("trusted.bin"), &bytes).unwrap();
+        std::fs::write(root.join("password.bin"), &bytes).unwrap();
+        ha.send_file(b.node_id(), root.join("trusted.bin")).unwrap();
+        hb.send_file(a.node_id(), root.join("password.bin"))
+            .unwrap();
+        time::timeout(Duration::from_secs(10), async {
+            a_wait.await.unwrap();
+            b_wait.await.unwrap();
+        })
+        .await
+        .unwrap();
+        hb.change_trusted_device(TrustedDeviceChange::Revoke { peer: a.node_id() })
+            .await
+            .unwrap();
+        wait_grants(
+            &mut ea,
+            b.node_id(),
+            RemoteAuthorization {
+                inbound: AuthorizationGrant::password(true),
+                outbound: AuthorizationGrant::default(),
+            },
+        )
+        .await;
+        a_release.send(()).unwrap();
+        time::timeout(Duration::from_secs(10), async {
+            loop {
+                let tasks = a_service.snapshot().await.unwrap();
+                let remote = b_service.snapshot().await.unwrap();
+                let kept = tasks.iter().any(|t| {
+                    t.direction() == super::super::task_model::TaskDirection::Receive
+                        && t.state() == TaskState::Completed
+                });
+                let revoked = remote.iter().any(|t| {
+                    t.direction() == super::super::task_model::TaskDirection::Receive
+                        && t.state() == TaskState::Interrupted
+                });
+                if kept && revoked {
+                    break;
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(b_release.send(()).is_err());
+        assert_eq!(
+            std::fs::read(root.join("a-receive/password.bin")).unwrap(),
+            bytes
+        );
+        assert!(!root.join("b-receive/trusted.bin").exists());
+        assert!(inspect(&ha).await[&b.node_id()].1.close_reason().is_none());
+        ha.shutdown();
+        hb.shutdown();
+        drop((ha, hb));
+        server.abort();
+        drop((a_service, b_service));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn explicit_passwordless_reconnect_does_not_reuse_old_in_memory_password() {
+        let (signal, server) = start_local_server().await;
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let (ha, mut ea) = spawn(a.clone(), auth_config(signal)).unwrap();
+        let (hb, mut eb) = spawn(b.clone(), auth_config(signal)).unwrap();
+        wait_signal_online(&mut ea).await;
+        wait_signal_online(&mut eb).await;
+        ha.connect_peer_with_password(b.node_id(), test_password())
+            .unwrap();
+        wait_authorization(&mut ea, b.node_id()).await;
+        wait_authorization(&mut eb, a.node_id()).await;
+        inspect(&ha).await[&b.node_id()]
+            .1
+            .close(0u32.into(), b"test fresh passwordless session");
+        ha.connect_peer_trusted(b.node_id()).unwrap();
+        wait_failed(&mut ea).await;
+        wait_failed(&mut eb).await;
+        assert!(inspect(&ha).await.is_empty());
+        assert!(inspect(&hb).await.is_empty());
+        ha.shutdown();
+        hb.shutdown();
+        drop((ha, hb));
+        server.abort();
     }
 }

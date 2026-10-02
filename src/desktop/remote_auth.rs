@@ -1,12 +1,17 @@
 //! Session authorization follows Ed25519 identity and TLS exporter authentication.
 //! Passwords exist only in zeroizing memory; only a versioned Argon2id verifier is persisted.
-use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    sync::Arc,
+    time::Duration,
+};
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore, watch};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::protocol::frame::{read_raw_frame_limited, write_raw_frame_limited};
@@ -150,6 +155,11 @@ enum AuthMessage {
         accepted: bool,
         confirmation: Option<[u8; 32]>,
     },
+    TrustedGrant {
+        accepted: bool,
+        sequence: u64,
+        confirmation: [u8; 32],
+    },
 }
 
 fn mac(
@@ -198,24 +208,52 @@ fn verify(
 /// Rights belong to the authenticated transport and expire with it. Stream replies
 /// (including download data and TCP replies) remain part of the authorized request.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AuthorizationGrant {
+    pub password: bool,
+    pub trusted_device: bool,
+}
+impl AuthorizationGrant {
+    pub const fn password(password: bool) -> Self {
+        Self {
+            password,
+            trusted_device: false,
+        }
+    }
+    pub const fn authorized(self) -> bool {
+        self.password || self.trusted_device
+    }
+    pub fn label(self) -> &'static str {
+        match (self.password, self.trusted_device) {
+            (true, true) => "密码及可信设备",
+            (true, false) => "密码",
+            (false, true) => "可信设备",
+            (false, false) => "未授权",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RemoteAuthorization {
-    pub inbound_authorized: bool,
-    pub outbound_authorized: bool,
+    pub inbound: AuthorizationGrant,
+    pub outbound: AuthorizationGrant,
 }
 impl RemoteAuthorization {
     #[cfg(test)]
     pub const BOTH: Self = Self {
-        inbound_authorized: true,
-        outbound_authorized: true,
+        inbound: AuthorizationGrant::password(true),
+        outbound: AuthorizationGrant::password(true),
     };
-
-    pub fn label(self) -> &'static str {
-        match (self.inbound_authorized, self.outbound_authorized) {
-            (true, true) => "双向访问已授权",
-            (true, false) => "已允许对端访问；本机访问尚未授权",
-            (false, true) => "本机访问对端已授权；对端访问未授权",
-            (false, false) => "等待密码授权",
-        }
+    pub const fn inbound_authorized(self) -> bool {
+        self.inbound.authorized()
+    }
+    pub const fn outbound_authorized(self) -> bool {
+        self.outbound.authorized()
+    }
+    pub fn label(self) -> String {
+        format!(
+            "对端访问本机：{}；本机访问对端：{}",
+            self.inbound.label(),
+            self.outbound.label()
+        )
     }
 }
 
@@ -269,23 +307,48 @@ impl FailureTable {
     }
 }
 
+#[cfg(test)]
+type PublishGate = Arc<
+    std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+>;
+
 #[derive(Clone)]
 pub struct AuthContext {
     failures: Arc<Mutex<FailureTable>>,
     kdf: Arc<Semaphore>,
+    trusted: watch::Sender<HashSet<NodeId>>,
+    #[cfg(test)]
+    publish_gate: PublishGate,
 }
 impl Default for AuthContext {
     fn default() -> Self {
         Self {
             failures: Arc::new(Mutex::new(FailureTable::default())),
             kdf: Arc::new(Semaphore::new(2)),
+            trusted: watch::channel(HashSet::new()).0,
+            #[cfg(test)]
+            publish_gate: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
 impl AuthContext {
-    /// Both directions exchange challenges because QUIC dialer order is unrelated to user intent.
-    /// Return independent incoming and outgoing request rights. Neither right implies the other.
-    /// A bare Result(true) never grants authorization.
+    pub fn set_trusted(&self, devices: &[super::trusted_devices::TrustedDevice]) {
+        self.trusted.send_replace(
+            devices
+                .iter()
+                .filter_map(|d| NodeId::from_hex(&d.node_id).ok())
+                .collect(),
+        );
+    }
+    pub fn trusts(&self, peer: NodeId) -> bool {
+        self.trusted.borrow().contains(&peer)
+    }
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub async fn authorize(
         &self,
@@ -297,6 +360,32 @@ impl AuthContext {
         password: Option<SecretPassword>,
         capabilities: u64,
     ) -> Result<RemoteAuthorization> {
+        self.authorize_session(
+            connection,
+            initiator,
+            local,
+            peer,
+            verifier,
+            password,
+            capabilities,
+        )
+        .await
+        .map(|s| s.authorization)
+    }
+    /// Both directions exchange challenges because QUIC dialer order is unrelated to user intent.
+    /// Return independent incoming and outgoing request rights. Neither right implies the other.
+    /// A bare Result(true) never grants authorization.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn authorize_session(
+        &self,
+        connection: &quinn::Connection,
+        initiator: bool,
+        local: NodeId,
+        peer: NodeId,
+        verifier: RemoteVerifier,
+        password: Option<SecretPassword>,
+        capabilities: u64,
+    ) -> Result<AuthorizedSession> {
         if capabilities & super::protocol::CAP_REMOTE_AUTH == 0 {
             return Err(Error::Protocol(
                 "对端不支持远程访问认证，请升级客户端".into(),
@@ -305,18 +394,40 @@ impl AuthContext {
         self.failures.lock().await.check(peer)?;
         let result = tokio::time::timeout(
             AUTH_TIMEOUT,
-            self.exchange(connection, initiator, local, peer, verifier, password),
+            self.exchange(
+                connection,
+                initiator,
+                local,
+                peer,
+                verifier,
+                password,
+                capabilities,
+            ),
         )
         .await;
         match result {
-            Ok(Ok((authorization, failed_inbound))) => {
-                if authorization.inbound_authorized {
+            Ok(Ok((mut session, failed_inbound))) => {
+                #[cfg(test)]
+                {
+                    let gate = self.publish_gate.lock().unwrap().take();
+                    if let Some((reached, release)) = gate {
+                        let _ = reached.send(());
+                        let _ = release.await;
+                    }
+                }
+                session.authorization.inbound.trusted_device &= self.trusts(peer);
+                if !session.authorization.inbound_authorized()
+                    && !session.authorization.outbound_authorized()
+                {
+                    return Err(invalid());
+                }
+                if session.authorization.inbound.password {
                     self.failures.lock().await.0.remove(&peer);
                 } else if failed_inbound {
                     let delay = self.failures.lock().await.failed(peer);
                     tokio::time::sleep(delay).await;
                 }
-                Ok(authorization)
+                Ok(session)
             }
             _ => {
                 let delay = self.failures.lock().await.failed(peer);
@@ -335,7 +446,8 @@ impl AuthContext {
         peer: NodeId,
         verifier: RemoteVerifier,
         password: Option<SecretPassword>,
-    ) -> Result<(RemoteAuthorization, bool)> {
+        capabilities: u64,
+    ) -> Result<(AuthorizedSession, bool)> {
         let binding = ChannelBinding::from_connection(connection)?;
         let challenge = Challenge::new(&verifier)?;
         let (mut send, mut recv) = if initiator {
@@ -418,7 +530,6 @@ impl AuthContext {
         else {
             return Err(invalid());
         };
-        send.finish().map_err(|_| invalid())?;
         let confirmed = remote_accepted
             && outgoing
                 .as_ref()
@@ -435,17 +546,312 @@ impl AuthContext {
                     .verify_slice(confirmation)
                     .is_ok()
                 });
-        if accepted || confirmed {
+        let mut authorization = RemoteAuthorization {
+            inbound: AuthorizationGrant::password(accepted),
+            outbound: AuthorizationGrant::password(confirmed),
+        };
+        let control = if capabilities & super::protocol::CAP_TRUSTED_DEVICE_AUTH != 0 {
+            let trusted = self.trusted.subscribe();
+            authorization.inbound.trusted_device = trusted.borrow().contains(&peer);
+            let mut control = TrustedControl {
+                send,
+                recv: Some(recv),
+                binding,
+                challenge,
+                remote,
+                local,
+                peer,
+                trusted,
+                sent_sequence: 0,
+                received_sequence: 0,
+            };
+            control
+                .send_grant(authorization.inbound.trusted_device)
+                .await?;
+            authorization.outbound.trusted_device = control.receive_grant(0).await?;
+            Some(control)
+        } else {
+            send.finish().map_err(|_| invalid())?;
+            None
+        };
+        if authorization.inbound_authorized() || authorization.outbound_authorized() {
             Ok((
-                RemoteAuthorization {
-                    inbound_authorized: accepted,
-                    outbound_authorized: confirmed,
+                AuthorizedSession {
+                    authorization,
+                    control,
                 },
                 incoming.is_some() && !accepted,
             ))
         } else {
             Err(invalid())
         }
+    }
+}
+pub struct AuthorizedSession {
+    pub authorization: RemoteAuthorization,
+    pub control: Option<TrustedControl>,
+}
+
+pub struct TrustedControl {
+    send: quinn::SendStream,
+    recv: Option<quinn::RecvStream>,
+    binding: ChannelBinding,
+    challenge: Challenge,
+    remote: Challenge,
+    local: NodeId,
+    peer: NodeId,
+    trusted: watch::Receiver<HashSet<NodeId>>,
+    sent_sequence: u64,
+    received_sequence: u64,
+}
+fn trusted_mac(
+    binding: &ChannelBinding,
+    challenge: &Challenge,
+    grantor: NodeId,
+    recipient: NodeId,
+    accepted: bool,
+    sequence: u64,
+) -> Hmac<Sha256> {
+    let mut mac = mac(
+        binding.as_bytes(),
+        challenge,
+        recipient,
+        grantor,
+        binding.as_bytes(),
+        b"p2p_file/desktop/trusted-device/v1",
+    );
+    mac.update(&sequence.to_le_bytes());
+    mac.update(&[u8::from(accepted)]);
+    mac
+}
+impl TrustedControl {
+    async fn send_grant(&mut self, accepted: bool) -> Result<()> {
+        let confirmation = trusted_mac(
+            &self.binding,
+            &self.challenge,
+            self.local,
+            self.peer,
+            accepted,
+            self.sent_sequence,
+        )
+        .finalize()
+        .into_bytes()
+        .into();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            write(
+                &mut self.send,
+                &AuthMessage::TrustedGrant {
+                    accepted,
+                    sequence: self.sent_sequence,
+                    confirmation,
+                },
+            ),
+        )
+        .await
+        .map_err(|_| invalid())?
+    }
+    async fn receive_grant(&mut self, expected: u64) -> Result<bool> {
+        let AuthMessage::TrustedGrant {
+            accepted,
+            sequence,
+            confirmation,
+        } = read(self.recv.as_mut().ok_or_else(invalid)?).await?
+        else {
+            return Err(invalid());
+        };
+        if sequence != expected
+            || trusted_mac(
+                &self.binding,
+                &self.remote,
+                self.peer,
+                self.local,
+                accepted,
+                sequence,
+            )
+            .verify_slice(&confirmation)
+            .is_err()
+        {
+            return Err(invalid());
+        }
+        Ok(accepted)
+    }
+    /// This stream is owned by exactly one authenticated QUIC connection. Closing
+    /// or corrupting it removes only trust grants; password proofs stay valid.
+    pub async fn run(mut self, changes: AuthorizationPublisher) {
+        // Frame reads must survive a simultaneous local policy change. Cancelling
+        // read_exact mid-frame would discard framing bytes and desynchronize the stream.
+        let mut reader = tokio::task::JoinSet::new();
+        let (messages, mut incoming) = tokio::sync::mpsc::channel(1);
+        let mut recv = self.recv.take().expect("control owns its receive stream");
+        reader.spawn(async move {
+            loop {
+                let message = read(&mut recv).await;
+                let failed = message.is_err();
+                if messages.send(message).await.is_err() || failed {
+                    break;
+                }
+            }
+            let _ = recv.stop(4u32.into());
+        });
+        let result: Result<()> = async {
+            loop {
+                let expected = self.received_sequence.checked_add(1).ok_or_else(invalid)?;
+                tokio::select! {
+                    biased;
+                    changed = self.trusted.changed() => {
+                        changed.map_err(|_| invalid())?;
+                        let accepted = self.trusted.borrow_and_update().contains(&self.peer);
+                        self.sent_sequence = self.sent_sequence.checked_add(1).ok_or_else(invalid)?;
+                        self.send_grant(accepted).await?;
+                        changes.send_modify(|a| a.inbound.trusted_device = accepted);
+                    }
+                    received = incoming.recv() => {
+                        let AuthMessage::TrustedGrant { accepted, sequence, confirmation } = received.ok_or_else(invalid)?? else { return Err(invalid()); };
+                        if sequence != expected || trusted_mac(&self.binding, &self.remote, self.peer, self.local, accepted, sequence).verify_slice(&confirmation).is_err() { return Err(invalid()); }
+                        self.received_sequence = expected;
+                        changes.send_modify(|a| a.outbound.trusted_device = accepted);
+                    }
+                }
+            }
+        }.await;
+        let _ = result;
+        changes.send_modify(|a| {
+            a.inbound.trusted_device = false;
+            a.outbound.trusted_device = false;
+        });
+        let _ = self.send.reset(4u32.into());
+        reader.abort_all();
+        while reader.join_next().await.is_some() {}
+    }
+}
+
+#[derive(Default)]
+pub struct RevocationEpochs {
+    inbound: std::sync::atomic::AtomicU64,
+    outbound: std::sync::atomic::AtomicU64,
+}
+impl RevocationEpochs {
+    fn get(&self, inbound: bool) -> u64 {
+        if inbound {
+            &self.inbound
+        } else {
+            &self.outbound
+        }
+        .load(std::sync::atomic::Ordering::Acquire)
+    }
+    fn changed(&self, before: RemoteAuthorization, after: RemoteAuthorization) {
+        use std::sync::atomic::Ordering;
+        if before.inbound_authorized() && !after.inbound_authorized() {
+            self.inbound.fetch_add(1, Ordering::AcqRel);
+        }
+        if before.outbound_authorized() && !after.outbound_authorized() {
+            self.outbound.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+/// A monotonic revocation epoch prevents watch coalescing from hiding revoke/regrant
+/// from a running stream. Effective Password grants do not advance that direction.
+#[derive(Clone)]
+pub struct AuthorizationPublisher {
+    sender: watch::Sender<RemoteAuthorization>,
+    epochs: Arc<RevocationEpochs>,
+}
+impl AuthorizationPublisher {
+    pub fn new(authorization: RemoteAuthorization) -> Self {
+        Self {
+            sender: watch::channel(authorization).0,
+            epochs: Arc::new(RevocationEpochs::default()),
+        }
+    }
+    pub fn borrow(&self) -> watch::Ref<'_, RemoteAuthorization> {
+        self.sender.borrow()
+    }
+    pub fn subscribe(&self) -> watch::Receiver<RemoteAuthorization> {
+        self.sender.subscribe()
+    }
+    pub fn live(&self) -> LiveAuthorization {
+        LiveAuthorization::Live(self.subscribe(), self.epochs.clone())
+    }
+    pub fn send_modify(&self, update: impl FnOnce(&mut RemoteAuthorization)) {
+        self.sender.send_modify(|authorization| {
+            let old = *authorization;
+            update(authorization);
+            self.epochs.changed(old, *authorization);
+        });
+    }
+    pub fn send_if_modified(&self, update: impl FnOnce(&mut RemoteAuthorization) -> bool) {
+        self.sender.send_if_modified(|authorization| {
+            let old = *authorization;
+            let changed = update(authorization);
+            if changed {
+                self.epochs.changed(old, *authorization);
+            }
+            changed
+        });
+    }
+    pub fn send_replace(&self, authorization: RemoteAuthorization) {
+        self.send_modify(|a| *a = authorization);
+    }
+}
+
+/// Readable rights belong to this connection, never to a peer cache or a new generation.
+#[derive(Clone)]
+pub enum LiveAuthorization {
+    Live(watch::Receiver<RemoteAuthorization>, Arc<RevocationEpochs>),
+    #[cfg(test)]
+    Fixed(RemoteAuthorization),
+}
+impl LiveAuthorization {
+    pub fn current(&self) -> RemoteAuthorization {
+        match self {
+            Self::Live(receiver, _) => *receiver.borrow(),
+            #[cfg(test)]
+            Self::Fixed(a) => *a,
+        }
+    }
+    pub async fn denied(&mut self, inbound: bool) {
+        let epoch = match self {
+            Self::Live(_, epochs) => epochs.get(inbound),
+            #[cfg(test)]
+            Self::Fixed(_) => 0,
+        };
+        loop {
+            let authorized = if inbound {
+                self.current().inbound_authorized()
+            } else {
+                self.current().outbound_authorized()
+            };
+            if !authorized {
+                return;
+            }
+            match self {
+                Self::Live(receiver, epochs) => {
+                    if epochs.get(inbound) != epoch {
+                        return;
+                    }
+                    if receiver.changed().await.is_err() {
+                        return;
+                    }
+                }
+                #[cfg(test)]
+                Self::Fixed(_) => std::future::pending::<()>().await,
+            }
+        }
+    }
+    pub async fn guard<T>(
+        &self,
+        inbound: bool,
+        work: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let mut rights = self.clone();
+        tokio::select! { biased; _ = rights.denied(inbound) => Err(Error::Protocol("当前方向的远程授权已撤销".into())), result = work => result }
+    }
+}
+#[cfg(test)]
+impl From<RemoteAuthorization> for LiveAuthorization {
+    fn from(a: RemoteAuthorization) -> Self {
+        Self::Fixed(a)
     }
 }
 async fn write(send: &mut quinn::SendStream, message: &AuthMessage) -> Result<()> {
@@ -531,15 +937,23 @@ mod tests {
             assert_eq!(
                 left.unwrap(),
                 RemoteAuthorization {
-                    inbound_authorized: !prover_is_dialer,
-                    outbound_authorized: prover_is_dialer
+                    inbound: crate::desktop::remote_auth::AuthorizationGrant::password(
+                        !prover_is_dialer
+                    ),
+                    outbound: crate::desktop::remote_auth::AuthorizationGrant::password(
+                        prover_is_dialer
+                    )
                 }
             );
             assert_eq!(
                 right.unwrap(),
                 RemoteAuthorization {
-                    inbound_authorized: prover_is_dialer,
-                    outbound_authorized: !prover_is_dialer
+                    inbound: crate::desktop::remote_auth::AuthorizationGrant::password(
+                        prover_is_dialer
+                    ),
+                    outbound: crate::desktop::remote_auth::AuthorizationGrant::password(
+                        !prover_is_dialer
+                    )
                 }
             );
             assert_eq!(ca.failures.lock().await.0.is_empty(), !prover_is_dialer);
@@ -617,15 +1031,15 @@ mod tests {
             assert_eq!(
                 ca.unwrap(),
                 RemoteAuthorization {
-                    inbound_authorized: false,
-                    outbound_authorized: true
+                    inbound: crate::desktop::remote_auth::AuthorizationGrant::password(false),
+                    outbound: crate::desktop::remote_auth::AuthorizationGrant::password(true)
                 }
             );
             assert_eq!(
                 cb.unwrap(),
                 RemoteAuthorization {
-                    inbound_authorized: true,
-                    outbound_authorized: false
+                    inbound: crate::desktop::remote_auth::AuthorizationGrant::password(true),
+                    outbound: crate::desktop::remote_auth::AuthorizationGrant::password(false)
                 }
             );
             assert_eq!(left.failures.lock().await.0[&b].count, count);
@@ -669,8 +1083,8 @@ mod tests {
                 super::super::protocol::LOCAL_CAPABILITIES
             ),
         );
-        assert!(ca.unwrap().outbound_authorized);
-        assert!(cb.unwrap().inbound_authorized);
+        assert!(ca.unwrap().outbound_authorized());
+        assert!(cb.unwrap().inbound_authorized());
         assert!(context.failures.lock().await.0.len() <= MAX_FAILURE_PEERS);
         context.failures.lock().await.failed(a);
         assert_eq!(context.failures.lock().await.0.len(), MAX_FAILURE_PEERS);
@@ -951,5 +1365,285 @@ mod tests {
         tokio::time::advance(FAILURE_TTL).await;
         assert!(table.check(a).is_ok());
         assert!(table.0.is_empty());
+    }
+    fn trust(peer: NodeId) -> super::super::trusted_devices::TrustedDevice {
+        super::super::trusted_devices::TrustedDevice::new(
+            peer,
+            "test device".into(),
+            Some("100000124".into()),
+        )
+    }
+    async fn wait_rights(
+        receiver: &mut watch::Receiver<RemoteAuthorization>,
+        expected: RemoteAuthorization,
+    ) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while *receiver.borrow_and_update() != expected {
+                receiver.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn trusted_only_is_one_way_and_preserves_password_failure_statistics() {
+        let (_ce, _se, c, s) = pair().await;
+        let a = crate::identity::Identity::generate().node_id();
+        let b = crate::identity::Identity::generate().node_id();
+        let ca = AuthContext::default();
+        let sa = AuthContext::default();
+        sa.set_trusted(&[trust(a)]);
+        sa.failures.lock().await.failed(a);
+        let verifier =
+            RemoteVerifier::create(&SecretPassword::new("A9b8C7".into()).unwrap()).unwrap();
+        let caps = super::super::protocol::LOCAL_CAPABILITIES;
+        let (left, right) = tokio::join!(
+            ca.authorize_session(&c, true, a, b, verifier.clone(), None, caps),
+            sa.authorize_session(&s, false, b, a, verifier, None, caps)
+        );
+        let left = left.unwrap();
+        let right = right.unwrap();
+        assert!(!left.authorization.inbound_authorized());
+        assert_eq!(
+            left.authorization.outbound,
+            AuthorizationGrant {
+                password: false,
+                trusted_device: true
+            }
+        );
+        assert_eq!(right.authorization.inbound, left.authorization.outbound);
+        assert!(!right.authorization.outbound_authorized());
+        assert!(!ca.trusts(b));
+        assert_eq!(sa.failures.lock().await.0[&a].count, 1);
+        let ltx = AuthorizationPublisher::new(left.authorization);
+        let mut lrx = ltx.subscribe();
+        let rtx = AuthorizationPublisher::new(right.authorization);
+        let mut rrx = rtx.subscribe();
+        let ltask = tokio::spawn(left.control.unwrap().run(ltx));
+        let rtask = tokio::spawn(right.control.unwrap().run(rtx));
+        sa.set_trusted(&[]);
+        wait_rights(&mut lrx, RemoteAuthorization::default()).await;
+        wait_rights(&mut rrx, RemoteAuthorization::default()).await;
+        assert_eq!(sa.failures.lock().await.0[&a].count, 1);
+        ltask.abort();
+        rtask.abort();
+    }
+    #[tokio::test]
+    async fn mixed_grants_revoke_only_trust_and_control_failure_keeps_password() {
+        let (_ce, _se, c, s) = pair().await;
+        let a = crate::identity::Identity::generate().node_id();
+        let b = crate::identity::Identity::generate().node_id();
+        let ca = AuthContext::default();
+        let sa = AuthContext::default();
+        sa.set_trusted(&[trust(a)]);
+        let password = SecretPassword::new("A9b8C7".into()).unwrap();
+        let verifier = RemoteVerifier::create(&password).unwrap();
+        let caps = super::super::protocol::LOCAL_CAPABILITIES;
+        let (left, right) = tokio::join!(
+            ca.authorize_session(&c, true, a, b, verifier.clone(), Some(password), caps),
+            sa.authorize_session(&s, false, b, a, verifier, None, caps)
+        );
+        let left = left.unwrap();
+        let right = right.unwrap();
+        assert_eq!(
+            left.authorization.outbound,
+            AuthorizationGrant {
+                password: true,
+                trusted_device: true
+            }
+        );
+        let ltx = AuthorizationPublisher::new(left.authorization);
+        let mut lrx = ltx.subscribe();
+        let rtx = AuthorizationPublisher::new(right.authorization);
+        let mut rrx = rtx.subscribe();
+        let ltask = tokio::spawn(left.control.unwrap().run(ltx));
+        let rtask = tokio::spawn(right.control.unwrap().run(rtx));
+        sa.set_trusted(&[]);
+        let expected_left = RemoteAuthorization {
+            inbound: AuthorizationGrant::default(),
+            outbound: AuthorizationGrant::password(true),
+        };
+        let expected_right = RemoteAuthorization {
+            inbound: AuthorizationGrant::password(true),
+            outbound: AuthorizationGrant::default(),
+        };
+        wait_rights(&mut lrx, expected_left).await;
+        wait_rights(&mut rrx, expected_right).await;
+        sa.set_trusted(&[trust(a)]);
+        wait_rights(&mut lrx, left.authorization).await;
+        rtask.abort();
+        wait_rights(&mut lrx, expected_left).await;
+        assert_eq!(c.close_reason(), None);
+        ltask.abort();
+    }
+    #[tokio::test]
+    async fn legacy_capability_requires_password_and_never_silently_trusts() {
+        let a = crate::identity::Identity::generate().node_id();
+        let b = crate::identity::Identity::generate().node_id();
+        let ca = AuthContext::default();
+        let sa = AuthContext::default();
+        sa.set_trusted(&[trust(a)]);
+        let password = SecretPassword::new("A9b8C7".into()).unwrap();
+        let verifier = RemoteVerifier::create(&password).unwrap();
+        let caps = super::super::protocol::LOCAL_CAPABILITIES
+            & !super::super::protocol::CAP_TRUSTED_DEVICE_AUTH;
+        for use_password in [false, true] {
+            let (_ce, _se, c, s) = pair().await;
+            let (left, right) = tokio::join!(
+                ca.authorize_session(
+                    &c,
+                    true,
+                    a,
+                    b,
+                    verifier.clone(),
+                    use_password.then(|| password.clone()),
+                    caps
+                ),
+                sa.authorize_session(&s, false, b, a, verifier.clone(), None, caps)
+            );
+            if !use_password {
+                assert!(left.is_err() && right.is_err());
+            } else {
+                let left = left.unwrap();
+                let right = right.unwrap();
+                assert!(left.control.is_none() && right.control.is_none());
+                assert_eq!(
+                    left.authorization.outbound,
+                    AuthorizationGrant::password(true)
+                );
+            }
+        }
+    }
+    #[tokio::test]
+    async fn trusted_confirmation_cannot_cross_identity_session_challenge_or_sequence() {
+        let (_c1, _s1, c1, _) = pair().await;
+        let (_c2, _s2, c2, _) = pair().await;
+        let b1 = ChannelBinding::from_connection(&c1).unwrap();
+        let b2 = ChannelBinding::from_connection(&c2).unwrap();
+        let a = crate::identity::Identity::generate().node_id();
+        let b = crate::identity::Identity::generate().node_id();
+        let other = crate::identity::Identity::generate().node_id();
+        let verifier =
+            RemoteVerifier::create(&SecretPassword::new("A9b8C7".into()).unwrap()).unwrap();
+        let challenge = Challenge::new(&verifier).unwrap();
+        let fresh = Challenge::new(&verifier).unwrap();
+        let proof = trusted_mac(&b1, &challenge, b, a, true, 0)
+            .finalize()
+            .into_bytes();
+        assert!(
+            trusted_mac(&b1, &challenge, b, a, true, 0)
+                .verify_slice(&proof)
+                .is_ok()
+        );
+        for mac in [
+            trusted_mac(&b2, &challenge, b, a, true, 0),
+            trusted_mac(&b1, &fresh, b, a, true, 0),
+            trusted_mac(&b1, &challenge, b, other, true, 0),
+            trusted_mac(&b1, &challenge, b, a, false, 0),
+            trusted_mac(&b1, &challenge, b, a, true, 1),
+        ] {
+            assert!(mac.verify_slice(&proof).is_err());
+        }
+    }
+    #[tokio::test]
+    async fn live_direction_revocation_cancels_work_without_killing_password_direction() {
+        let mixed = RemoteAuthorization {
+            inbound: AuthorizationGrant {
+                password: false,
+                trusted_device: true,
+            },
+            outbound: AuthorizationGrant {
+                password: true,
+                trusted_device: true,
+            },
+        };
+        let sender = AuthorizationPublisher::new(mixed);
+        let live = sender.live();
+        let incoming = tokio::spawn({
+            let live = live.clone();
+            async move { live.guard(true, std::future::pending::<Result<()>>()).await }
+        });
+        sender.send_modify(|a| {
+            a.inbound.trusted_device = false;
+            a.outbound.trusted_device = false;
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), incoming)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert!(live.guard(false, async { Ok(()) }).await.is_ok());
+        assert!(!live.current().inbound_authorized());
+        assert!(live.current().outbound_authorized());
+    }
+    #[tokio::test]
+    async fn revocation_during_authentication_cannot_publish_a_stale_trusted_grant() {
+        let (_ce, _se, c, s) = pair().await;
+        let a = crate::identity::Identity::generate().node_id();
+        let b = crate::identity::Identity::generate().node_id();
+        let ca = AuthContext::default();
+        let sa = AuthContext::default();
+        sa.set_trusted(&[trust(a)]);
+        let (reached, waiting) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        *sa.publish_gate.lock().unwrap() = Some((reached, released));
+        let verifier =
+            RemoteVerifier::create(&SecretPassword::new("A9b8C7".into()).unwrap()).unwrap();
+        let caps = super::super::protocol::LOCAL_CAPABILITIES;
+        let server_auth = tokio::spawn({
+            let sa = sa.clone();
+            let verifier = verifier.clone();
+            async move {
+                sa.authorize_session(&s, false, b, a, verifier, None, caps)
+                    .await
+            }
+        });
+        let client_auth = tokio::spawn(async move {
+            ca.authorize_session(&c, true, a, b, verifier, None, caps)
+                .await
+        });
+        waiting.await.unwrap();
+        sa.set_trusted(&[]);
+        release.send(()).unwrap();
+        assert!(server_auth.await.unwrap().is_err());
+        let client = client_auth.await.unwrap().unwrap();
+        let rights = AuthorizationPublisher::new(client.authorization);
+        let mut changes = rights.subscribe();
+        let control = tokio::spawn(client.control.unwrap().run(rights));
+        wait_rights(&mut changes, RemoteAuthorization::default()).await;
+        control.abort();
+    }
+    #[tokio::test]
+    async fn immediate_regrant_cannot_hide_revocation_from_an_existing_stream() {
+        let authorization = RemoteAuthorization {
+            inbound: AuthorizationGrant {
+                password: false,
+                trusted_device: true,
+            },
+            outbound: AuthorizationGrant::password(true),
+        };
+        let publisher = AuthorizationPublisher::new(authorization);
+        let live = publisher.live();
+        let guard = live.guard(true, std::future::pending::<Result<()>>());
+        tokio::pin!(guard);
+        // Poll it once before doing two updates without yielding. A plain watch
+        // would coalesce these to authorized=true and let the old work survive.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), &mut guard)
+                .await
+                .is_err()
+        );
+        publisher.send_modify(|a| a.inbound.trusted_device = false);
+        publisher.send_modify(|a| a.inbound.trusted_device = true);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut guard)
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert!(publisher.live().guard(true, async { Ok(()) }).await.is_ok());
+        assert!(live.guard(false, async { Ok(()) }).await.is_ok());
     }
 }

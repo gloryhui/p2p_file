@@ -1,5 +1,7 @@
 # 短设备 ID 与远程访问认证（Issue #51）
 
+Trusted Device 扩展及最新授权来源/撤销语义见 [TRUSTED_DEVICES.md](TRUSTED_DEVICES.md)。
+
 ## 身份与权限
 
 `ShortId` 是信令服务器分配的公开地址；真实身份仍是由 Ed25519 公钥推导的
