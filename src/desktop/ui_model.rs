@@ -187,6 +187,8 @@ pub(super) enum ListRow {
     Task(TaskRow),
 }
 pub(super) struct Snapshot {
+    pub detail_selection: Option<super::task_details::Selection>,
+    pub detail: Option<super::task_details::Detail>,
     pub space: super::space_budget::Summary,
     pub tasks: Vec<TaskRow>,
     pub queue: QueueMetrics,
@@ -399,6 +401,8 @@ mod tests {
         other.peer = crate::identity::Identity::generate().node_id();
         let view = Snapshot {
             space: Default::default(),
+            detail_selection: None,
+            detail: None,
             tasks: vec![first.clone(), second, other],
             queue: super::super::queue::TaskQueue::default().metrics(),
             speeds: HashMap::new(),
@@ -523,6 +527,8 @@ mod tests {
         b.confirmed = 4;
         let view = Snapshot {
             space: Default::default(),
+            detail_selection: None,
+            detail: None,
             tasks: vec![a, b],
             queue: QueueMetrics {
                 pending: 0,
