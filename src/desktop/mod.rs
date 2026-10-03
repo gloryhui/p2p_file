@@ -15,6 +15,7 @@ mod background;
 mod bandwidth;
 pub(in crate::desktop) mod config;
 mod diagnostics;
+mod drop_send;
 #[cfg(test)]
 mod e2e;
 mod files;
@@ -1004,6 +1005,7 @@ struct DesktopShell {
     editing_allowed_id: Option<String>,
     editing_tunnel_id: Option<String>,
     selected_files: Vec<PathBuf>,
+    native_dialogs: usize,
     selected_folder: Option<PathBuf>,
     settings: SettingsDraft,
     identity_id: Option<String>,
@@ -1711,6 +1713,9 @@ impl DesktopShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.native_dialogs > 0 {
+            return;
+        }
         let eligible = self.task_rows.iter().any(|row| {
             matches!(row, ui_model::ListRow::Task(task) if task.id == id && task.can_delete_file())
         });
@@ -1723,6 +1728,8 @@ impl DesktopShell {
             return;
         };
         let detail = format!("将从接收目录永久删除“{name}”，并移除对应任务记录。此操作无法撤销。");
+        self.native_dialogs += 1;
+        cx.notify();
         let confirmation = window.prompt(
             PromptLevel::Warning,
             "确定删除已接收文件？",
@@ -1733,20 +1740,27 @@ impl DesktopShell {
         let background = cx.background_executor().clone();
         cx.spawn(async move |shell, cx| {
             if confirmation.await.ok() != Some(1) {
+                let _ = shell.update(cx, |shell, cx| {
+                    shell.native_dialogs = shell.native_dialogs.saturating_sub(1);
+                    cx.notify();
+                });
                 return;
             }
             let delete_id = id.clone();
             let result = background
                 .spawn(async move { service.delete_completed_receive_file(&delete_id) })
                 .await;
-            let _ = shell.update(cx, move |shell, cx| match result {
-                Ok(()) => {
-                    if shell.selected_task.as_ref() == Some(&id) {
-                        shell.selected_task = None;
+            let _ = shell.update(cx, move |shell, cx| {
+                shell.native_dialogs = shell.native_dialogs.saturating_sub(1);
+                match result {
+                    Ok(()) => {
+                        if shell.selected_task.as_ref() == Some(&id) {
+                            shell.selected_task = None;
+                        }
+                        shell.set_status("已删除接收文件，并移除完成记录", cx);
                     }
-                    shell.set_status("已删除接收文件，并移除完成记录", cx);
+                    Err(error) => shell.set_status(format!("删除接收文件失败：{error}"), cx),
                 }
-                Err(error) => shell.set_status(format!("删除接收文件失败：{error}"), cx),
             });
         })
         .detach();
@@ -3063,10 +3077,63 @@ impl DesktopShell {
         .detach();
     }
 
+    fn drop_admission(&self, cx: &Context<Self>) -> drop_send::Admission {
+        drop_send::Admission {
+            authorized: self.selected_peer(cx).is_some_and(|peer| {
+                self.peer_states
+                    .get(&peer)
+                    .is_some_and(network_state::PeerLifecycle::outbound_authorized)
+            }),
+            storage_ready: self.transfer_service.is_some() && self.network_session.is_some(),
+            modal: self.show_settings_home
+                || self.show_settings
+                || self.show_diagnostics
+                || self.native_dialogs > 0
+                || self.clearing_history
+                || self.exporting_diagnostics
+                || self.is_saving_settings,
+            speed_busy: self.speed_request_until.is_some()
+                || self
+                    .speed_views
+                    .0
+                    .values()
+                    .any(|view| view.snapshot.status == speed::SpeedStatus::Running),
+        }
+    }
+    fn drop_paths(&mut self, paths: &gpui::ExternalPaths, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.drop_admission(cx).allowed() {
+            self.set_status(
+                "当前不能拖入：请完成设备授权，关闭设置或对话框，并等待测速结束",
+                cx,
+            );
+            return;
+        }
+        if let Err(error) = drop_send::validate_paths(paths.paths()) {
+            self.set_status(error.to_string(), cx);
+            return;
+        }
+        let Some(peer) = self.authenticated_peer(cx) else {
+            return;
+        };
+        let count = paths.paths().len();
+        let result = self
+            .network_session
+            .as_ref()
+            .ok_or_else(|| "网络会话已关闭".to_owned())
+            .and_then(|session| session.send_paths(peer, paths.paths().to_vec()));
+        match result {
+            Ok(()) => self.set_status(format!("正在后台检查 {count} 个拖入项；发送设备 {} 已固定，重复与目录内子路径只发送一次", peer.short()), cx),
+            Err(error) => self.set_status(format!("拖入项尚未提交：{error}"), cx),
+        }
+    }
     fn choose_files(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.pick_files(cx);
     }
     fn pick_files(&mut self, cx: &mut Context<Self>) {
+        if self.native_dialogs > 0 {
+            self.set_status("请先关闭当前文件对话框", cx);
+            return;
+        }
         if self
             .speed_views
             .0
@@ -3080,6 +3147,8 @@ impl DesktopShell {
             return;
         };
         let epoch = self.network_epoch;
+        self.native_dialogs += 1;
+        cx.notify();
         let task = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -3089,45 +3158,48 @@ impl DesktopShell {
         cx.spawn(async move |shell, cx| {
             let result = task.await;
             shell
-                .update(cx, |shell, cx| match result {
-                    Ok(Ok(Some(paths))) if paths.iter().any(|path| path.to_str().is_none()) => {
-                        shell.set_status("所选文件路径编码不受支持；未保存或转换该路径", cx);
-                    }
-                    Ok(Ok(Some(paths))) if !paths.is_empty() => {
-                        let count = paths.len();
-                        if shell.network_epoch != epoch {
-                            shell.set_status("选择期间网络会话已重建，请重新选择", cx);
-                            return;
+                .update(cx, |shell, cx| {
+                    shell.native_dialogs = shell.native_dialogs.saturating_sub(1);
+                    match result {
+                        Ok(Ok(Some(paths))) if paths.iter().any(|path| path.to_str().is_none()) => {
+                            shell.set_status("所选文件路径编码不受支持；未保存或转换该路径", cx);
                         }
-                        let result = shell
-                            .network_session
-                            .as_ref()
-                            .ok_or("网络会话已关闭".to_owned())
-                            .and_then(|session| {
-                                for path in &paths {
-                                    session.send_file(peer, path.clone())?;
-                                }
-                                Ok(())
-                            });
-                        shell.selected_files = paths;
-                        match result {
-                            Ok(()) => shell.set_status(
-                                format!(
-                                    "正在后台扫描 {count} 个文件；发送对象 {} 已固定",
-                                    peer.to_hex()
+                        Ok(Ok(Some(paths))) if !paths.is_empty() => {
+                            let count = paths.len();
+                            if shell.network_epoch != epoch {
+                                shell.set_status("选择期间网络会话已重建，请重新选择", cx);
+                                return;
+                            }
+                            let result = shell
+                                .network_session
+                                .as_ref()
+                                .ok_or("网络会话已关闭".to_owned())
+                                .and_then(|session| {
+                                    for path in &paths {
+                                        session.send_file(peer, path.clone())?;
+                                    }
+                                    Ok(())
+                                });
+                            shell.selected_files = paths;
+                            match result {
+                                Ok(()) => shell.set_status(
+                                    format!(
+                                        "正在后台扫描 {count} 个文件；发送对象 {} 已固定",
+                                        peer.to_hex()
+                                    ),
+                                    cx,
                                 ),
-                                cx,
-                            ),
-                            Err(e) => shell.set_status(
-                                format!("文件提交未全部完成：{e}；已提交项将在任务列表中显示"),
-                                cx,
-                            ),
+                                Err(e) => shell.set_status(
+                                    format!("文件提交未全部完成：{e}；已提交项将在任务列表中显示"),
+                                    cx,
+                                ),
+                            }
                         }
+                        Ok(Ok(None)) => shell.set_status("已取消文件选择", cx),
+                        Ok(Ok(Some(_))) => shell.set_status("未选择文件", cx),
+                        Ok(Err(error)) => shell.set_status(format!("文件选择失败：{error:?}"), cx),
+                        Err(_) => shell.set_status("文件选择任务已取消", cx),
                     }
-                    Ok(Ok(None)) => shell.set_status("已取消文件选择", cx),
-                    Ok(Ok(Some(_))) => shell.set_status("未选择文件", cx),
-                    Ok(Err(error)) => shell.set_status(format!("文件选择失败：{error:?}"), cx),
-                    Err(_) => shell.set_status("文件选择任务已取消", cx),
                 })
                 .ok();
         })
@@ -3138,6 +3210,10 @@ impl DesktopShell {
         self.pick_folder(cx);
     }
     fn pick_folder(&mut self, cx: &mut Context<Self>) {
+        if self.native_dialogs > 0 {
+            self.set_status("请先关闭当前文件对话框", cx);
+            return;
+        }
         if self
             .speed_views
             .0
@@ -3151,6 +3227,8 @@ impl DesktopShell {
             return;
         };
         let epoch = self.network_epoch;
+        self.native_dialogs += 1;
+        cx.notify();
         let task = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -3160,41 +3238,48 @@ impl DesktopShell {
         cx.spawn(async move |shell, cx| {
             let result = task.await;
             shell
-                .update(cx, |shell, cx| match result {
-                    Ok(Ok(Some(mut paths))) => {
-                        if let Some(path) = paths.pop() {
-                            if let Some(path_text) = path.to_str() {
-                                if shell.network_epoch != epoch {
-                                    shell.set_status("选择期间网络会话已重建，请重新选择", cx);
-                                    return;
-                                }
-                                let result = shell
-                                    .network_session
-                                    .as_ref()
-                                    .ok_or("网络会话已关闭".to_owned())
-                                    .and_then(|session| session.send_directory(peer, path.clone()));
-                                shell.selected_folder = Some(path.clone());
-                                match result {
-                                    Ok(()) => shell.set_status(
-                                        format!(
-                                            "正在后台扫描目录 {path_text}；发送对象 {} 已固定",
-                                            peer.to_hex()
+                .update(cx, |shell, cx| {
+                    shell.native_dialogs = shell.native_dialogs.saturating_sub(1);
+                    match result {
+                        Ok(Ok(Some(mut paths))) => {
+                            if let Some(path) = paths.pop() {
+                                if let Some(path_text) = path.to_str() {
+                                    if shell.network_epoch != epoch {
+                                        shell.set_status("选择期间网络会话已重建，请重新选择", cx);
+                                        return;
+                                    }
+                                    let result = shell
+                                        .network_session
+                                        .as_ref()
+                                        .ok_or("网络会话已关闭".to_owned())
+                                        .and_then(|session| {
+                                            session.send_directory(peer, path.clone())
+                                        });
+                                    shell.selected_folder = Some(path.clone());
+                                    match result {
+                                        Ok(()) => shell.set_status(
+                                            format!(
+                                                "正在后台扫描目录 {path_text}；发送对象 {} 已固定",
+                                                peer.to_hex()
+                                            ),
+                                            cx,
                                         ),
+                                        Err(e) => shell.set_status(e, cx),
+                                    }
+                                } else {
+                                    shell.set_status(
+                                        "所选目录路径编码不受支持；未保存或转换该路径",
                                         cx,
-                                    ),
-                                    Err(e) => shell.set_status(e, cx),
+                                    );
                                 }
                             } else {
-                                shell
-                                    .set_status("所选目录路径编码不受支持；未保存或转换该路径", cx);
+                                shell.set_status("未选择目录", cx);
                             }
-                        } else {
-                            shell.set_status("未选择目录", cx);
                         }
+                        Ok(Ok(None)) => shell.set_status("已取消目录选择", cx),
+                        Ok(Err(error)) => shell.set_status(format!("目录选择失败：{error:?}"), cx),
+                        Err(_) => shell.set_status("目录选择任务已取消", cx),
                     }
-                    Ok(Ok(None)) => shell.set_status("已取消目录选择", cx),
-                    Ok(Err(error)) => shell.set_status(format!("目录选择失败：{error:?}"), cx),
-                    Err(_) => shell.set_status("目录选择任务已取消", cx),
                 })
                 .ok();
         })
@@ -3210,6 +3295,12 @@ impl DesktopShell {
         self.pick_receive_directory(cx);
     }
     fn pick_receive_directory(&mut self, cx: &mut Context<Self>) {
+        if self.native_dialogs > 0 {
+            self.set_status("请先关闭当前文件对话框", cx);
+            return;
+        }
+        self.native_dialogs += 1;
+        cx.notify();
         let task = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -3219,28 +3310,36 @@ impl DesktopShell {
         cx.spawn(async move |shell, cx| {
             let result = task.await;
             shell
-                .update(cx, |shell, cx| match result {
-                    Ok(Ok(Some(mut paths))) => {
-                        if let Some(path) = paths.pop() {
-                            if let Some(path_text) = path.to_str() {
-                                shell.settings.receive_directory = Some(path.to_path_buf());
-                                shell.config_note =
-                                    "已选择新接收目录；保存时重新验证写能力，仅影响新任务".into();
-                                shell.set_status(
-                                    format!("接收目录已选择 {path_text}；保存后用于新任务"),
-                                    cx,
-                                );
+                .update(cx, |shell, cx| {
+                    shell.native_dialogs = shell.native_dialogs.saturating_sub(1);
+                    match result {
+                        Ok(Ok(Some(mut paths))) => {
+                            if let Some(path) = paths.pop() {
+                                if let Some(path_text) = path.to_str() {
+                                    shell.settings.receive_directory = Some(path.to_path_buf());
+                                    shell.config_note =
+                                        "已选择新接收目录；保存时重新验证写能力，仅影响新任务"
+                                            .into();
+                                    shell.set_status(
+                                        format!("接收目录已选择 {path_text}；保存后用于新任务"),
+                                        cx,
+                                    );
+                                } else {
+                                    shell.set_status(
+                                        "所选接收目录路径编码不受支持；请改选其它目录",
+                                        cx,
+                                    );
+                                }
                             } else {
-                                shell
-                                    .set_status("所选接收目录路径编码不受支持；请改选其它目录", cx);
+                                shell.set_status("未选择接收目录", cx);
                             }
-                        } else {
-                            shell.set_status("未选择接收目录", cx);
                         }
+                        Ok(Ok(None)) => shell.set_status("已取消接收目录选择", cx),
+                        Ok(Err(error)) => {
+                            shell.set_status(format!("接收目录选择失败：{error:?}"), cx)
+                        }
+                        Err(_) => shell.set_status("接收目录选择任务已取消", cx),
                     }
-                    Ok(Ok(None)) => shell.set_status("已取消接收目录选择", cx),
-                    Ok(Err(error)) => shell.set_status(format!("接收目录选择失败：{error:?}"), cx),
-                    Err(_) => shell.set_status("接收目录选择任务已取消", cx),
                 })
                 .ok();
         })
@@ -4200,12 +4299,24 @@ impl DesktopShell {
                 ui_components::compact_secondary_button("选择目录", enabled)
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::choose_folder)),
             );
+        let drop_hint = if self.drop_admission(cx).allowed() {
+            "可拖入文件和目录 · 每批最多 128 项"
+        } else {
+            "连接并授权后可拖入文件和目录"
+        };
         let transfer_toolbar = div()
             .flex()
             .items_center()
             .justify_between()
             .gap_3()
-            .child(file_actions)
+            .child(
+                div().flex().flex_col().gap_1().child(file_actions).child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(ui_theme::TEXT_MUTED))
+                        .child(drop_hint),
+                ),
+            )
             .child(
                 div()
                     .flex()
@@ -5391,10 +5502,23 @@ impl Render for DesktopShell {
             return self.settings_home(window, cx).into_any_element();
         }
         let speed_card = self.show_speed_test_panel.then(|| self.speed_test_card(cx));
+        let drop_enabled = self.drop_admission(cx).allowed();
 
         div()
             .size_full()
             .id("desktop-shell")
+            .can_drop(move |value, _, _| {
+                drop_enabled
+                    && value
+                        .downcast_ref::<gpui::ExternalPaths>()
+                        .is_some_and(|paths| drop_send::validate_paths(paths.paths()).is_ok())
+            })
+            .on_drop(cx.listener(Self::drop_paths))
+            .when(drop_enabled, |page| {
+                page.drag_over::<gpui::ExternalPaths>(|style, _, _, _| {
+                    style.bg(rgb(ui_theme::PRIMARY_SOFT))
+                })
+            })
             .key_context("DesktopShell")
             .track_focus(&self.focus_handle)
             .overflow_y_scroll()
@@ -5750,6 +5874,7 @@ pub fn run(background_start: bool) {
                         editing_allowed_id: None,
                         editing_tunnel_id: None,
                         selected_files: Vec::new(),
+                        native_dialogs: 0,
                         selected_folder: None,
                         settings,
                         identity_id,

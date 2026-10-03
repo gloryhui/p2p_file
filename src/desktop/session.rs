@@ -363,6 +363,16 @@ impl DesktopSessionHandle {
             .map_err(|_| "网络会话在停止规则前退出".to_owned())
     }
 
+    pub fn send_paths(
+        &self,
+        peer: NodeId,
+        sources: Vec<std::path::PathBuf>,
+    ) -> std::result::Result<(), String> {
+        let sources = super::drop_send::normalize(sources).map_err(|error| error.to_string())?;
+        self.commands
+            .try_send(SessionCommand::SendPaths { peer, sources })
+            .map_err(|_| "传输命令队列已满或会话已关闭；拖入项尚未提交".into())
+    }
     #[allow(dead_code)] // T010 product controls call this tested backend command.
     pub fn send_file(
         &self,
@@ -519,6 +529,10 @@ enum SessionCommand {
         peer: NodeId,
         id: super::task_model::TaskId,
     },
+    SendPaths {
+        peer: NodeId,
+        sources: Vec<std::path::PathBuf>,
+    },
     #[allow(dead_code)] // T010 selection controls.
     SendDirectory {
         peer: NodeId,
@@ -576,7 +590,8 @@ enum SessionCommand {
 impl SessionCommand {
     fn business_peer(&self) -> Option<NodeId> {
         match self {
-            Self::SendFile { peer, .. }
+            Self::SendPaths { peer, .. }
+            | Self::SendFile { peer, .. }
             | Self::SendDirectory { peer, .. }
             | Self::ResumeTask { peer, .. }
             | Self::StartSpeed { peer, .. } => Some(*peer),
@@ -1287,12 +1302,14 @@ async fn run_session(
                 }
             }
             Wake::Command(Some(
-                command @ (SessionCommand::SendFile { .. }
+                command @ (SessionCommand::SendPaths { .. }
+                | SessionCommand::SendFile { .. }
                 | SessionCommand::SendDirectory { .. }
                 | SessionCommand::ResumeTask { .. }),
             )) => {
                 let peer = match &command {
-                    SessionCommand::SendFile { peer, .. }
+                    SessionCommand::SendPaths { peer, .. }
+                    | SessionCommand::SendFile { peer, .. }
                     | SessionCommand::SendDirectory { peer, .. }
                     | SessionCommand::ResumeTask { peer, .. } => *peer,
                     _ => unreachable!(),
@@ -1333,6 +1350,20 @@ async fn run_session(
                     let result = live
                         .guard(false, async {
                             match command {
+                                SessionCommand::SendPaths { sources, .. } => {
+                                    let _worker =
+                                        selection_workers.clone().acquire_owned().await.map_err(
+                                            |_| super::transfer_files::failure("扫描任务已关闭"),
+                                        )?;
+                                    let ids = service.select_paths(peer, sources).await?;
+                                    let _ = events
+                                        .send(SessionEvent::SelectionQueued {
+                                            peer,
+                                            count: ids.len(),
+                                        })
+                                        .await;
+                                    Ok(())
+                                }
                                 SessionCommand::SendFile { source, .. } => {
                                     let _worker =
                                         selection_workers.clone().acquire_owned().await.map_err(
@@ -5251,6 +5282,11 @@ mod tests {
         );
         let source_b = root.join("reverse.bin");
         std::fs::write(&source_b, b"reverse").unwrap();
+        hb.send_paths(
+            a.node_id(),
+            vec![source_b.clone(), root.join("must-not-be-read")],
+        )
+        .unwrap();
         hb.send_file(a.node_id(), source_b.clone()).unwrap();
         hb.start_speed(
             a.node_id(),
@@ -6701,6 +6737,96 @@ mod tests {
         echo_task.abort();
         server.abort();
         let _ = server.await;
+    }
+    #[tokio::test]
+    async fn native_drop_batch_command_sends_mixed_selection_to_the_bound_peer() {
+        use super::super::{
+            task_model::TaskState, task_store::TaskStore, transfer::TransferService,
+        };
+        let root =
+            std::env::temp_dir().join(format!("p2p-session-transfer-{}", rand::random::<u128>()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(root.join("a-receive")).unwrap();
+        std::fs::create_dir(root.join("b-receive")).unwrap();
+        let (a_store, _) = TaskStore::open(&root.join("a-state/tasks.json")).unwrap();
+        let (b_store, _) = TaskStore::open(&root.join("b-state/tasks.json")).unwrap();
+        let a = TransferService::new(a_store, root.join("a-receive"));
+        let b = TransferService::new(b_store, root.join("b-receive"));
+        let (address, server) = start_local_server().await;
+        let ia = Identity::generate();
+        let ib = Identity::generate();
+        let mut ca = local_config(address);
+        ca.transfer = Some(a.clone());
+        let mut cb = local_config(address);
+        cb.transfer = Some(b.clone());
+        let (ha, mut ea) = spawn(ia.clone(), ca).unwrap();
+        let (hb, mut eb) = spawn(ib.clone(), cb).unwrap();
+        wait_signal_online(&mut ea).await;
+        wait_signal_online(&mut eb).await;
+        ha.connect_peer(ib.node_id()).unwrap();
+        wait_connected(&mut ea, &[ib.node_id()]).await;
+        wait_connected(&mut eb, &[ia.node_id()]).await;
+        let bytes = vec![55; 1024 * 1024];
+        let source = root.join("selected.bin");
+        std::fs::write(&source, &bytes).unwrap();
+        let directory = root.join("目录");
+        std::fs::create_dir_all(directory.join("空目录")).unwrap();
+        std::fs::write(directory.join("子.bin"), b"directory child").unwrap();
+        ha.send_paths(
+            ib.node_id(),
+            vec![
+                source.clone(),
+                source,
+                directory.join("子.bin"),
+                directory.join("空目录"),
+                directory,
+            ],
+        )
+        .unwrap();
+        time::timeout(Duration::from_secs(10), async {
+            let mut changed = a.subscribe();
+            loop {
+                let tasks = a.snapshot().await.unwrap();
+                if tasks.len() == 4
+                    && tasks
+                        .iter()
+                        .all(|task| task.state() == TaskState::Completed)
+                {
+                    break;
+                }
+                changed.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(b.snapshot().await.unwrap()[0].state(), TaskState::Completed);
+        assert_eq!(
+            std::fs::read(root.join("b-receive/selected.bin")).unwrap(),
+            bytes
+        );
+        assert_eq!(b.snapshot().await.unwrap().len(), 4);
+        assert!(
+            b.snapshot()
+                .await
+                .unwrap()
+                .iter()
+                .all(|task| task.state() == TaskState::Completed)
+        );
+        assert_eq!(
+            std::fs::read(root.join("b-receive/目录/子.bin")).unwrap(),
+            b"directory child"
+        );
+        assert!(root.join("b-receive/目录/空目录").is_dir());
+        tokio::task::spawn_blocking(move || {
+            ha.shutdown_and_wait();
+            hb.shutdown_and_wait();
+        })
+        .await
+        .unwrap();
+        server.abort();
+        let _ = server.await;
+        drop((a, b));
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[tokio::test]
     async fn session_command_sends_to_passive_peer_using_owned_transfer_service() {
