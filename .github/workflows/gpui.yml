@@ -85,6 +85,8 @@ jobs:
         run: "cargo test --locked --features gui relay_ --lib --target ${{ matrix.target }} -- --nocapture"
       - name: Run IPv6 CLI send regression
         run: "cargo test --locked --test ipv6_cli_send --target ${{ matrix.target }} -- --nocapture"
+      - name: Run verified-TLS signaling CLI transfer and hostname rejection
+        run: "cargo test --locked --test signaling_tls_cli --target ${{ matrix.target }} -- --nocapture"
       - name: Run GUI Clippy
         if: runner.os == 'Linux'
         run: cargo clippy --locked --features gui --all-targets --target ${{ matrix.target }} -- -D warnings

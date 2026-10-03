@@ -2,6 +2,7 @@
 
 pub mod mdns;
 pub mod signal;
+pub mod signal_tls;
 
 pub use mdns::{
     LanDiscovery, PeerAnnouncement, SERVICE_TYPE, local_ip_addresses, parse_announcement,

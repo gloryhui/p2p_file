@@ -92,6 +92,15 @@ pub struct DirectOpts {
     /// 信令服务器地址（跑在阿里云那台上的 `signal-server`）
     #[arg(long, value_name = "HOST:PORT")]
     pub signal: String,
+    /// Use verified TLS for signaling; handshake failure never falls back to TCP plaintext.
+    #[arg(long)]
+    pub signal_tls: bool,
+    /// PEM trust roots for a private CA; omitted uses bundled Mozilla roots.
+    #[arg(long, requires = "signal_tls", value_name = "FILE")]
+    pub signal_ca_file: Option<PathBuf>,
+    /// Verify this certificate DNS name/IP instead of the --signal host.
+    #[arg(long, requires = "signal_tls", value_parser = parse_tls_name, value_name = "NAME")]
+    pub signal_server_name: Option<String>,
 
     /// 本机打洞用的 UDP 端口
     ///
@@ -179,6 +188,8 @@ pub enum Command {
 
     /// 跑信令服务；Direct 优先，可选 UDP Relay 只转发端到端加密的 QUIC datagram
     SignalServer {
+        #[command(flatten)]
+        tls: SignalTlsServerOpts,
         #[command(flatten)]
         relay: RelayServerOpts,
         /// 监听地址
@@ -298,6 +309,39 @@ pub enum Command {
     },
 }
 
+fn parse_tls_name(value: &str) -> std::result::Result<String, String> {
+    crate::discovery::signal_tls::server_name("localhost:7000", Some(value))
+        .map_err(|e| e.to_string())?;
+    Ok(value.to_owned())
+}
+#[derive(Debug, Args, Clone)]
+pub struct SignalTlsServerOpts {
+    /// PEM server certificate chain; enables TLS-only signaling on --listen.
+    #[arg(long, requires = "tls_key", value_name = "FILE")]
+    pub tls_cert: Option<PathBuf>,
+    /// Matching PKCS#8/PKCS#1/SEC1 PEM private key.
+    #[arg(long, requires = "tls_cert", value_name = "FILE")]
+    pub tls_key: Option<PathBuf>,
+}
+impl SignalTlsServerOpts {
+    pub fn config(
+        &self,
+    ) -> crate::error::Result<Option<crate::discovery::signal_tls::SignalTlsServer>> {
+        match (&self.tls_cert, &self.tls_key) {
+            (Some(certificate), Some(private_key)) => {
+                Ok(Some(crate::discovery::signal_tls::SignalTlsServer {
+                    certificate: certificate.clone(),
+                    private_key: private_key.clone(),
+                }))
+            }
+            (None, None) => Ok(None),
+            _ => Err(crate::error::Error::Discovery(
+                "TLS 证书与私钥必须一起配置".into(),
+            )),
+        }
+    }
+}
+
 fn parse_relay_spec(raw: &str) -> std::result::Result<String, String> {
     crate::relay::client::validate_server_spec(raw).map_err(|e| e.to_string())?;
     Ok(raw.to_owned())
@@ -337,6 +381,70 @@ impl RelayServerOpts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn signaling_tls_flags_require_explicit_mode_and_complete_server_credentials() {
+        for args in [
+            vec!["signal-server", "--tls-cert", "cert.pem"],
+            vec!["signal-server", "--tls-key", "key.pem"],
+            vec![
+                "serve",
+                "--signal",
+                "localhost:7000",
+                "--signal-ca-file",
+                "ca.pem",
+            ],
+            vec![
+                "serve",
+                "--signal",
+                "localhost:7000",
+                "--signal-server-name",
+                "localhost",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(std::iter::once("p2p_file").chain(args)).is_err());
+        }
+        let cli = Cli::try_parse_from([
+            "p2p_file",
+            "signal-server",
+            "--tls-cert",
+            "cert.pem",
+            "--tls-key",
+            "key.pem",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Command::SignalServer { tls, .. } if tls.config().unwrap().is_some())
+        );
+        let cli = Cli::try_parse_from(["p2p_file", "serve", "--signal", "localhost:7000"]).unwrap();
+        assert!(matches!(cli.command, Command::Serve { direct, .. } if !direct.signal_tls));
+        let cli = Cli::try_parse_from([
+            "p2p_file",
+            "serve",
+            "--signal",
+            "127.0.0.1:7000",
+            "--signal-tls",
+            "--signal-ca-file",
+            "ca.pem",
+            "--signal-server-name",
+            "localhost",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Command::Serve { direct, .. } if direct.signal_tls && direct.signal_ca_file.is_some() && direct.signal_server_name.as_deref() == Some("localhost"))
+        );
+        assert!(
+            Cli::try_parse_from([
+                "p2p_file",
+                "serve",
+                "--signal",
+                "localhost:7000",
+                "--signal-tls",
+                "--signal-server-name",
+                "bad/name"
+            ])
+            .is_err()
+        );
+    }
     use clap::CommandFactory;
 
     #[test]

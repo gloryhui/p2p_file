@@ -1330,9 +1330,22 @@ mod tests {
     }
     #[tokio::test]
     async fn relay_real_pairing_blackhole_file_resume_speedtest_and_multiple_allowlisted_tunnels() {
+        relay_business_fixture(None).await;
+    }
+
+    #[tokio::test]
+    async fn signaling_tls_relay_pairing_business_and_fresh_registration_keep_verification() {
+        let tls = crate::discovery::signal_tls::tests::Fixture::new(false);
+        relay_business_fixture(Some(&tls)).await;
+    }
+
+    async fn relay_business_fixture(tls: Option<&crate::discovery::signal_tls::tests::Fixture>) {
         use crate::net::NetworkFamilies;
         use crate::speedtest::{SpeedTestDirection, run_speedtest};
-        let (signal, relay, signal_task) = crate::relay::tests::signaling_fixture().await;
+        let (signal, relay, signal_task) = crate::relay::tests::signaling_fixture_with_tls(
+            tls.map(|fixture| fixture.server.clone()),
+        )
+        .await;
         let mut server_id = Identity::generate();
         let mut client_id = Identity::generate();
         if server_id.node_id() > client_id.node_id() {
@@ -1341,11 +1354,13 @@ mod tests {
         let blackhole_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let blackhole_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut sc = test_direct_config(signal, client_id.node_id());
+        sc.signal_tls = tls.map(|fixture| fixture.client.clone());
         sc.families = NetworkFamilies::Ipv4Only;
         sc.relay_server = Some(relay.to_string());
         sc.advertise_only = true;
         sc.advertise = vec![blackhole_a.local_addr().unwrap()];
         let mut cc = test_direct_config(signal, server_id.node_id());
+        cc.signal_tls = sc.signal_tls.clone();
         cc.families = sc.families;
         cc.relay_server = sc.relay_server.clone();
         cc.advertise_only = true;

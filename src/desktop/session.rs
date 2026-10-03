@@ -58,6 +58,7 @@ fn is_current_signal_generation(current: u64, result_generation: u64) -> bool {
 #[derive(Clone, Debug)]
 pub struct DesktopSessionConfig {
     pub signal_server: String,
+    pub signal_tls: Option<crate::discovery::signal_tls::SignalTlsClient>,
     pub remote_auth: Option<RemoteVerifier>,
     pub trusted_devices: Vec<super::trusted_devices::TrustedDevice>,
     pub config_path: Option<std::path::PathBuf>,
@@ -73,6 +74,7 @@ impl DesktopSessionConfig {
     pub fn new(signal_server: impl Into<String>) -> Self {
         Self {
             signal_server: signal_server.into(),
+            signal_tls: None,
             remote_auth: None,
             trusted_devices: Vec::new(),
             config_path: None,
@@ -97,6 +99,9 @@ pub enum TunnelRuntimeState {
 
 #[derive(Clone, Debug)]
 pub enum SessionEvent {
+    SignalSecurity {
+        tls: bool,
+    },
     NetworkPaths(String),
     NetworkFamilies {
         ipv4: bool,
@@ -282,6 +287,7 @@ impl DesktopSessionHandle {
         &self,
         server: String,
         relay_server: Option<String>,
+        signal_tls: Option<crate::discovery::signal_tls::SignalTlsClient>,
     ) -> std::result::Result<(), String> {
         if let Some(spec) = &relay_server {
             crate::relay::client::validate_server_spec(spec).map_err(|e| e.to_string())?;
@@ -290,6 +296,7 @@ impl DesktopSessionHandle {
             .try_send(SessionCommand::ReconfigureNetwork {
                 server,
                 relay_server,
+                signal_tls,
             })
             .map_err(|e| format!("网络配置队列不可用：{e}"))
     }
@@ -546,6 +553,7 @@ enum SessionCommand {
     ReconfigureNetwork {
         server: String,
         relay_server: Option<String>,
+        signal_tls: Option<crate::discovery::signal_tls::SignalTlsClient>,
     },
     StartTunnel(String),
     StopTunnel(String),
@@ -729,6 +737,11 @@ async fn run_session(
     mut shutdown: watch::Receiver<bool>,
     events: SessionEvents,
 ) {
+    let _ = events
+        .send(SessionEvent::SignalSecurity {
+            tls: config.signal_tls.is_some(),
+        })
+        .await;
     emit_lifecycle(&events, NetworkLifecycle::ConnectingSignal).await;
     let mut network = match prepare_desktop_network(&config.network).await {
         Ok(network) => network,
@@ -833,6 +846,7 @@ async fn run_session(
     let mut queued_lookups: VecDeque<(NodeId, u64)> = VecDeque::new();
     let mut signal: Option<SignalingClient> = None;
     let mut signal_server = config.signal_server;
+    let mut signal_tls = config.signal_tls;
     let mut signal_generation = 0u64;
     let mut connect_task: Option<tokio::task::AbortHandle> = None;
     let mut reconnect_sleep: Option<Pin<Box<Sleep>>> = None;
@@ -842,7 +856,7 @@ async fn run_session(
 
     start_signal_connect(
         &identity,
-        &signal_server,
+        (&signal_server, signal_tls.as_ref()),
         &network.local_candidates,
         signal_generation,
         input_tx.clone(),
@@ -1530,8 +1544,10 @@ async fn run_session(
                     SessionCommand::ReconfigureNetwork {
                         server,
                         relay_server,
+                        signal_tls: updated_tls,
                     } => {
                         signal_server = server;
+                        signal_tls = updated_tls;
                         credentials.clear();
                         if let Some(old) = &network.relay {
                             old.endpoints.close();
@@ -1611,10 +1627,15 @@ async fn run_session(
                     if let Some(task) = connect_task.take() {
                         task.abort();
                     }
+                    let _ = events
+                        .send(SessionEvent::SignalSecurity {
+                            tls: signal_tls.is_some(),
+                        })
+                        .await;
                     emit_lifecycle(&events, NetworkLifecycle::ConnectingSignal).await;
                     start_signal_connect(
                         &identity,
-                        &signal_server,
+                        (&signal_server, signal_tls.as_ref()),
                         &network.local_candidates,
                         signal_generation,
                         input_tx.clone(),
@@ -2630,7 +2651,7 @@ async fn run_session(
                 .await;
                 start_signal_connect(
                     &identity,
-                    &signal_server,
+                    (&signal_server, signal_tls.as_ref()),
                     &network.local_candidates,
                     signal_generation,
                     input_tx.clone(),
@@ -2999,7 +3020,7 @@ async fn start_tunnel_rule(
 
 fn start_signal_connect(
     identity: &Identity,
-    signal_server: &str,
+    target: (&str, Option<&crate::discovery::signal_tls::SignalTlsClient>),
     candidates: &[Candidate],
     generation: u64,
     inputs: mpsc::Sender<SessionInput>,
@@ -3007,12 +3028,17 @@ fn start_signal_connect(
     tasks: &mut JoinSet<()>,
 ) {
     let identity = identity.clone();
-    let signal_server = signal_server.to_owned();
+    let signal_server = target.0.to_owned();
+    let signal_tls = target.1.cloned();
     let candidates = candidates.to_vec();
     *task = Some(tasks.spawn(async move {
-        let result =
-            SignalingClient::connect_desktop_with_events(&signal_server, &identity, candidates)
-                .await;
+        let result = SignalingClient::connect_desktop_with_tls(
+            &signal_server,
+            &identity,
+            candidates,
+            signal_tls.as_ref(),
+        )
+        .await;
         let _ = inputs
             .send(SessionInput::SignalConnected { generation, result })
             .await;
@@ -5366,6 +5392,101 @@ mod tests {
         hb.shutdown();
         server.abort();
     }
+    #[tokio::test]
+    async fn signaling_tls_session_reconnect_preserves_transport_and_policy_changes_revoke_it() {
+        async fn disconnected(events: &mut mpsc::Receiver<SessionEvent>) {
+            time::timeout(Duration::from_secs(15), async {
+                loop {
+                    if matches!(
+                        events.recv().await.unwrap(),
+                        SessionEvent::Lifecycle(NetworkLifecycle::ReconnectingSignal { .. })
+                    ) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        }
+        let fixture = crate::discovery::signal_tls::tests::Fixture::new(false);
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+        let address = listener.local_addr().unwrap();
+        let config = SignalServerConfig {
+            tls: Some(fixture.server.clone()),
+            ..SignalServerConfig::for_tests()
+        };
+        let active = listener.clone();
+        let first_config = config.clone();
+        let server =
+            tokio::spawn(async move { run_signal_server_on_borrowed(&active, first_config).await });
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let mut ca = local_config(address);
+        ca.signal_tls = Some(fixture.client.clone());
+        let cb = ca.clone();
+        let (ha, mut ea) = spawn(a.clone(), ca).unwrap();
+        let (hb, mut eb) = spawn(b.clone(), cb).unwrap();
+        wait_signal_online(&mut ea).await;
+        wait_signal_online(&mut eb).await;
+        ha.connect_peer(b.node_id()).unwrap();
+        wait_connected(&mut ea, &[b.node_id()]).await;
+        wait_connected(&mut eb, &[a.node_id()]).await;
+        let old = inspect(&ha).await[&b.node_id()].1.clone();
+        let binding = ChannelBinding::from_connection(&old).unwrap();
+        server.abort();
+        let _ = server.await;
+        disconnected(&mut ea).await;
+        disconnected(&mut eb).await;
+        let active = listener.clone();
+        let server =
+            tokio::spawn(async move { run_signal_server_on_borrowed(&active, config).await });
+        wait_signal_online(&mut ea).await;
+        wait_signal_online(&mut eb).await;
+        assert_eq!(
+            inspect(&ha).await[&b.node_id()].1.stable_id(),
+            old.stable_id(),
+            "signaling outage retains the live authenticated device transport"
+        );
+        while ea.try_recv().is_ok() {}
+        let wrong = crate::discovery::signal_tls::SignalTlsClient {
+            server_name: Some("wrong.invalid".into()),
+            ..fixture.client.clone()
+        };
+        ha.reconfigure_network(address.to_string(), None, Some(wrong))
+            .unwrap();
+        // Registration cannot publish with the wrong certificate name.
+        time::timeout(Duration::from_secs(15), async {
+            loop {
+                match ea.recv().await.unwrap() {
+                    SessionEvent::Lifecycle(NetworkLifecycle::SignalOnline)
+                    | SessionEvent::SignalIdentityRegistered(_) => {
+                        panic!("invalid certificate name published signaling success")
+                    }
+                    SessionEvent::Lifecycle(NetworkLifecycle::ReconnectingSignal { .. }) => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(inspect(&ha).await.is_empty());
+        assert!(old.close_reason().is_some());
+        ha.reconfigure_network(address.to_string(), None, Some(fixture.client.clone()))
+            .unwrap();
+        wait_signal_online(&mut ea).await;
+        ha.connect_peer(b.node_id()).unwrap();
+        wait_connected(&mut ea, &[b.node_id()]).await;
+        wait_connected(&mut eb, &[a.node_id()]).await;
+        assert_ne!(
+            ChannelBinding::from_connection(&inspect(&ha).await[&b.node_id()].1).unwrap(),
+            binding
+        );
+        ha.shutdown();
+        hb.shutdown();
+        drop((ha, hb));
+        server.abort();
+        let _ = server.await;
+    }
     async fn start_local_server() -> (SocketAddr, JoinHandle<()>) {
         start_local_server_with(SignalServerConfig::for_tests()).await
     }
@@ -5382,6 +5503,7 @@ mod tests {
     fn local_config(signal_server: SocketAddr) -> DesktopSessionConfig {
         DesktopSessionConfig {
             signal_server: signal_server.to_string(),
+            signal_tls: None,
             remote_auth: Some(test_verifier()),
             trusted_devices: Vec::new(),
             config_path: None,
@@ -5805,7 +5927,7 @@ mod tests {
         .unwrap()
         .unwrap();
         handle
-            .reconfigure_network(new_address.to_string(), None)
+            .reconfigure_network(new_address.to_string(), None, None)
             .unwrap();
         wait_signal_online(&mut events).await;
         // Drain the original Hello; canceled registration must then close TCP.

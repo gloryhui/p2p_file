@@ -109,6 +109,7 @@ impl Peer {
     }
 }
 pub(super) struct Diagnostics {
+    signal_tls: Option<bool>,
     signal: Signal,
     signal_since: Instant,
     signal_finished: Option<Instant>,
@@ -121,6 +122,7 @@ pub(super) struct Diagnostics {
 impl Diagnostics {
     pub fn new(now: Instant) -> Self {
         Self {
+            signal_tls: None,
             signal: Signal::Unconfigured,
             signal_since: now,
             signal_finished: None,
@@ -141,6 +143,16 @@ impl Diagnostics {
         if matches!(self.signal, Signal::Preparing) {
             self.signal = Signal::Connecting;
         }
+    }
+    pub fn signal_security(&mut self, tls: bool, now: Instant) {
+        self.signal_tls = Some(tls);
+        self.signal = if self.families.is_some() {
+            Signal::Connecting
+        } else {
+            Signal::Preparing
+        };
+        self.signal_since = now;
+        self.signal_finished = None;
     }
     pub fn network(&mut self, state: &NetworkLifecycle, now: Instant) {
         match state {
@@ -290,6 +302,15 @@ impl Diagnostics {
             "P2P File 连接诊断 v1（脱敏摘要）".to_owned(),
             format!("信令：{}", self.signal.label()),
         ];
+        lines.push(format!(
+            "信令通道：{}",
+            match self.signal_tls {
+                Some(true) if matches!(self.signal, Signal::Online) => "TLS；证书与主机名校验通过",
+                Some(true) => "已配置 TLS；等待连接及证书校验",
+                Some(false) => "明文 TCP（兼容模式）",
+                None => "未知",
+            }
+        ));
         let signal_time = if matches!(self.signal, Signal::Unconfigured) {
             "未知".into()
         } else {
@@ -407,6 +428,34 @@ pub(super) fn export(path: &std::path::Path, text: &str) -> std::io::Result<()> 
 mod tests {
     use super::*;
     use crate::{desktop::remote_auth::RemoteAuthorization, identity::Identity};
+    #[test]
+    fn signaling_tls_diagnostic_claims_verification_only_after_current_registration() {
+        let now = Instant::now();
+        let mut model = Diagnostics::new(now);
+        model.signal_security(true, now);
+        assert!(model.text(now).contains("等待连接及证书校验"));
+        assert!(!model.text(now).contains("校验通过"));
+        model.network(
+            &NetworkLifecycle::Connected {
+                peer: Identity::generate().node_id(),
+            },
+            now,
+        );
+        assert!(!model.text(now).contains("校验通过"));
+        model.network(&NetworkLifecycle::SignalOnline, now);
+        assert!(model.text(now).contains("TLS；证书与主机名校验通过"));
+        model.signal_security(true, now); // A CA/name policy update fences the prior claim.
+        model.network(
+            &NetworkLifecycle::Failed {
+                detail: "private raw TLS error".into(),
+            },
+            now,
+        );
+        assert!(!model.text(now).contains("校验通过"));
+        assert!(!model.text(now).contains("明文 TCP"));
+        model.signal_security(false, now);
+        assert!(model.text(now).contains("明文 TCP（兼容模式）"));
+    }
     #[test]
     fn paths_do_not_grant_business_rights_and_attempt_time_stops_at_connection() {
         let now = Instant::now();
