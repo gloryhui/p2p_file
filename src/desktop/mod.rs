@@ -29,6 +29,7 @@ mod queue;
 mod remote_auth;
 pub(crate) mod secure_fs;
 mod session;
+mod space_budget;
 mod speed;
 #[allow(dead_code)] // Task list consumers arrive in later GPUI task integrations.
 mod task_events;
@@ -985,6 +986,7 @@ struct DesktopShell {
     concurrency_input: Entity<TextField>,
     upload_limit_input: Entity<TextField>,
     download_limit_input: Entity<TextField>,
+    receive_safety_input: Entity<TextField>,
     signal_host: Entity<TextField>,
     signal_port: Entity<TextField>,
     signal_tls_enabled: bool,
@@ -1039,6 +1041,7 @@ struct DesktopShell {
     expanded_groups: HashSet<task_model::TaskId>,
     selected_task: Option<task_model::TaskId>,
     queue_status: SharedString,
+    receive_space_status: SharedString,
     speed_views: ui_model::SpeedViews,
     speedtest_upload_result: Option<speed::SpeedSnapshot>,
     speed_peer: Option<NodeId>,
@@ -1203,6 +1206,12 @@ impl DesktopShell {
                     .update(cx, |shell, cx| {
                         match result {
                             Ok(snapshot) => {
+                                shell.receive_space_status = format!(
+                                    "接收预算已预约 {:.1} MiB · {} 个文件系统",
+                                    snapshot.space.reserved as f64 / (1024. * 1024.),
+                                    snapshot.space.filesystems
+                                )
+                                .into();
                                 shell.queue_status = format!(
                                     "排队 {} · 活动文件 {}/{}{}",
                                     snapshot.queue.pending,
@@ -1484,6 +1493,7 @@ impl DesktopShell {
     }
     fn refresh_task_rows(&mut self, cx: &mut Context<Self>) {
         let snapshot = ui_model::Snapshot {
+            space: Default::default(),
             tasks: self.task_snapshot.clone(),
             queue: queue::TaskQueue::default().metrics(),
             speeds: HashMap::new(),
@@ -3776,6 +3786,7 @@ impl DesktopShell {
             .child(self.notifications_card(cx))
             .child(self.auto_resume_card(cx))
             .child(self.file_limits_card(window, cx))
+            .child(self.receive_space_card(window, cx))
             .child(self.advanced_network_card(window, cx))
     }
 
@@ -3900,6 +3911,7 @@ impl DesktopShell {
             self.expanded_groups.insert(group.clone());
         }
         let snapshot = ui_model::Snapshot {
+            space: Default::default(),
             tasks: self.task_snapshot.clone(),
             queue: queue::TaskQueue::default().metrics(),
             speeds: HashMap::new(),
@@ -3917,6 +3929,58 @@ impl DesktopShell {
         } else {
             self.set_status("通知对应的历史记录已移除", cx);
         }
+    }
+
+    fn receive_space_card(&self, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
+        ui_components::card()
+            .child(ui_components::section_header("▣", "接收磁盘空间", "同一文件系统的任务共享接收预算"))
+            .child(ui_components::field_label("安全余量（MiB，默认 64，范围 0..4096）"))
+            .child(Self::text_field_frame(&self.receive_safety_input, window, cx))
+            .child(div().text_xs().text_color(rgb(ui_theme::TEXT_SECONDARY))
+                .child("余量在每个文件系统只计算一次；修改后用于后续接收。预检查结合已验证的持久断点，不能保证运行期间空间充足。空间不足时保留断点，腾出空间后手动继续。"))
+            .child(self.receive_space_status.clone())
+            .child(ui_components::secondary_button("保存接收安全余量", self.can_save_settings && !self.is_saving_settings)
+                .on_mouse_up(MouseButton::Left, cx.listener(|shell, _, _, cx| shell.apply_receive_space(cx))))
+    }
+    fn apply_receive_space(&mut self, cx: &mut Context<Self>) {
+        if !self.can_save_settings || self.is_saving_settings {
+            return;
+        }
+        let parsed = self
+            .receive_safety_input
+            .read(cx)
+            .content
+            .trim()
+            .parse::<u16>();
+        let value = match parsed {
+            Ok(value) if space_budget::validate_safety_mib(value).is_ok() => value,
+            _ => {
+                self.set_status("接收安全余量必须为 0..4096 MiB 的整数", cx);
+                return;
+            }
+        };
+        let config_file = self.config_file.clone();
+        let background = cx.background_executor().clone();
+        self.is_saving_settings = true;
+        cx.spawn(async move |shell, cx| {
+            let result = background
+                .spawn(async move { DesktopConfig::save_receive_safety_mib(&config_file, value) })
+                .await;
+            let _ = shell.update(cx, |shell, cx| {
+                shell.is_saving_settings = false;
+                match result {
+                    Ok(()) => {
+                        shell.settings.receive_safety_mib = value;
+                        if let Some(service) = &shell.transfer_service {
+                            let _ = service.receive_space.set_safety_mib(value);
+                        }
+                        shell.set_status("接收安全余量已保存，将用于后续接收", cx);
+                    }
+                    Err(error) => shell.set_status(format!("接收安全余量未保存：{error}"), cx),
+                }
+            });
+        })
+        .detach();
     }
 
     fn file_limits_card(&self, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
@@ -5502,8 +5566,13 @@ pub fn run(background_start: bool) {
                 .set_file_limits(settings.file_limits)
                 .expect("validated file limits");
             service.set_auto_resume(settings.auto_resume);
+            service
+                .receive_space
+                .set_safety_mib(settings.receive_safety_mib)
+                .expect("validated receive margin");
         }
         let initial_file_limits = settings.file_limits;
+        let initial_receive_safety = settings.receive_safety_mib;
         let initial_notifications = settings.notifications;
         let initial_receive_root = settings.receive_directory.clone();
         let initial_concurrency = settings.send_concurrency;
@@ -5566,6 +5635,11 @@ pub fn run(background_start: bool) {
                 let upload_limit_input = cx.new(|cx| {
                     let mut field = TextField::new(cx, "0 表示不限速");
                     field.content = initial_file_limits.upload_kib.to_string().into();
+                    field
+                });
+                let receive_safety_input = cx.new(|cx| {
+                    let mut field = TextField::new(cx, "0..4096 MiB");
+                    field.content = initial_receive_safety.to_string().into();
                     field
                 });
                 let download_limit_input = cx.new(|cx| {
@@ -5658,6 +5732,7 @@ pub fn run(background_start: bool) {
                         concurrency_input,
                         upload_limit_input,
                         download_limit_input,
+                        receive_safety_input,
                         signal_host,
                         signal_port,
                         signal_tls_enabled: initial_tls_enabled,
@@ -5721,6 +5796,7 @@ pub fn run(background_start: bool) {
                         expanded_groups: HashSet::new(),
                         selected_task: None,
                         queue_status: "正在载入任务…".into(),
+                        receive_space_status: "接收预算尚未预约".into(),
                         speed_views: Default::default(),
                         speedtest_upload_result: None,
                         speed_peer: None,

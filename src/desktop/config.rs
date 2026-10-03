@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const APP_DIR_NAME: &str = "p2p_file";
-const CONFIG_SCHEMA_VERSION: u32 = 10;
+const CONFIG_SCHEMA_VERSION: u32 = 11;
 static CONFIG_MUTATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const LEGACY_CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -104,6 +104,7 @@ pub struct SettingsDraft {
     pub file_limits: super::bandwidth::FileLimits,
     pub notifications: bool,
     pub auto_resume: bool,
+    pub receive_safety_mib: u16,
     pub relay_server: Option<String>,
     pub signal_host: String,
     pub signal_port: String,
@@ -199,6 +200,7 @@ impl SettingsDraft {
             file_limits: Default::default(),
             notifications: false,
             auto_resume: false,
+            receive_safety_mib: crate::desktop::space_budget::DEFAULT_SAFETY_MIB,
             signal_tls: None,
             relay_server: None,
             signal_host: String::new(),
@@ -226,6 +228,7 @@ impl SettingsDraft {
             file_limits: config.file_limits,
             notifications: config.notifications,
             auto_resume: config.auto_resume,
+            receive_safety_mib: config.receive_safety_mib,
             signal_tls: config.signal_tls,
             relay_server: config.relay_server,
             signal_host: config
@@ -276,6 +279,7 @@ impl SettingsDraft {
             file_limits: self.file_limits,
             notifications: self.notifications,
             auto_resume: self.auto_resume,
+            receive_safety_mib: self.receive_safety_mib,
             relay_server: self.relay_server.clone(),
             schema_version: CONFIG_SCHEMA_VERSION,
             signal: Some(SignalConfig {
@@ -313,6 +317,7 @@ impl SettingsDraft {
             config.file_limits = saved.file_limits;
             config.notifications = saved.notifications;
             config.auto_resume = saved.auto_resume;
+            config.receive_safety_mib = saved.receive_safety_mib;
             config.trusted_devices = saved.trusted_devices;
             config.remote_auth = saved.remote_auth;
         }
@@ -369,6 +374,8 @@ pub struct DesktopConfig {
     notifications: bool,
     #[serde(default)]
     auto_resume: bool,
+    #[serde(default = "crate::desktop::space_budget::default_safety_mib")]
+    receive_safety_mib: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     relay_server: Option<String>,
     schema_version: u32,
@@ -421,6 +428,7 @@ impl DesktopConfig {
                 file_limits: Default::default(),
                 notifications: false,
                 auto_resume: false,
+                receive_safety_mib: crate::desktop::space_budget::DEFAULT_SAFETY_MIB,
                 signal_tls: None,
                 relay_server: None,
                 schema_version: CONFIG_SCHEMA_VERSION,
@@ -446,6 +454,15 @@ impl DesktopConfig {
         let mut config = Self::load(path)?
             .ok_or_else(|| ConfigError::Invalid("请先完成本机身份初始化".into()))?;
         config.background = options;
+        config.write_atomic(path)
+    }
+    pub fn save_receive_safety_mib(path: &Path, value: u16) -> Result<(), ConfigError> {
+        crate::desktop::space_budget::validate_safety_mib(value)
+            .map_err(|message| ConfigError::Invalid(message.into()))?;
+        let _guard = config_mutation_lock()?;
+        let mut config =
+            Self::load(path)?.ok_or_else(|| ConfigError::Invalid("请先保存基础设置".into()))?;
+        config.receive_safety_mib = value;
         config.write_atomic(path)
     }
     pub fn save_auto_resume(path: &Path, enabled: bool) -> Result<(), ConfigError> {
@@ -556,6 +573,7 @@ impl DesktopConfig {
                     file_limits: Default::default(),
                     notifications: false,
                     auto_resume: false,
+                    receive_safety_mib: crate::desktop::space_budget::DEFAULT_SAFETY_MIB,
                     signal_tls: None,
                     relay_server: None,
                     schema_version: CONFIG_SCHEMA_VERSION,
@@ -570,7 +588,7 @@ impl DesktopConfig {
                     trusted_devices: Vec::new(),
                 }
             }
-            2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | CONFIG_SCHEMA_VERSION => {
+            2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | CONFIG_SCHEMA_VERSION => {
                 let mut config = serde_json::from_slice::<Self>(&bytes)
                     .map_err(|error| ConfigError::Corrupt(error.to_string()))?;
                 if version < 4 && (config.signal.is_none() || config.receive_directory.is_none()) {
@@ -598,6 +616,13 @@ impl DesktopConfig {
                 if version < 10 && config.auto_resume {
                     return Err(ConfigError::Corrupt("旧配置版本不能启用自动恢复".into()));
                 }
+                if version < 11
+                    && config.receive_safety_mib != crate::desktop::space_budget::DEFAULT_SAFETY_MIB
+                {
+                    return Err(ConfigError::Corrupt(
+                        "旧配置版本不能声明接收安全余量".into(),
+                    ));
+                }
                 // v2 had target-only grants. Preserve rows, but require explicit peer authorization.
                 if version == 2 {
                     for entry in &mut config.allowed_forward_targets {
@@ -620,6 +645,8 @@ impl DesktopConfig {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        crate::desktop::space_budget::validate_safety_mib(self.receive_safety_mib)
+            .map_err(|message| ConfigError::Invalid(message.into()))?;
         if let Some(tls) = &self.signal_tls {
             let signal = self
                 .signal
@@ -1069,6 +1096,42 @@ mod tests {
     }
 
     #[test]
+    fn receive_margin_migrates_validates_and_stale_drafts_preserve_saved_choice() {
+        let root = temp_dir("receive-margin");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("settings.json");
+        let draft = valid_draft(root.clone());
+        for version in 2..=10 {
+            let mut old = serde_json::to_value(draft.to_config().unwrap()).unwrap();
+            old["schema_version"] = version.into();
+            old.as_object_mut().unwrap().remove("receive_safety_mib");
+            fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+            assert_eq!(
+                DesktopConfig::load(&path)
+                    .unwrap()
+                    .unwrap()
+                    .receive_safety_mib,
+                64
+            );
+            DesktopConfig::save_receive_safety_mib(&path, 0).unwrap();
+            draft.save_atomic(&path).unwrap();
+            assert_eq!(
+                DesktopConfig::load(&path)
+                    .unwrap()
+                    .unwrap()
+                    .receive_safety_mib,
+                0
+            );
+            let saved = fs::read(&path).unwrap();
+            assert!(DesktopConfig::save_receive_safety_mib(&path, 4097).is_err());
+            assert_eq!(fs::read(&path).unwrap(), saved);
+            old["receive_safety_mib"] = 1.into();
+            fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+            assert!(DesktopConfig::load(&path).is_err());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn auto_resume_preference_migrates_off_and_stale_drafts_preserve_explicit_choice() {
         let root = temp_dir("auto-resume");
         fs::create_dir_all(&root).unwrap();
@@ -1144,6 +1207,7 @@ mod tests {
             file_limits: Default::default(),
             notifications: false,
             auto_resume: false,
+            receive_safety_mib: crate::desktop::space_budget::DEFAULT_SAFETY_MIB,
             signal_tls: None,
             relay_server: None,
             signal_host: "relay.example.test".into(),
@@ -1226,6 +1290,7 @@ mod tests {
             file_limits: Default::default(),
             notifications: false,
             auto_resume: false,
+            receive_safety_mib: crate::desktop::space_budget::DEFAULT_SAFETY_MIB,
             signal_tls: None,
             relay_server: None,
             schema_version: CONFIG_SCHEMA_VERSION,

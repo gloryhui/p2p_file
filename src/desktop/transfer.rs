@@ -58,6 +58,7 @@ pub(crate) struct TransferService {
     rates: Arc<Mutex<HashMap<TaskId, super::queue::RateSampler>>>,
     sender_queue: Arc<Mutex<super::queue::TaskQueue>>,
     recovery: Arc<Mutex<super::auto_resume::Recovery>>,
+    pub(super) receive_space: super::space_budget::SpaceBudget,
     automatic_sends: Arc<Mutex<HashMap<TaskId, super::auto_resume::Ticket>>>,
     pub(super) activity: super::activity::Activity,
     speed_peers: Arc<Mutex<HashMap<NodeId, super::speed::SpeedPeer>>>,
@@ -165,6 +166,7 @@ impl TransferService {
             rates: Arc::new(Mutex::new(HashMap::new())),
             sender_queue: Arc::new(Mutex::new(super::queue::TaskQueue::default())),
             recovery: Default::default(),
+            receive_space: Default::default(),
             automatic_sends: Default::default(),
             #[cfg(test)]
             drop_completion: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1066,12 +1068,23 @@ impl TransferService {
     async fn finish_error(&self, id: &TaskId, error: &Error, connection: &Connection) {
         let id = id.clone();
         let text = error.to_string();
+        let space_code = match error {
+            Error::Io(e) => e
+                .get_ref()
+                .and_then(|cause| cause.downcast_ref::<super::space_budget::SpaceError>())
+                .map(super::space_budget::SpaceError::diagnostic),
+            _ => None,
+        };
         let (state, code, retryable) = if text.contains("源文件内容已变化") {
             (TaskState::Failed, TaskErrorCode::SourceChanged, false)
         } else if text.contains("源文件不可用") {
             (TaskState::Failed, TaskErrorCode::SourceUnavailable, true)
         } else if text.contains("资源忙") {
             (TaskState::Failed, TaskErrorCode::PeerBusy, true)
+        } else if matches!(error, Error::Io(e) if e.kind() == std::io::ErrorKind::StorageFull) {
+            (TaskState::Failed, TaskErrorCode::DiskFull, true)
+        } else if let Some(code) = space_code {
+            (TaskState::Failed, code, true)
         } else if is_storage_error(error) {
             (TaskState::Failed, TaskErrorCode::StorageUnavailable, true)
         } else {
@@ -1223,6 +1236,7 @@ impl TransferService {
         };
         tasks.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.id.cmp(&b.1.id)));
         Ok(super::ui_model::Snapshot {
+            space: self.receive_space.summary(),
             tasks: tasks.into_iter().map(|(_, row)| row).collect(),
             queue: self.queue_metrics(),
             speeds: self.speed_snapshots(),
@@ -1946,6 +1960,7 @@ impl TransferService {
         let (_guard, pause) = self
             .claim_receive(&mut send, peer, &task_id, false, connection.stable_id())
             .await?;
+        let _guard = Arc::new(_guard);
         let mut io = TaskIo::new(send, recv, peer, task_id.clone(), self.frame_budget.clone());
         io.observe(&first)?;
         drop(first);
@@ -1980,24 +1995,29 @@ impl TransferService {
         }
         self.state(&task_id, TaskState::Transferring).await?;
         let local = record.clone();
-        let download = match blocking(move || disk::open_download(&local)).await {
-            Ok(download) => download,
-            Err(error) => {
-                io.report_error(&error).await;
-                self.finish_error(&task_id, &error, connection).await;
-                return Err(error);
-            }
-        };
+        let budget = self.receive_space.clone();
+        let owner = _guard.clone();
+        let (download, reservation) =
+            match blocking(move || disk::open_download_with_space(&local, &budget, owner)).await {
+                Ok(admitted) => admitted,
+                Err(error) => {
+                    io.report_error(&error).await;
+                    self.finish_error(&task_id, &error, connection).await;
+                    return Err(error);
+                }
+            };
         let download = Arc::new(Mutex::new(download));
         let result = self
-            .receiver_loop(&mut io, &record, download.clone(), pause)
+            .receiver_loop(&mut io, &record, download.clone(), pause, &reservation)
             .await;
         if result.is_ok() {
             self.recovery.lock().unwrap().forget(&task_id);
         }
         if let Err(error) = &result {
             let checkpoint = download.clone();
+            let lease = reservation.clone();
             let _ = blocking(move || {
+                let _lease = lease;
                 checkpoint
                     .lock()
                     .map_err(|_| disk::failure("接收文件锁不可用"))?
@@ -2034,6 +2054,7 @@ impl TransferService {
         let (_guard, _pause) = self
             .claim_receive(&mut send, peer, &task_id, true, connection.stable_id())
             .await?;
+        let _guard = Arc::new(_guard);
         let mut io = TaskIo::new(send, recv, peer, task_id.clone(), self.frame_budget.clone());
         io.observe(&first)?;
         drop(first);
@@ -2054,8 +2075,14 @@ impl TransferService {
                 self.state(&task_id, TaskState::Transferring).await?;
                 self.state(&task_id, TaskState::Finalizing).await?;
                 let local = record.clone();
-                self.store(move |store| super::publish::directory(store, &local))
-                    .await?;
+                let budget = self.receive_space.clone();
+                let owner = _guard.clone();
+                self.store(move |store| {
+                    let lease = budget.reserve_directory(&local)?;
+                    lease.keep_alive(owner);
+                    super::publish::directory(store, &local)
+                })
+                .await?;
             }
             io.send(Message::Completed {
                 task_id: task_id.clone(),
@@ -2084,11 +2111,14 @@ impl TransferService {
         record: &TaskRecord,
         download: Arc<Mutex<crate::storage::PartialDownload>>,
         mut pause: watch::Receiver<bool>,
+        reservation: &super::space_budget::Reservation,
     ) -> Result<()> {
         let id = record.task_id();
         let manifest = &record.file_details().unwrap().manifest;
         let initial = download.clone();
+        let lease = reservation.clone();
         let (have, missing, mut bytes) = blocking(move || {
+            let _lease = lease;
             let download = initial
                 .lock()
                 .map_err(|_| disk::failure("接收文件锁不可用"))?;
@@ -2121,7 +2151,9 @@ impl TransferService {
                 let output = download.clone();
                 #[cfg(test)]
                 let publication_error = self.publication_error.clone();
+                let lease = reservation.clone();
                 self.store(move |store| {
+                    let _lease = lease;
                     #[cfg(test)]
                     if let Some(kind) = publication_error.lock().unwrap().take() {
                         return Err(
@@ -2170,7 +2202,9 @@ impl TransferService {
             } else if outstanding.is_empty() {
                 if !checkpointed {
                     let file = download.clone();
+                    let lease = reservation.clone();
                     blocking(move || {
+                        let _lease = lease;
                         file.lock()
                             .map_err(|_| disk::failure("接收文件锁不可用"))?
                             .checkpoint()
@@ -2217,11 +2251,14 @@ impl TransferService {
                         .await?;
                     let output = download.clone();
                     let length = data.len() as u64;
+                    let lease = reservation.clone();
                     blocking(move || {
                         output
                             .lock()
                             .map_err(|_| disk::failure("接收文件锁不可用"))?
-                            .write_chunk(index, &data)
+                            .write_chunk(index, &data)?;
+                        lease.written(length);
+                        Ok(())
                     })
                     .await?;
                     #[cfg(test)]
@@ -2816,6 +2853,189 @@ mod tests {
             *self.b.first_chunk_gate.lock().unwrap() = Some((reached_tx, release_rx));
             (reached, release)
         }
+    }
+    #[tokio::test]
+    async fn receive_space_precheck_reports_refusal_and_manual_retry_preserves_task() {
+        for query_fails in [false, true] {
+            let pair = Pair::new().await;
+            pair.b.receive_space.set_safety_mib(0).unwrap();
+            *pair.b.receive_space.probe_override.lock().unwrap() =
+                Some(if query_fails { Err(()) } else { Ok(0) });
+            let (id, bytes) = pair.select(128 * 1024).await;
+            assert!(pair.sender(id.clone()).await.unwrap().is_err());
+            wait_state(&pair.b, &id, TaskState::Failed).await;
+            pair.b.wait_previous_attempt(&id).await.unwrap();
+            let refused = pair.b.task(id.clone()).await.unwrap();
+            assert_eq!(
+                refused.diagnostic().unwrap().code(),
+                if query_fails {
+                    TaskErrorCode::SpaceCheckUnavailable
+                } else {
+                    TaskErrorCode::DiskFull
+                }
+            );
+            assert!(refused.diagnostic().unwrap().is_retryable());
+            assert!(
+                !disk::stage_dir(&refused)
+                    .unwrap()
+                    .join("data.part")
+                    .exists()
+            );
+            assert!(!pair.root.join("b-receive/文件.bin").exists());
+            assert_eq!(pair.b.receive_space.summary().reserved, 0);
+            *pair.b.receive_space.probe_override.lock().unwrap() = None;
+            pair.b.resume(&pair.cb, pair.ia, id.clone()).await.unwrap();
+            wait_state(&pair.a, &id, TaskState::Completed).await;
+            wait_state(&pair.b, &id, TaskState::Completed).await;
+            pair.b.wait_previous_attempt(&id).await.unwrap();
+            assert_eq!(
+                fs::read(pair.root.join("b-receive/文件.bin")).unwrap(),
+                bytes
+            );
+            assert_eq!(pair.b.receive_space.summary().reserved, 0);
+            pair.shutdown().await;
+        }
+    }
+    #[tokio::test]
+    async fn receive_space_concurrent_transfers_release_on_completion_pause_and_disconnect() {
+        for termination in 0..3 {
+            let mut pair = Pair::new().await;
+            pair.a.set_send_limit(2).unwrap();
+            pair.b.receive_space.set_safety_mib(0).unwrap();
+            let (id, bytes) = pair.select(8 * 1024 * 1024).await;
+            let (reached, release) = pair.gate();
+            let sender = pair.sender(id.clone());
+            reached.await.unwrap();
+            let held = pair.b.receive_space.summary().reserved;
+            assert!(held >= super::super::space_budget::TASK_OVERHEAD);
+            assert!(held < bytes.len() as u64 + super::super::space_budget::TASK_OVERHEAD);
+            *pair.b.receive_space.probe_override.lock().unwrap() = Some(Ok(held));
+            let other_path = pair.root.join("other.bin");
+            fs::write(&other_path, b"another file").unwrap();
+            let other = pair.a.select_file(pair.ib, other_path).await.unwrap();
+            assert!(pair.sender(other.clone()).await.unwrap().is_err());
+            wait_state(&pair.b, &other, TaskState::Failed).await;
+            assert_eq!(
+                pair.b
+                    .task(other.clone())
+                    .await
+                    .unwrap()
+                    .diagnostic()
+                    .unwrap()
+                    .code(),
+                TaskErrorCode::DiskFull
+            );
+            *pair.b.receive_space.probe_override.lock().unwrap() = None;
+            match termination {
+                0 => {
+                    release.send(()).unwrap();
+                    sender.await.unwrap().unwrap();
+                }
+                1 => {
+                    pair.b.pause_task(id.clone()).await.unwrap();
+                    release.send(()).unwrap();
+                    sender.await.unwrap().unwrap();
+                    wait_state(&pair.b, &id, TaskState::Paused).await;
+                }
+                _ => {
+                    pair.a.network_lost(pair.ib);
+                    pair.b.network_lost(pair.ia);
+                    pair.ca.close(0u32.into(), b"fixture interruption");
+                    assert!(sender.await.unwrap().is_err());
+                    pair.cb.closed().await;
+                    while pair.tasks.join_next().await.is_some() {}
+                    drop(release);
+                    pair.a.settle_network_loss(pair.ib).await.unwrap();
+                    pair.b.settle_network_loss(pair.ia).await.unwrap();
+                }
+            }
+            pair.b.wait_previous_attempt(&id).await.unwrap();
+            pair.b.wait_previous_attempt(&other).await.unwrap();
+            assert_eq!(pair.b.receive_space.summary().reserved, 0);
+            if termination != 0 {
+                if termination == 2 {
+                    pair.reconnect().await;
+                }
+                pair.b.resume(&pair.cb, pair.ia, id.clone()).await.unwrap();
+            }
+            wait_state(&pair.b, &id, TaskState::Completed).await;
+            pair.b.wait_previous_attempt(&id).await.unwrap();
+            assert_eq!(
+                fs::read(pair.root.join("b-receive/文件.bin")).unwrap(),
+                bytes
+            );
+            assert_eq!(pair.b.receive_space.summary().reserved, 0);
+            pair.shutdown().await;
+        }
+    }
+    #[tokio::test]
+    async fn receive_space_directory_refusal_keeps_target_absent_then_manual_retry_works() {
+        let pair = Pair::new().await;
+        pair.b.receive_space.set_safety_mib(0).unwrap();
+        *pair.b.receive_space.probe_override.lock().unwrap() = Some(Ok(0));
+        let source = pair.root.join("空目录");
+        fs::create_dir(&source).unwrap();
+        let id = pair
+            .a
+            .select_directory(pair.ib, source)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(pair.sender(id.clone()).await.unwrap().is_err());
+        wait_state(&pair.b, &id, TaskState::Failed).await;
+        pair.b.wait_previous_attempt(&id).await.unwrap();
+        assert_eq!(
+            pair.b
+                .task(id.clone())
+                .await
+                .unwrap()
+                .diagnostic()
+                .unwrap()
+                .code(),
+            TaskErrorCode::DiskFull
+        );
+        assert!(!pair.root.join("b-receive/空目录").exists());
+        assert_eq!(pair.b.receive_space.summary().reserved, 0);
+        *pair.b.receive_space.probe_override.lock().unwrap() = None;
+        pair.b.resume(&pair.cb, pair.ia, id.clone()).await.unwrap();
+        wait_state(&pair.b, &id, TaskState::Completed).await;
+        assert!(pair.root.join("b-receive/空目录").is_dir());
+        pair.b.wait_previous_attempt(&id).await.unwrap();
+        assert_eq!(pair.b.receive_space.summary().reserved, 0);
+        pair.shutdown().await;
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn receive_space_real_enospc_kind_keeps_partial_and_releases_reservation() {
+        use std::io::Write;
+        // /dev/full returns a genuine kernel ENOSPC without filling a shared
+        // filesystem. Route that native error kind through the publication seam.
+        let error = fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap()
+            .write_all(b"space fixture")
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
+        let pair = Pair::new().await;
+        let (id, bytes) = pair.select(128 * 1024).await;
+        *pair.b.publication_error.lock().unwrap() = Some(error.kind());
+        assert!(pair.sender(id.clone()).await.unwrap().is_err());
+        wait_state(&pair.b, &id, TaskState::Failed).await;
+        pair.b.wait_previous_attempt(&id).await.unwrap();
+        let failed = pair.b.task(id.clone()).await.unwrap();
+        assert_eq!(failed.diagnostic().unwrap().code(), TaskErrorCode::DiskFull);
+        assert!(!failed.receipt_committed());
+        assert!(disk::stage_dir(&failed).unwrap().join("data.part").exists());
+        assert_eq!(pair.b.receive_space.summary().reserved, 0);
+        pair.b.resume(&pair.cb, pair.ia, id.clone()).await.unwrap();
+        wait_state(&pair.b, &id, TaskState::Completed).await;
+        assert_eq!(
+            fs::read(pair.root.join("b-receive/文件.bin")).unwrap(),
+            bytes
+        );
+        pair.shutdown().await;
     }
     #[tokio::test]
     async fn simultaneous_automatic_resume_reuses_the_fresh_sender_attempt() {

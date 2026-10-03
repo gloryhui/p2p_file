@@ -360,6 +360,7 @@ pub fn stage_capability(record: &TaskRecord) -> Result<cap_std::fs::Dir> {
     let peer = super::secure_fs::child(&internal, record.peer_id().as_str(), true)?;
     super::secure_fs::child(&peer, record.task_id().as_str(), true)
 }
+#[cfg(test)]
 pub fn open_download(record: &TaskRecord) -> Result<PartialDownload> {
     let details = record
         .file_details()
@@ -371,6 +372,31 @@ pub fn open_download(record: &TaskRecord) -> Result<PartialDownload> {
         .join(record.peer_id().as_str())
         .join(record.task_id().as_str());
     PartialDownload::create_desktop(&path, dir, details.manifest.clone())
+}
+pub fn open_download_with_space(
+    record: &TaskRecord,
+    budget: &super::space_budget::SpaceBudget,
+    owner: std::sync::Arc<dyn Send + Sync>,
+) -> Result<(PartialDownload, super::space_budget::Reservation)> {
+    let details = record
+        .file_details()
+        .ok_or_else(|| failure("缺少文件任务绑定"))?;
+    let dir = std::sync::Arc::new(stage_capability(record)?);
+    let path = record
+        .local_path()
+        .join(".p2p-desktop")
+        .join(record.peer_id().as_str())
+        .join(record.task_id().as_str());
+    PartialDownload::create_desktop_with_admission(
+        &path,
+        dir.clone(),
+        details.manifest.clone(),
+        |remaining| {
+            let reservation = budget.reserve_file(record, &dir, remaining)?;
+            reservation.keep_alive(owner);
+            Ok(reservation)
+        },
+    )
 }
 pub fn publish(
     store: &mut TaskStore,
@@ -455,6 +481,78 @@ mod tests {
                 )
                 .unwrap();
         }
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn receive_space_rejects_native_cross_filesystem_publication_before_reserving() {
+        let (root, store, record, _) = fixture();
+        let foreign =
+            cap_std::fs::Dir::open_ambient_dir("/dev/shm", cap_std::ambient_authority()).unwrap();
+        let budget = super::super::space_budget::SpaceBudget::default();
+        let error = budget.reserve_file(&record, &foreign, 1).err().unwrap();
+        let Error::Io(error) = error else {
+            panic!("expected typed storage error");
+        };
+        assert!(matches!(
+            error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<super::super::space_budget::SpaceError>(),
+            Some(super::super::space_budget::SpaceError::CrossFilesystem)
+        ));
+        assert_eq!(budget.summary().reserved, 0);
+        drop((store, foreign));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn receive_space_admission_rehashes_durable_chunks_before_any_mutation() {
+        let (root, store, record, bytes) = fixture();
+        let budget = super::super::space_budget::SpaceBudget::default();
+        budget.set_safety_mib(0).unwrap();
+        let overhead = super::super::space_budget::TASK_OVERHEAD;
+        let stage = stage_dir(&record).unwrap();
+        let total = bytes.len() as u64;
+        let chunk = u64::from(MIN_CHUNK_SIZE);
+        let mut partial = open_download(&record).unwrap();
+        partial.write_chunk(0, &bytes[..chunk as usize]).unwrap();
+        drop(partial); // An uncheckpointed chunk must not reduce admission demand.
+        *budget.probe_override.lock().unwrap() = Some(Ok(overhead + total - chunk));
+        assert!(open_download_with_space(&record, &budget, std::sync::Arc::new(())).is_err());
+        let mut partial = open_download(&record).unwrap();
+        partial.write_chunk(0, &bytes[..chunk as usize]).unwrap();
+        partial.checkpoint().unwrap();
+        drop(partial);
+        let (partial, reservation) =
+            open_download_with_space(&record, &budget, std::sync::Arc::new(())).unwrap();
+        assert_eq!(partial.durable_bitmap().count_set(), 1);
+        assert_eq!(budget.summary().reserved, overhead + total - chunk);
+        drop((partial, reservation));
+        // A persisted bit over corrupt bytes gives no credit. Refusal leaves
+        // both the original bitmap and the existing file untouched.
+        let bitmap = fs::read(stage.join("data.bitmap")).unwrap();
+        let part_path = stage.join("data.part");
+        let mut corrupt = bytes.clone();
+        corrupt[0] ^= 1;
+        fs::write(&part_path, &corrupt).unwrap();
+        assert!(open_download_with_space(&record, &budget, std::sync::Arc::new(())).is_err());
+        assert_eq!(fs::read(stage.join("data.bitmap")).unwrap(), bitmap);
+        assert_eq!(fs::read(&part_path).unwrap(), corrupt);
+        // A mismatched length must not be truncated on failed admission.
+        fs::write(&part_path, b"preserve me").unwrap();
+        assert!(open_download_with_space(&record, &budget, std::sync::Arc::new(())).is_err());
+        assert_eq!(fs::read(&part_path).unwrap(), b"preserve me");
+        *budget.probe_override.lock().unwrap() = Some(Err(()));
+        assert!(open_download_with_space(&record, &budget, std::sync::Arc::new(())).is_err());
+        assert_eq!(fs::read(&part_path).unwrap(), b"preserve me");
+        *budget.probe_override.lock().unwrap() = Some(Ok(overhead + total));
+        let (partial, reservation) =
+            open_download_with_space(&record, &budget, std::sync::Arc::new(())).unwrap();
+        assert_eq!(partial.durable_bitmap().count_set(), 0);
+        assert_eq!(fs::metadata(&part_path).unwrap().len(), total);
+        drop((partial, reservation));
+        assert_eq!(budget.summary().reserved, 0);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn published_inode_before_receipt_is_recovered_without_second_publication() {

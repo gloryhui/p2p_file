@@ -321,8 +321,12 @@ pub enum TaskErrorCode {
     NetworkInterrupted,
     ApplicationRestarted,
     StorageUnavailable,
+
     UserCancelled,
     Other,
+    SpaceCheckUnavailable,
+    ReceiveBudgetBusy,
+    FilesystemMismatch,
 }
 
 /// Safe diagnostic classification. Persist only a code and retryability bit,
@@ -361,6 +365,9 @@ impl TaskDiagnostic {
             TaskErrorCode::NetworkInterrupted => "网络连接中断",
             TaskErrorCode::ApplicationRestarted => "应用退出时任务被中断",
             TaskErrorCode::StorageUnavailable => "任务存储不可用",
+            TaskErrorCode::SpaceCheckUnavailable => "接收磁盘空间检查不可用，请手动重试",
+            TaskErrorCode::ReceiveBudgetBusy => "接收空间预算正忙，请稍后手动继续",
+            TaskErrorCode::FilesystemMismatch => "暂存和目标不在同一文件系统，请检查接收目录",
             TaskErrorCode::UserCancelled => "任务已取消",
             TaskErrorCode::Other => "任务失败，详情不可用",
         }
