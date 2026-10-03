@@ -164,7 +164,8 @@ impl NativeTray {
     pub fn anchor(&self) -> Option<(u32, f32, f32)> {
         // NSWindow/NSScreen frames are logical Cocoa coordinates, so mixed DPI
         // never depends on the display hosting the unrelated main window.
-        let native = self.icon.ns_status_item()?.button()?.window()?;
+        let marker = objc2::MainThreadMarker::new()?;
+        let native = self.icon.ns_status_item()?.button(marker)?.window()?;
         let screen = native.screen()?;
         let frame = native.frame();
         let screen_frame = screen.frame();

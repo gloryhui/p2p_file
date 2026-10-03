@@ -30,6 +30,7 @@ gui = [
     "dep:ksni",
     "dep:x11rb",
     "dep:objc2",
+    "dep:objc2-app-kit",
     "dep:windows-sys",
 ]
 
@@ -81,6 +82,7 @@ tray-icon = { version = "=0.24.1", default-features = false, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "=0.6.4", optional = true }
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSScreen"], optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "=0.59.0", features = ["Win32_UI_WindowsAndMessaging", "Win32_System_Registry", "Win32_Security"], optional = true }
