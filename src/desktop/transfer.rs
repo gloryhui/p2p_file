@@ -72,6 +72,8 @@ pub(crate) struct TransferService {
     #[cfg(test)]
     source_cleanup_gate: TestGate,
     #[cfg(test)]
+    resume_admission_gate: TestGate,
+    #[cfg(test)]
     pub(super) publication_error: Arc<Mutex<Option<std::io::ErrorKind>>>,
 }
 #[allow(dead_code)] // T010 consumes these safe domain fields in its task list.
@@ -89,6 +91,7 @@ struct SendMode {
 }
 struct Active {
     peer: NodeId,
+    transport: usize,
     direction: TaskDirection,
     metadata: bool,
     pause: watch::Sender<bool>,
@@ -173,6 +176,8 @@ impl TransferService {
             admission_gate: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             source_cleanup_gate: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            resume_admission_gate: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             publication_error: Arc::new(Mutex::new(None)),
         }
@@ -867,10 +872,52 @@ impl TransferService {
         self.read_store(move |store| store.task(&id).map_err(disk::local_error))
             .await
     }
+    /// Simultaneous recovery requests share a fresh attempt. Never reuse an
+    /// old connection's ending worker, or a cancelled local queue intention.
+    fn automatic_attempt_exists(&self, id: &TaskId, peer: NodeId, transport: usize) -> bool {
+        let queued = self
+            .automatic_sends
+            .lock()
+            .unwrap()
+            .get(id)
+            .is_some_and(|ticket| ticket.peer == peer && !ticket.cancelled());
+        let fresh = self.active.lock().unwrap().get(id).is_some_and(|active| {
+            active.peer == peer
+                && active.direction == TaskDirection::Send
+                && active.transport == transport
+                && !*active.pause.borrow()
+        });
+        (queued || fresh) && self.recovery.lock().unwrap().automatic_allowed(id)
+    }
+    async fn acknowledge_automatic_resume(send: &mut SendStream, id: TaskId) -> Result<()> {
+        protocol::write(
+            send,
+            &Frame {
+                request_id: 1,
+                message: Message::AutomaticResumeTask { task_id: id },
+            },
+        )
+        .await?;
+        send.finish()
+            .map_err(|_| disk::failure("自动恢复回执发送失败"))?;
+        Ok(())
+    }
     async fn wait_previous_attempt(&self, id: &TaskId) -> Result<()> {
+        self.wait_attempt_or_reuse(id, None).await.map(|_| ())
+    }
+    async fn wait_attempt_or_reuse(
+        &self,
+        id: &TaskId,
+        automatic: Option<(NodeId, usize)>,
+    ) -> Result<bool> {
         let mut changed = self.subscribe();
         tokio::time::timeout(PAUSE_TIMEOUT, async {
             loop {
+                if automatic.is_some_and(|(peer, transport)| {
+                    self.automatic_attempt_exists(id, peer, transport)
+                }) {
+                    return Ok(true);
+                }
                 if !self.active.lock().unwrap().contains_key(id)
                     && self
                         .sender_queue
@@ -879,7 +926,7 @@ impl TransferService {
                         .slot_generation(id)
                         .is_none()
                 {
-                    return Ok(());
+                    return Ok(false);
                 }
                 changed
                     .changed()
@@ -897,6 +944,7 @@ impl TransferService {
         direction: TaskDirection,
         metadata: bool,
         send_generation: Option<u64>,
+        transport: usize,
     ) -> Result<(ActiveGuard, watch::Receiver<bool>)> {
         let mut activity = self.activity.lock();
         let mut active = self.active.lock().unwrap();
@@ -942,6 +990,7 @@ impl TransferService {
             id.clone(),
             Active {
                 peer,
+                transport,
                 direction,
                 metadata,
                 pause,
@@ -966,8 +1015,9 @@ impl TransferService {
         peer: NodeId,
         id: &TaskId,
         metadata: bool,
+        transport: usize,
     ) -> Result<(ActiveGuard, watch::Receiver<bool>)> {
-        match self.claim(peer, id, TaskDirection::Receive, metadata, None) {
+        match self.claim(peer, id, TaskDirection::Receive, metadata, None, transport) {
             Ok(claim) => Ok(claim),
             Err(error) => {
                 tokio::time::timeout(
@@ -1221,6 +1271,7 @@ impl TransferService {
             TaskDirection::Send,
             current.directory_details().is_some(),
             Some(generation),
+            connection.stable_id(),
         )?;
         let ticket = self.automatic_sends.lock().unwrap().remove(&id);
         let mode = SendMode {
@@ -1725,20 +1776,38 @@ impl TransferService {
                                     protocol::write(&mut send,&Frame{request_id:1,message:Message::Error{task_id:id.clone(),code}}).await?;
                                     let _=send.finish();return Err(remote_error(code));
                                 }
-                                service.wait_previous_attempt(&id).await?;
+                                if service.wait_attempt_or_reuse(&id, automatic.then_some((peer,connection.stable_id()))).await? {
+                                    return Self::acknowledge_automatic_resume(&mut send,id).await;
+                                }
+                                #[cfg(test)]
+                                if automatic {
+                                    let gate = service.resume_admission_gate.lock().unwrap().take();
+                                    if let Some((reached, release)) = gate {
+                                        let _ = reached.send(());
+                                        let _ = release.await;
+                                    }
+                                }
                                 let slot=match service.reserve_send(peer,id.clone()).await {
                                     Ok(slot)=>slot,
-                                    Err(error)=> {protocol::write(&mut send,&Frame{request_id:1,message:Message::Error{task_id:id.clone(),code:ErrorCode::Busy}}).await?;let _=send.finish();return Err(error);}
+                                    Err(error)=> {
+                                        // An executor may claim its fair-queue slot while the
+                                        // store read for reserve_send yields. Recheck that race.
+                                        if automatic && service.automatic_attempt_exists(&id,peer,connection.stable_id()) {
+                                            return Self::acknowledge_automatic_resume(&mut send,id).await;
+                                        }
+                                        protocol::write(&mut send,&Frame{request_id:1,message:Message::Error{task_id:id.clone(),code:ErrorCode::Busy}}).await?;let _=send.finish();return Err(error);
+                                    }
                                 };
                                 let metadata=checked.as_ref().unwrap().directory_details().is_some();
-                                let (_guard,pause)=match service.claim(peer,&id,TaskDirection::Send,metadata,Some(slot.generation)) {
+                                let (_guard,pause)=match service.claim(peer,&id,TaskDirection::Send,metadata,Some(slot.generation),connection.stable_id()) {
                                     Ok(claim)=>claim,
                                     Err(error)=> {
                                         protocol::write(&mut send,&Frame{request_id:1,message:Message::Error{task_id:id.clone(),code:ErrorCode::Busy}}).await?;
                                         let _=send.finish();return Err(error);
                                     }
                                 };
-                                let result=authorization.guard(false, service.send_inner(&connection,peer,&id,pause,Some(&mut send),SendMode {automatic,ticket:None})).await;
+                                let ticket = service.automatic_sends.lock().unwrap().remove(&id);
+                                let result=authorization.guard(false, service.send_inner(&connection,peer,&id,pause,Some(&mut send),SendMode {automatic,ticket})).await;
                                 if let Err(error)=&result {
                                     let _=protocol::write(&mut send,&Frame{request_id:1,message:Message::Error{task_id:id.clone(),code:error_code(error)}}).await;
                                     let _=send.finish();service.finish_error(&id,error,&connection).await;
@@ -1874,7 +1943,9 @@ impl TransferService {
             let _ = send.finish();
             return Err(error);
         }
-        let (_guard, pause) = self.claim_receive(&mut send, peer, &task_id, false).await?;
+        let (_guard, pause) = self
+            .claim_receive(&mut send, peer, &task_id, false, connection.stable_id())
+            .await?;
         let mut io = TaskIo::new(send, recv, peer, task_id.clone(), self.frame_budget.clone());
         io.observe(&first)?;
         drop(first);
@@ -1960,7 +2031,9 @@ impl TransferService {
         else {
             return Err(disk::failure("目录 Offer 非法"));
         };
-        let (_guard, _pause) = self.claim_receive(&mut send, peer, &task_id, true).await?;
+        let (_guard, _pause) = self
+            .claim_receive(&mut send, peer, &task_id, true, connection.stable_id())
+            .await?;
         let mut io = TaskIo::new(send, recv, peer, task_id.clone(), self.frame_budget.clone());
         io.observe(&first)?;
         drop(first);
@@ -2743,6 +2816,117 @@ mod tests {
             *self.b.first_chunk_gate.lock().unwrap() = Some((reached_tx, release_rx));
             (reached, release)
         }
+    }
+    #[tokio::test]
+    async fn simultaneous_automatic_resume_reuses_the_fresh_sender_attempt() {
+        let mut pair = Pair::new().await;
+        pair.a.set_auto_resume(true);
+        pair.b.set_auto_resume(true);
+        let (id, bytes) = pair.select(4 * 1024 * 1024).await;
+        let (reached, _release) = pair.gate();
+        let sender = pair.sender(id.clone());
+        reached.await.unwrap();
+        pair.a.network_lost(pair.ib);
+        pair.b.network_lost(pair.ia);
+        pair.ca.close(0u32.into(), b"fixture loss");
+        assert!(sender.await.unwrap().is_err());
+        pair.cb.closed().await;
+        while pair.tasks.join_next().await.is_some() {}
+        pair.a.settle_network_loss(pair.ib).await.unwrap();
+        pair.b.settle_network_loss(pair.ia).await.unwrap();
+        let lost_transport = pair.ca.stable_id();
+        pair.reconnect().await;
+        let (admitted_tx, admitted) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        *pair.a.resume_admission_gate.lock().unwrap() = Some((admitted_tx, release_rx));
+        let ticket = pair
+            .b
+            .recovery
+            .lock()
+            .unwrap()
+            .due(
+                Instant::now() + Duration::from_secs(5),
+                |_, _| true,
+                |_| false,
+            )
+            .1
+            .pop()
+            .unwrap();
+        let service = pair.b.clone();
+        let connection = pair.cb.clone();
+        let request = tokio::spawn(async move { service.auto_recover(&connection, ticket).await });
+        tokio::time::timeout(Duration::from_secs(5), admitted)
+            .await
+            .unwrap()
+            .unwrap();
+        let ticket = pair
+            .a
+            .recovery
+            .lock()
+            .unwrap()
+            .due(
+                Instant::now() + Duration::from_secs(5),
+                |_, _| true,
+                |_| false,
+            )
+            .1
+            .pop()
+            .unwrap();
+        pair.a.auto_recover(&pair.ca, ticket).await.unwrap();
+        let (reached, finish) = pair.gate();
+        let scheduled = pair
+            .a
+            .dispatch_ready(&HashMap::from([(pair.ib, pair.ca.clone())]))
+            .pop()
+            .unwrap();
+        let service = pair.a.clone();
+        let connection = pair.ca.clone();
+        let sender =
+            tokio::spawn(async move { service.execute_queued(scheduled, connection).await });
+        tokio::time::timeout(Duration::from_secs(5), reached)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            pair.a
+                .automatic_attempt_exists(&id, pair.ib, pair.ca.stable_id())
+        );
+        assert!(
+            !pair
+                .a
+                .automatic_attempt_exists(&id, pair.ib, lost_transport)
+        );
+        assert!(
+            !pair
+                .a
+                .automatic_attempt_exists(&id, pair.ia, pair.ca.stable_id())
+        );
+        release.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_ok(),
+            "fresh active sender must be reused: {result:?}"
+        );
+        assert_eq!(
+            pair.b.task(id.clone()).await.unwrap().state(),
+            TaskState::Transferring
+        );
+        finish.send(()).unwrap();
+        sender.await.unwrap().unwrap();
+        wait_state(&pair.b, &id, TaskState::Completed).await;
+        assert_eq!(
+            pair.a.task(id.clone()).await.unwrap().state(),
+            TaskState::Completed
+        );
+        assert_eq!(
+            fs::read(pair.root.join("b-receive/文件.bin")).unwrap(),
+            bytes
+        );
+        assert!(pair.a.automatic_sends.lock().unwrap().is_empty());
+        pair.shutdown().await;
     }
     #[tokio::test]
     async fn cancelled_or_expired_receive_rpc_leaves_a_manually_recoverable_task() {
@@ -3921,6 +4105,7 @@ mod tests {
                         TaskDirection::Receive,
                         false,
                         None,
+                        pair.cb.stable_id(),
                     )
                     .unwrap(),
             );
@@ -3934,6 +4119,7 @@ mod tests {
                 TaskDirection::Receive,
                 true,
                 None,
+                pair.cb.stable_id(),
             )
             .unwrap();
         assert!(
@@ -3943,7 +4129,8 @@ mod tests {
                     &TaskId::generate(),
                     TaskDirection::Receive,
                     false,
-                    None
+                    None,
+                    pair.cb.stable_id(),
                 )
                 .is_err()
         );
