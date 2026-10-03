@@ -122,19 +122,22 @@ impl TaskRow {
         self.can_delete_file
     }
     pub fn state_label(&self) -> &'static str {
-        match self.state {
-            TaskState::Scanning => "扫描中",
-            TaskState::Queued => "排队中",
-            TaskState::Connecting => "连接中",
-            TaskState::Negotiating => "协商中",
-            TaskState::Transferring => "传输中",
-            TaskState::Pausing => "正在暂停",
-            TaskState::Paused => "已暂停",
-            TaskState::Finalizing => "正在发布确认",
-            TaskState::Completed => "已完成",
-            TaskState::Interrupted => "中断待继续",
-            TaskState::Failed => "失败",
-        }
+        state_label(self.state)
+    }
+}
+pub(super) fn state_label(state: TaskState) -> &'static str {
+    match state {
+        TaskState::Scanning => "扫描中",
+        TaskState::Queued => "排队中",
+        TaskState::Connecting => "连接中",
+        TaskState::Negotiating => "协商中",
+        TaskState::Transferring => "传输中",
+        TaskState::Pausing => "正在暂停",
+        TaskState::Paused => "已暂停",
+        TaskState::Finalizing => "正在发布确认",
+        TaskState::Completed => "已完成",
+        TaskState::Interrupted => "中断待继续",
+        TaskState::Failed => "失败",
     }
 }
 #[derive(Clone, Debug)]
@@ -142,6 +145,7 @@ pub(super) struct GroupRow {
     pub id: TaskId,
     pub name: String,
     pub children: usize,
+    pub matched: usize,
     pub complete: usize,
     pub failures: usize,
     pub total: u64,
@@ -156,10 +160,17 @@ impl GroupRow {
         } else {
             "进行中"
         };
-        format!(
+        let mut label = format!(
             "{} · {state} · {}/{} 项 · {} / {} 字节",
             self.name, self.complete, self.children, self.confirmed, self.total
-        )
+        );
+        if self.matched < self.children {
+            label.push_str(&format!(
+                " · 筛选命中 {}/{} 项",
+                self.matched, self.children
+            ));
+        }
+        label
     }
 }
 #[derive(Clone, Debug)]
@@ -174,6 +185,14 @@ pub(super) struct Snapshot {
 }
 impl Snapshot {
     pub fn list(&self, expanded: &HashSet<TaskId>) -> Vec<ListRow> {
+        self.filtered_list(expanded, &TaskFilter::default(), &[])
+    }
+    pub fn filtered_list(
+        &self,
+        expanded: &HashSet<TaskId>,
+        filter: &TaskFilter,
+        devices: &[super::trusted_devices::TrustedDevice],
+    ) -> Vec<ListRow> {
         let mut groups: HashMap<TaskId, GroupRow> = HashMap::new();
         for t in &self.tasks {
             if let Some(id) = &t.group {
@@ -181,12 +200,14 @@ impl Snapshot {
                     id: id.clone(),
                     name: t.name.split('/').next().unwrap_or(&t.name).to_owned(),
                     children: 0,
+                    matched: 0,
                     complete: 0,
                     failures: 0,
                     total: 0,
                     confirmed: 0,
                 });
                 g.children += 1;
+                g.matched += usize::from(filter.matches(t, devices));
                 g.complete += usize::from(t.state == TaskState::Completed);
                 g.failures += usize::from(matches!(
                     t.state,
@@ -199,17 +220,64 @@ impl Snapshot {
         let mut seen = HashSet::new();
         let mut rows = Vec::new();
         for t in &self.tasks {
+            if !filter.matches(t, devices) {
+                continue;
+            }
             if let Some(id) = &t.group {
                 if seen.insert(id.clone()) {
                     rows.push(ListRow::Group(groups[id].clone()));
                 }
-                if !expanded.contains(id) {
+                if !filter.active() && !expanded.contains(id) {
                     continue;
                 }
             }
             rows.push(ListRow::Task(t.clone()));
         }
         rows
+    }
+}
+
+#[derive(Clone, Default)]
+pub(super) struct TaskFilter {
+    pub query: String,
+    pub peer: Option<NodeId>,
+    pub direction: Option<TaskDirection>,
+    pub state: Option<TaskState>,
+}
+impl TaskFilter {
+    pub fn active(&self) -> bool {
+        !self.query.trim().is_empty()
+            || self.peer.is_some()
+            || self.direction.is_some()
+            || self.state.is_some()
+    }
+    pub fn matches(
+        &self,
+        row: &TaskRow,
+        devices: &[super::trusted_devices::TrustedDevice],
+    ) -> bool {
+        if self.peer.is_some_and(|p| p != row.peer)
+            || self.direction.is_some_and(|d| d != row.direction)
+            || self.state.is_some_and(|s| s != row.state)
+        {
+            return false;
+        }
+        let alias = devices
+            .iter()
+            .find(|d| d.node_id == row.peer.to_hex())
+            .map_or("", |d| d.display_name.as_str());
+        let text = format!(
+            "{} {} {} {}",
+            row.name,
+            row.peer.to_hex(),
+            row.peer.short(),
+            alias
+        )
+        .to_lowercase();
+        self.query
+            .to_lowercase()
+            .split_whitespace()
+            .all(|word| text.contains(word))
     }
 }
 #[derive(Clone)]
@@ -292,6 +360,80 @@ pub(super) fn can_trust_peer(
 mod tests {
     use super::super::protocol::SpeedDirection;
     use super::*;
+    #[test]
+    fn combined_filters_show_matching_children_with_whole_group_truth() {
+        let peer = crate::identity::Identity::generate().node_id();
+        let group = TaskId::generate();
+        let first = TaskRow {
+            id: TaskId::generate(),
+            group: Some(group),
+            name: "Folder/文档.TXT".into(),
+            peer,
+            direction: TaskDirection::Receive,
+            state: TaskState::Completed,
+            total: 10,
+            confirmed: 10,
+            rate: 0.,
+            diagnostic: None,
+            retryable: false,
+            can_delete_file: false,
+        };
+        let mut second = first.clone();
+        second.id = TaskId::generate();
+        second.name = "Folder/other.bin".into();
+        second.state = TaskState::Paused;
+        second.confirmed = 2;
+        let mut other = first.clone();
+        other.id = TaskId::generate();
+        other.group = None;
+        other.peer = crate::identity::Identity::generate().node_id();
+        let view = Snapshot {
+            tasks: vec![first.clone(), second, other],
+            queue: super::super::queue::TaskQueue::default().metrics(),
+            speeds: HashMap::new(),
+        };
+        let devices = [super::super::trusted_devices::TrustedDevice::new(
+            peer,
+            "Office Mac".into(),
+            None,
+        )];
+        let mut filter = TaskFilter {
+            query: "txt OFFICE".into(),
+            peer: Some(peer),
+            direction: Some(TaskDirection::Receive),
+            state: Some(TaskState::Completed),
+        };
+        let rows = view.filtered_list(&HashSet::new(), &filter, &devices);
+        assert_eq!(rows.len(), 2); // Filtering exposes matches even in collapsed groups.
+        let ListRow::Group(group) = &rows[0] else {
+            panic!()
+        };
+        assert_eq!(
+            (
+                group.children,
+                group.matched,
+                group.complete,
+                group.confirmed,
+                group.total
+            ),
+            (2, 1, 1, 12, 20)
+        );
+        assert!(group.label().contains("进行中"));
+        assert!(group.label().contains("筛选命中 1/2"));
+        assert!(matches!(&rows[1], ListRow::Task(t) if t.id == first.id));
+        filter.direction = Some(TaskDirection::Send);
+        assert!(
+            view.filtered_list(&HashSet::new(), &filter, &devices)
+                .is_empty()
+        );
+        filter = TaskFilter::default();
+        assert!(!filter.active());
+        assert_eq!(
+            view.filtered_list(&HashSet::new(), &filter, &devices).len(),
+            2
+        );
+        assert_eq!(view.tasks.len(), 3); // Projection never changes source state.
+    }
     #[test]
     fn speed_delta_staleness_restart_cancel_and_disconnect_are_truthful() {
         let peer = crate::identity::Identity::generate().node_id();

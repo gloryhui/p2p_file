@@ -1022,6 +1022,9 @@ struct DesktopShell {
     tunnel_last_errors: HashMap<String, String>,
     task_rows: Vec<ui_model::ListRow>,
     task_snapshot: Vec<ui_model::TaskRow>,
+    task_search: Entity<TextField>,
+    task_filter: ui_model::TaskFilter,
+    clearing_history: bool,
     outcome_alerts: notifications::OutcomeAlerts,
     native_alerts: notifications::NativeAlerts,
     notification_note: SharedString,
@@ -1117,7 +1120,11 @@ impl DesktopShell {
                 self.peer_id.clone(),
             ]
         } else {
-            vec![self.peer_id.clone(), self.peer_password.clone()]
+            vec![
+                self.peer_id.clone(),
+                self.peer_password.clone(),
+                self.task_search.clone(),
+            ]
         };
         let current = fields
             .iter()
@@ -1170,7 +1177,7 @@ impl DesktopShell {
         } else {
             self.expanded_groups.extend(groups);
         }
-        cx.notify();
+        self.refresh_task_rows(cx);
     }
     fn observe_tasks(&mut self, cx: &mut Context<Self>) {
         let Some(service) = self.transfer_service.clone() else {
@@ -1227,8 +1234,8 @@ impl DesktopShell {
                                 ) {
                                     shell.native_alerts.show(notice);
                                 }
-                                shell.task_rows = snapshot.list(&shell.expanded_groups);
                                 shell.task_snapshot = snapshot.tasks.clone();
+                                shell.refresh_task_rows(cx);
                                 for event in shell.native_alerts.poll() {
                                     match event {
                                         notifications::AlertEvent::Open(id) => {
@@ -1465,6 +1472,218 @@ impl DesktopShell {
         })
         .detach();
     }
+    fn refresh_task_rows(&mut self, cx: &mut Context<Self>) {
+        let snapshot = ui_model::Snapshot {
+            tasks: self.task_snapshot.clone(),
+            queue: queue::TaskQueue::default().metrics(),
+            speeds: HashMap::new(),
+        };
+        self.task_rows = snapshot.filtered_list(
+            &self.expanded_groups,
+            &self.task_filter,
+            &self.settings.trusted_devices,
+        );
+        if self.selected_task.as_ref().is_some_and(|id| {
+            !self
+                .task_rows
+                .iter()
+                .any(|r| matches!(r, ui_model::ListRow::Task(t) if &t.id == id))
+        }) {
+            self.selected_task = None;
+        }
+        cx.notify();
+    }
+    fn reset_task_filters(&mut self, cx: &mut Context<Self>) {
+        self.task_filter = Default::default();
+        Self::set_text_field(&self.task_search, "", cx);
+        self.refresh_task_rows(cx);
+    }
+    fn task_filter_toolbar(&self, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
+        use task_model::{TaskDirection, TaskState};
+        let directions = [
+            None,
+            Some(TaskDirection::Send),
+            Some(TaskDirection::Receive),
+        ];
+        let states = [
+            None,
+            Some(TaskState::Completed),
+            Some(TaskState::Failed),
+            Some(TaskState::Interrupted),
+            Some(TaskState::Paused),
+            Some(TaskState::Transferring),
+            Some(TaskState::Queued),
+            Some(TaskState::Connecting),
+            Some(TaskState::Negotiating),
+            Some(TaskState::Pausing),
+            Some(TaskState::Finalizing),
+            Some(TaskState::Scanning),
+        ];
+        let direction = match self.task_filter.direction {
+            None => "全部方向",
+            Some(TaskDirection::Send) => "发送",
+            Some(TaskDirection::Receive) => "接收",
+        };
+        let state = self
+            .task_filter
+            .state
+            .map_or("全部状态", ui_model::state_label);
+        let peer = self.task_filter.peer.map_or("全部设备".to_owned(), |peer| {
+            format!("设备 {}", peer.short())
+        });
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Self::compact_text_field_frame(
+                        &self.task_search,
+                        window,
+                        cx,
+                    )),
+            )
+            .child(
+                ui_components::compact_secondary_button(peer, true).on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|shell, _, _, cx| {
+                        let mut peers: Vec<_> =
+                            shell.task_snapshot.iter().map(|t| t.peer).collect();
+                        peers.sort_by_key(|p| p.to_hex());
+                        peers.dedup();
+                        let next = shell
+                            .task_filter
+                            .peer
+                            .and_then(|p| peers.iter().position(|v| *v == p))
+                            .map_or(0, |i| i + 1);
+                        shell.task_filter.peer = peers.get(next).copied();
+                        shell.refresh_task_rows(cx);
+                    }),
+                ),
+            )
+            .child(
+                ui_components::compact_secondary_button(direction, true).on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |shell, _, _, cx| {
+                        let next = directions
+                            .iter()
+                            .position(|d| *d == shell.task_filter.direction)
+                            .unwrap_or(0)
+                            + 1;
+                        shell.task_filter.direction = directions[next % directions.len()];
+                        shell.refresh_task_rows(cx);
+                    }),
+                ),
+            )
+            .child(
+                ui_components::compact_secondary_button(state, true).on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |shell, _, _, cx| {
+                        let next = states
+                            .iter()
+                            .position(|s| *s == shell.task_filter.state)
+                            .unwrap_or(0)
+                            + 1;
+                        shell.task_filter.state = states[next % states.len()];
+                        shell.refresh_task_rows(cx);
+                    }),
+                ),
+            )
+            .child(
+                ui_components::compact_secondary_button("重置", self.task_filter.active())
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|shell, _, _, cx| shell.reset_task_filters(cx)),
+                    ),
+            )
+            .child(
+                ui_components::compact_secondary_button(
+                    "清理完成历史",
+                    !self.clearing_history && self.transfer_service.is_some(),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(Self::clear_completed_history),
+                ),
+            )
+    }
+    fn clear_completed_history(
+        &mut self,
+        _: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.clearing_history {
+            return;
+        }
+        let ids: std::collections::BTreeSet<_> = self
+            .task_snapshot
+            .iter()
+            .filter(|t| {
+                t.state == task_model::TaskState::Completed
+                    && self.task_filter.matches(t, &self.settings.trusted_devices)
+            })
+            .map(|t| t.id.clone())
+            .collect();
+        if ids.is_empty() {
+            self.set_status("当前筛选内没有已完成记录", cx);
+            return;
+        }
+        let Some(service) = self.transfer_service.clone() else {
+            return;
+        };
+        let detail = format!(
+            "清理当前筛选内最多 {} 条已完成记录。传输文件保留；未完成、仍活动或未被完整选中的目录组保留。历史记录清理后无法恢复。",
+            ids.len()
+        );
+        let confirmation = window.prompt(
+            PromptLevel::Warning,
+            "清理已完成历史？",
+            Some(&detail),
+            &[PromptButton::cancel("取消"), PromptButton::ok("清理记录")],
+            cx,
+        );
+        self.clearing_history = true;
+        cx.notify();
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |shell, cx| {
+            let result = if confirmation.await.ok() == Some(1) {
+                Some(
+                    executor
+                        .spawn(async move { service.remove_completed_history(ids) })
+                        .await,
+                )
+            } else {
+                None
+            };
+            let _ = shell.update(cx, move |shell, cx| {
+                shell.clearing_history = false;
+                match result {
+                    Some(Ok(removed)) => {
+                        if shell
+                            .selected_task
+                            .as_ref()
+                            .is_some_and(|id| removed.contains(id))
+                        {
+                            shell.selected_task = None;
+                        }
+                        shell.set_status(
+                            format!(
+                                "已清理 {} 条完成历史；传输文件保留，未满足条件的目录组保留",
+                                removed.len()
+                            ),
+                            cx,
+                        );
+                    }
+                    Some(Err(error)) => shell.set_status(format!("历史清理未完成：{error}"), cx),
+                    None => cx.notify(),
+                }
+            });
+        })
+        .detach();
+    }
     fn confirm_delete_received_file(
         &mut self,
         id: task_model::TaskId,
@@ -1516,7 +1735,8 @@ impl DesktopShell {
         let row = self.task_rows[index].clone();
         match row {
             ui_model::ListRow::Group(group) => {
-                let expanded = self.expanded_groups.contains(&group.id);
+                let expanded =
+                    self.task_filter.active() || self.expanded_groups.contains(&group.id);
                 let id = group.id.clone();
                 div()
                     .w_full()
@@ -1569,7 +1789,7 @@ impl DesktopShell {
                             if !shell.expanded_groups.remove(&id) {
                                 shell.expanded_groups.insert(id.clone());
                             }
-                            cx.notify();
+                            shell.refresh_task_rows(cx);
                         }),
                     )
             }
@@ -3486,6 +3706,8 @@ impl DesktopShell {
     }
     fn focus_notified_task(&mut self, id: task_model::TaskId, cx: &mut Context<Self>) {
         self.close_settings_home(cx);
+        self.task_filter = Default::default();
+        Self::set_text_field(&self.task_search, "", cx);
         if let Some(task) = self.task_snapshot.iter().find(|task| task.id == id)
             && let Some(group) = &task.group
         {
@@ -3745,7 +3967,16 @@ impl DesktopShell {
                             .text_xs()
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(rgb(ui_theme::TEXT))
-                            .child(format!("传输列表（{} 个任务）", self.task_rows.len())),
+                            .child(format!(
+                                "任务 {}/{}",
+                                self.task_snapshot
+                                    .iter()
+                                    .filter(|t| self
+                                        .task_filter
+                                        .matches(t, &self.settings.trusted_devices))
+                                    .count(),
+                                self.task_snapshot.len()
+                            )),
                     ),
             );
 
@@ -3770,9 +4001,17 @@ impl DesktopShell {
                         .text_sm()
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(rgb(ui_theme::TEXT))
-                        .child("暂无传输任务"),
+                        .child(if self.task_filter.active() {
+                            "没有匹配的任务"
+                        } else {
+                            "暂无传输任务"
+                        }),
                 )
-                .child(div().text_xs().child("连接设备后选择文件或文件夹开始传输"))
+                .child(div().text_xs().child(if self.task_filter.active() {
+                    "调整筛选条件或点击重置"
+                } else {
+                    "连接设备后选择文件或文件夹开始传输"
+                }))
                 .into_any_element()
         } else {
             gpui::uniform_list(
@@ -3816,6 +4055,7 @@ impl DesktopShell {
                     ),
             )
             .child(transfer_toolbar)
+            .child(self.task_filter_toolbar(window, cx))
             .child(
                 div()
                     .w_full()
@@ -5146,7 +5386,18 @@ pub fn run(background_start: bool) {
                 });
                 let trusted_name = cx.new(|cx| TextField::new(cx, "本地设备备注"));
                 let tunnel_target = cx.new(|cx| TextField::new(cx, "127.0.0.1:22"));
+                let task_search = cx.new(|cx| TextField::new(cx, "搜索文件名或设备备注 / ID"));
                 cx.new(|cx| {
+                    cx.observe(
+                        &task_search,
+                        |shell: &mut DesktopShell,
+                         input: Entity<TextField>,
+                         cx: &mut Context<DesktopShell>| {
+                            shell.task_filter.query = input.read(cx).content.to_string();
+                            shell.refresh_task_rows(cx);
+                        },
+                    )
+                    .detach();
                     cx.observe(
                         &concurrency_input,
                         |shell: &mut DesktopShell,
@@ -5214,6 +5465,9 @@ pub fn run(background_start: bool) {
                         tunnel_last_errors: HashMap::new(),
                         task_rows: Vec::new(),
                         task_snapshot: Vec::new(),
+                        task_search,
+                        task_filter: Default::default(),
+                        clearing_history: false,
                         outcome_alerts: Default::default(),
                         native_alerts: notifications::NativeAlerts::new(initial_notifications),
                         notification_note: if initial_notifications {

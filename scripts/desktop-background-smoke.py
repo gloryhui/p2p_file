@@ -143,6 +143,13 @@ def main():
             menu.Event(node[0], "clicked", dbus.String(""), dbus.UInt32(0), dbus_interface="com.canonical.dbusmenu")
         command("xdotool", "windowactivate", "--sync", window)
         (output / "main-window-properties.txt").write_text(command("xprop", "-id", window))
+        if shutil.which("import"):
+            # This fresh fixture starts on the first-password settings page.
+            geometry = dict(line.split("=", 1) for line in command("xdotool", "getwindowgeometry", "--shell", window).splitlines())
+            command("xdotool", "mousemove", "--window", window, str(int(geometry["WIDTH"]) - 80), "48")
+            command("xdotool", "click", "1")
+            time.sleep(0.3)
+            command("import", "-window", window, str(output / "main-window.png"))
         command("xdotool", "key", "alt+F4")
         wait_for(lambda: not mapped(window))
         assert app.poll() is None
