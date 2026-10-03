@@ -408,6 +408,22 @@ impl DesktopSessionHandle {
     pub fn shutdown(&self) {
         let _ = self.lifetime.stop.send(true);
     }
+
+    /// Wait off the UI thread for structured task cleanup and durable checkpoints.
+    pub(super) fn shutdown_and_wait(&self) {
+        self.shutdown();
+        if self
+            .lifetime
+            .done
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .is_ok()
+            && let Some(thread) = self.lifetime.thread.lock().unwrap().take()
+        {
+            let _ = thread.join();
+        }
+    }
 }
 
 #[derive(Clone)]

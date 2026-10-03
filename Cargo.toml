@@ -25,6 +25,12 @@ gui = [
     "dep:gpui",
     "dep:serde_json",
     "dep:unicode-segmentation",
+    "dep:raw-window-handle",
+    "dep:tray-icon",
+    "dep:ksni",
+    "dep:x11rb",
+    "dep:objc2",
+    "dep:windows-sys",
 ]
 
 [dependencies]
@@ -56,6 +62,7 @@ serde_json = { version = "=1.0.151", optional = true }
 unicode-segmentation = { version = "1.13.3", optional = true }
 cap-std = { version = "=3.4.6", optional = true }
 cap-fs-ext = { version = "=3.4.6", optional = true }
+raw-window-handle = { version = "=0.6.2", optional = true }
 unicode-normalization = { version = "=0.1.25", optional = true }
 
 [build-dependencies]
@@ -68,3 +75,16 @@ required-features = ["gui"]
 
 [target."cfg(unix)".dependencies]
 rustix = { version = "=1.1.5", features = ["fs"], optional = true }
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+tray-icon = { version = "=0.24.1", default-features = false, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "=0.6.4", optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "=0.59.0", features = ["Win32_UI_WindowsAndMessaging", "Win32_System_Registry", "Win32_Security"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "=0.3.2", features = ["blocking"], optional = true }
+x11rb = { version = "=0.13.2", optional = true }

@@ -30,7 +30,7 @@ binding → Desktop 能力协商 → Remote Auth → 发布业务连接。CLI �
 
 ## 持久化与撤销
 
-私有 Desktop 配置升级为 schema v5，保留 v1–v4 迁移。可信记录包含完整规范 NodeId、
+Trusted Device 引入 schema v5；当前后台运行配置使用 schema v6，保留 v1–v5 迁移。可信记录包含完整规范 NodeId、
 本地名称、可选历史 Short ID 和时间；拒绝重复身份及损坏配置。沿用原子替换、Unix
 私有权限、AppData 目录和 symlink/reparse point 拒绝策略，不保存对端密码。
 

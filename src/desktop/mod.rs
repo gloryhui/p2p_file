@@ -9,6 +9,8 @@
 //! MIT-licensed application code. See docs/gpui-mvp/THIRD_PARTY_NOTICES.md.
 
 mod activity;
+mod autostart;
+mod background;
 pub(in crate::desktop) mod config;
 #[cfg(test)]
 mod e2e;
@@ -34,6 +36,7 @@ mod task_recovery;
 mod task_store;
 mod transfer;
 mod transfer_files;
+mod tray;
 mod trusted_devices;
 mod tunnel;
 mod ui;
@@ -1003,6 +1006,8 @@ struct DesktopShell {
     transfer_service: Option<transfer::TransferService>,
     network_session: Option<session::DesktopSessionHandle>,
     network_status: SharedString,
+    signal_state: background::SignalState,
+    background_files: (usize, usize, u64),
     network_path_status: SharedString,
     peer_path_status: HashMap<NodeId, (u64, String)>,
     peer_status: SharedString,
@@ -1185,6 +1190,28 @@ impl DesktopShell {
                                     }
                                 )
                                 .into();
+                                shell.background_files = (
+                                    snapshot
+                                        .tasks
+                                        .iter()
+                                        .filter(|task| {
+                                            task.state == task_model::TaskState::Transferring
+                                        })
+                                        .count(),
+                                    snapshot
+                                        .tasks
+                                        .iter()
+                                        .filter(|task| task.state == task_model::TaskState::Queued)
+                                        .count(),
+                                    snapshot
+                                        .tasks
+                                        .iter()
+                                        .filter(|task| {
+                                            task.state == task_model::TaskState::Transferring
+                                        })
+                                        .map(|task| task.rate.max(0.) as u64)
+                                        .sum(),
+                                );
                                 shell.task_rows = snapshot.list(&shell.expanded_groups);
                                 shell.speed_views.update(snapshot.speeds, Instant::now());
                                 if shell
@@ -2147,6 +2174,7 @@ impl DesktopShell {
                                         if ui_model::project_peer_path(&mut shell.peer_path_status, &shell.peer_generations, peer, generation, detail) { cx.notify(); }
                                     }
                                     session::SessionEvent::Lifecycle(lifecycle) => {
+                                        shell.signal_state.apply(&lifecycle);
                                         let label = lifecycle.label();
                                         if matches!(lifecycle,
                                             network_state::NetworkLifecycle::Unconfigured
@@ -3349,6 +3377,7 @@ impl DesktopShell {
             )
             .child(self.remote_password_card(window, cx))
             .child(self.trusted_devices_card(window, cx))
+            .child(self.background_card(cx))
             .child(self.advanced_network_card(window, cx))
     }
 
@@ -4745,7 +4774,7 @@ impl Render for DesktopShell {
 }
 
 /// Start the native GPUI application.
-pub fn run() {
+pub fn run(background_start: bool) {
     let startup = match DesktopStartup::load() {
         Ok(startup) => startup,
         Err(error) => {
@@ -4754,7 +4783,9 @@ pub fn run() {
         }
     };
 
-    Application::new().run(move |cx: &mut App| {
+    let application = Application::new();
+    application.on_reopen(background::reopen);
+    application.run(move |cx: &mut App| {
         cx.bind_keys([
             KeyBinding::new("backspace", Backspace, None),
             KeyBinding::new("delete", Delete, None),
@@ -4959,6 +4990,12 @@ pub fn run() {
                         transfer_service,
                         network_session: None,
                         network_status: initial_network_status.into(),
+                        signal_state: if has_saved_network_config {
+                            background::SignalState::Connecting
+                        } else {
+                            background::SignalState::Offline
+                        },
+                        background_files: (0, 0, 0),
                         network_path_status: "UDP 地址族尚未准备".into(),
                         peer_path_status: HashMap::new(),
                         peer_status: "尚未连接对端".into(),
@@ -5006,7 +5043,8 @@ pub fn run() {
                         }
                     })
                     .expect("新建 GPUI 窗口后初始化焦点失败");
-                cx.on_action(|_: &Quit, cx| cx.quit());
+                background::install(window, cx, background_start);
+                cx.on_action(|_: &Quit, cx| background::request_quit(cx));
             }
             Err(error) => {
                 eprintln!("打开 GPUI 窗口失败：{error}");
