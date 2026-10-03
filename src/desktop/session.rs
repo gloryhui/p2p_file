@@ -566,6 +566,8 @@ enum SessionCommand {
         tunnel_rules: Vec<super::config::TunnelRule>,
     },
     #[cfg(test)]
+    TestNetworkLoss(NodeId, oneshot::Sender<()>),
+    #[cfg(test)]
     InspectDeferred(NodeId, oneshot::Sender<Option<PunchToken>>),
     #[cfg(test)]
     Inspect(oneshot::Sender<HashMap<NodeId, (u64, quinn::Connection)>>),
@@ -621,6 +623,7 @@ enum SessionInput {
         peer: NodeId,
         generation: u64,
         detail: String,
+        network_interruption: bool,
     },
 }
 
@@ -853,6 +856,8 @@ async fn run_session(
     let mut reconnect_attempt = 0u32;
     let mut session_shutdown = false;
     let mut maintenance = time::interval(Duration::from_secs(1));
+    #[cfg(test)]
+    let mut test_network_losses = HashSet::new();
 
     start_signal_connect(
         &identity,
@@ -970,6 +975,19 @@ async fn run_session(
             continue;
         }
         match wake {
+            #[cfg(test)]
+            Wake::Command(Some(SessionCommand::TestNetworkLoss(peer, done))) => {
+                if let Some(generation) = peers.generation(peer) {
+                    test_network_losses.insert((peer, generation));
+                }
+                if let Some(service) = config.transfer.clone() {
+                    service.network_lost(peer);
+                    peer_tasks.spawn(async move {
+                        let _ = service.settle_network_loss(peer).await;
+                    });
+                }
+                let _ = done.send(());
+            }
             #[cfg(test)]
             Wake::Command(Some(SessionCommand::InspectDeferred(peer, reply))) => {
                 let _ = reply.send(deferred_candidates.get(&peer).map(|(_, token)| *token));
@@ -1387,6 +1405,9 @@ async fn run_session(
                                     .get(&peer)
                                     .is_some_and(|(_, c)| c.close_reason().is_none()))
                     });
+                if !same_credential && let Some(service) = &config.transfer {
+                    service.cancel_peer_recovery(peer);
+                }
                 credentials.insert(peer, password);
                 if peers
                     .state(peer)
@@ -1891,6 +1912,12 @@ async fn run_session(
                         // Retire only this generation; new Punch/QUIC/identity/capability
                         // checks remain mandatory. Old closure callbacks are fenced.
                         if let Some((generation, connection)) = connections.remove(&node_id) {
+                            if let Some(service) = config.transfer.clone() {
+                                service.network_lost(node_id);
+                                peer_tasks.spawn(async move {
+                                    let _ = service.settle_network_loss(node_id).await;
+                                });
+                            }
                             if let Some((_, _, rights)) = authorizations.remove(&node_id) {
                                 rights.send_replace(RemoteAuthorization::default());
                             }
@@ -2286,6 +2313,16 @@ async fn run_session(
                         capabilities & super::protocol::CAP_FILE_FLOW != 0,
                     );
                 }
+                if capabilities & super::protocol::CAP_AUTO_RESUME == 0
+                    && let Some(service) = &config.transfer
+                    && service.cancel_peer_recovery(peer)
+                {
+                    let _ = events
+                        .send(SessionEvent::Diagnostic(
+                            "对端不支持自动恢复，断线任务请手动继续".into(),
+                        ))
+                        .await;
+                }
                 if capabilities & super::protocol::CAP_TCP_TUNNEL == 0 {
                     let incompatible_rules = running_tunnels
                         .iter()
@@ -2387,12 +2424,15 @@ async fn run_session(
                 }
                 let closed_inputs = input_tx.clone();
                 peer_tasks.spawn(async move {
-                    let detail = connection.closed().await.to_string();
+                    let reason = connection.closed().await;
+                    let network_interruption = recoverable_transport_close(&reason);
+                    let detail = reason.to_string();
                     let _ = closed_inputs
                         .send(SessionInput::PeerClosed {
                             peer,
                             generation,
                             detail,
+                            network_interruption,
                         })
                         .await;
                 });
@@ -2437,15 +2477,32 @@ async fn run_session(
                 peer,
                 generation,
                 detail,
+                network_interruption,
             })) => {
+                #[cfg(test)]
+                let network_interruption =
+                    network_interruption || test_network_losses.remove(&(peer, generation));
                 if peers.is_current(peer, generation)
                     && connections
                         .get(&peer)
                         .is_some_and(|(current, _)| *current == generation)
                 {
+                    if network_interruption && let Some(service) = &config.transfer {
+                        service.network_lost(peer);
+                    }
                     connections.remove(&peer);
                     if let Some((_, _, rights)) = authorizations.remove(&peer) {
                         rights.send_replace(RemoteAuthorization::default());
+                    }
+                    if !network_interruption && let Some(service) = &config.transfer {
+                        let _ = service
+                            .revoke_authorization(peer, RemoteAuthorization::default())
+                            .await;
+                    }
+                    if network_interruption && let Some(service) = config.transfer.clone() {
+                        peer_tasks.spawn(async move {
+                            let _ = service.settle_network_loss(peer).await;
+                        });
                     }
                     peer_capabilities.remove(&peer);
                     if let Some(service) = config.transfer.as_ref() {
@@ -2532,6 +2589,12 @@ async fn run_session(
                 }
                 reconnect_probes.remove(&peer);
                 if let Some((_, old)) = connections.remove(&peer) {
+                    if let Some(service) = config.transfer.clone() {
+                        service.network_lost(peer);
+                        peer_tasks.spawn(async move {
+                            let _ = service.settle_network_loss(peer).await;
+                        });
+                    }
                     if let Some((_, _, rights)) = authorizations.remove(&peer) {
                         rights.send_replace(RemoteAuthorization::default());
                     }
@@ -2588,6 +2651,58 @@ async fn run_session(
             }
             Wake::QueueChanged => {}
             Wake::Maintenance => {
+                if let Some(service) = &config.transfer {
+                    let (reconnect, jobs) = service.auto_due(
+                        |peer, direction| {
+                            let rights = authorizations.get(&peer).map(|(_, _, r)| *r.borrow());
+                            connections
+                                .get(&peer)
+                                .is_some_and(|(_, c)| c.close_reason().is_none())
+                                && peer_capabilities
+                                    .get(&peer)
+                                    .is_some_and(|c| c & super::protocol::CAP_AUTO_RESUME != 0)
+                                && rights.is_some_and(|r| {
+                                    r.outbound_authorized()
+                                        && (direction == super::task_model::TaskDirection::Send
+                                            || r.inbound_authorized())
+                                })
+                        },
+                        |peer| {
+                            signal.is_none()
+                                || peers.state(peer).is_some_and(PeerLifecycle::is_active)
+                        },
+                    );
+                    for peer in reconnect {
+                        let _ = command_tx.try_send(SessionCommand::ConnectPeer(peer));
+                    }
+                    for ticket in jobs {
+                        let Some((_, connection)) = connections.get(&ticket.peer) else {
+                            continue;
+                        };
+                        let live = authorizations[&ticket.peer].2.live();
+                        let connection = connection.clone();
+                        let service = service.clone();
+                        peer_tasks.spawn(async move {
+                            // Generation-owned rights abort the entire old continuation.
+                            // A receive RPC also needs inbound rights for its new Offer.
+                            if ticket.direction == super::task_model::TaskDirection::Receive {
+                                let incoming = live.clone();
+                                let _ = live
+                                    .guard(
+                                        false,
+                                        incoming
+                                            .guard(true, service.auto_recover(&connection, ticket)),
+                                    )
+                                    .await;
+                            } else {
+                                let _ = live
+                                    .guard(false, service.auto_recover(&connection, ticket))
+                                    .await;
+                            }
+                        });
+                    }
+                }
+
                 reconnect_probes.retain(|peer, watches| {
                     watches.retain(|watch| {
                         peers.is_current(*peer, watch.generation) && !watch.deadline.is_elapsed()
@@ -3124,6 +3239,13 @@ fn pending_ipv6_route(
         });
     let matched = matches.next()?;
     matches.next().is_none().then_some(matched)
+}
+
+fn recoverable_transport_close(reason: &quinn::ConnectionError) -> bool {
+    matches!(
+        reason,
+        quinn::ConnectionError::TimedOut | quinn::ConnectionError::Reset
+    )
 }
 
 async fn accept_incoming_loop(
@@ -5486,6 +5608,199 @@ mod tests {
         drop((ha, hb));
         server.abort();
         let _ = server.await;
+    }
+    #[test]
+    fn auto_resume_requires_network_loss_not_exit_or_protocol_failure() {
+        assert!(recoverable_transport_close(
+            &quinn::ConnectionError::TimedOut
+        ));
+        assert!(recoverable_transport_close(&quinn::ConnectionError::Reset));
+        assert!(!recoverable_transport_close(
+            &quinn::ConnectionError::LocallyClosed
+        ));
+        assert!(!recoverable_transport_close(
+            &quinn::ConnectionError::VersionMismatch
+        ));
+        assert!(!recoverable_transport_close(
+            &quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+                error_code: 0u32.into(),
+                reason: b"restart".to_vec().into()
+            })
+        ));
+    }
+    /// Tear down a real QUIC transport after recording the same typed loss
+    /// evidence as Quinn TimedOut/Reset. This avoids a 30s UDP idle timeout in
+    /// every platform fixture while retaining the real Session/auth/queue path.
+    async fn lose_test_transport(
+        a: &DesktopSessionHandle,
+        b: &DesktopSessionHandle,
+        peer_a: NodeId,
+        peer_b: NodeId,
+    ) {
+        for (handle, peer) in [(a, peer_b), (b, peer_a)] {
+            let (done, wait) = oneshot::channel();
+            handle
+                .commands
+                .send(SessionCommand::TestNetworkLoss(peer, done))
+                .await
+                .unwrap();
+            wait.await.unwrap();
+        }
+        let connection = inspect(a).await[&peer_b].1.clone();
+        connection.close(0u32.into(), b"fixture network loss");
+    }
+    #[tokio::test]
+    async fn auto_resume_real_sessions_restore_same_task_over_fresh_authenticated_transport() {
+        use super::super::{
+            task_model::TaskState, task_store::TaskStore, transfer::TransferService,
+        };
+        for (sender_enabled, receiver_enabled) in [(true, false), (false, true), (true, true)] {
+            let root = std::env::temp_dir()
+                .join(format!("p2p-auto-resume-{:032x}", rand::random::<u128>()));
+            std::fs::create_dir_all(root.join("receive-a")).unwrap();
+            std::fs::create_dir_all(root.join("receive-b")).unwrap();
+            let sa = TransferService::new(
+                TaskStore::open(&root.join("a/tasks.json")).unwrap().0,
+                root.join("receive-a"),
+            );
+            let sb = TransferService::new(
+                TaskStore::open(&root.join("b/tasks.json")).unwrap().0,
+                root.join("receive-b"),
+            );
+            sa.set_file_limits(super::super::bandwidth::FileLimits {
+                upload_kib: 1024,
+                download_kib: 0,
+            })
+            .unwrap();
+            sa.set_auto_resume(sender_enabled);
+            sb.set_auto_resume(receiver_enabled);
+            let (signal, server) = start_local_server().await;
+            let a = Identity::generate();
+            let b = Identity::generate();
+            let mut ca = local_config(signal);
+            ca.transfer = Some(sa.clone());
+            let mut cb = local_config(signal);
+            cb.transfer = Some(sb.clone());
+            let (ha, mut ea) = spawn(a.clone(), ca).unwrap();
+            let (hb, mut eb) = spawn(b.clone(), cb).unwrap();
+            wait_signal_online(&mut ea).await;
+            wait_signal_online(&mut eb).await;
+            ha.connect_peer(b.node_id()).unwrap();
+            wait_connected(&mut ea, &[b.node_id()]).await;
+            // Both directional grants are fresh for each device; auto receive
+            // requests require both outgoing RPC and incoming file permission.
+            hb.connect_peer(a.node_id()).unwrap();
+            time::timeout(Duration::from_secs(10), async {
+                while !(sa.test_speed_idle(b.node_id()) && sb.test_speed_idle(a.node_id())) {
+                    time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let bytes: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+            let directory = sender_enabled && receiver_enabled;
+            let source_dir = root.join("自动恢复目录");
+            if directory {
+                std::fs::create_dir_all(source_dir.join("空目录")).unwrap();
+            }
+            let source = if directory {
+                source_dir.join("resume.bin")
+            } else {
+                root.join("resume.bin")
+            };
+            std::fs::write(&source, &bytes).unwrap();
+            let (reached, gate) = oneshot::channel();
+            let (_release, wait) = oneshot::channel();
+            *sb.checkpoint_gate.lock().unwrap() = Some((reached, wait));
+            if directory {
+                ha.send_directory(b.node_id(), source_dir).unwrap();
+            } else {
+                ha.send_file(b.node_id(), source).unwrap();
+            }
+            time::timeout(Duration::from_secs(10), gate)
+                .await
+                .unwrap()
+                .unwrap();
+            let checkpoint_record = sb
+                .snapshot()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|r| r.file_details().is_some() && r.state() == TaskState::Transferring)
+                .unwrap();
+            let durable = tokio::task::spawn_blocking(move || {
+                super::super::transfer_files::open_download(&checkpoint_record)
+                    .unwrap()
+                    .durable_bitmap()
+                    .count_set()
+            })
+            .await
+            .unwrap();
+            assert!(durable > 0);
+            let original = sa.snapshot().await.unwrap();
+            let selected_count = original.len();
+            assert!(if directory {
+                selected_count > 1
+            } else {
+                selected_count == 1
+            });
+            let original_file = original
+                .iter()
+                .find(|r| r.file_details().is_some())
+                .unwrap();
+            let id = original_file.task_id().clone();
+            let destination = root
+                .join("receive-b")
+                .join(original_file.relative_path().unwrap());
+            let (generation, old) = inspect(&ha).await[&b.node_id()].clone();
+            let binding = ChannelBinding::from_connection(&old).unwrap();
+            lose_test_transport(&ha, &hb, a.node_id(), b.node_id()).await;
+            time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let ready = sa
+                        .snapshot()
+                        .await
+                        .unwrap()
+                        .iter()
+                        .any(|r| r.task_id() == &id && r.state() == TaskState::Completed);
+                    if ready {
+                        break;
+                    }
+                    time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!("auto restore failed sender={sender_enabled} receiver={receiver_enabled}")
+            });
+            let (fresh_generation, fresh) = inspect(&ha).await[&b.node_id()].clone();
+            assert_ne!(fresh_generation, generation);
+            assert_ne!(fresh.stable_id(), old.stable_id());
+            assert_ne!(ChannelBinding::from_connection(&fresh).unwrap(), binding);
+            assert_eq!(sa.snapshot().await.unwrap().len(), selected_count);
+            assert_eq!(sb.snapshot().await.unwrap().len(), selected_count);
+            assert_eq!(std::fs::read(destination).unwrap(), bytes);
+            assert!(
+                sa.snapshot()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|r| r.receipt_committed())
+            );
+            assert!(
+                sb.snapshot()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|r| r.receipt_committed())
+            );
+            ha.shutdown();
+            hb.shutdown();
+            drop((ha, hb));
+            server.abort();
+            let _ = server.await;
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
     async fn start_local_server() -> (SocketAddr, JoinHandle<()>) {
         start_local_server_with(SignalServerConfig::for_tests()).await

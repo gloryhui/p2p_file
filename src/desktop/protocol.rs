@@ -27,13 +27,15 @@ pub const CAP_TCP_TUNNEL: u64 = 128;
 pub const CAP_REMOTE_AUTH: u64 = 256;
 pub const CAP_TRUSTED_DEVICE_AUTH: u64 = 1 << 9;
 pub const CAP_FILE_FLOW: u64 = 1 << 10;
+pub const CAP_AUTO_RESUME: u64 = 1 << 11;
 pub const REQUIRED_CAPABILITIES: u64 =
     15 | CAP_FILE_TRANSFER | CAP_DIRECTORY_TRANSFER | CAP_SPEED_EXECUTION;
 pub const LOCAL_CAPABILITIES: u64 = REQUIRED_CAPABILITIES
     | CAP_TCP_TUNNEL
     | CAP_REMOTE_AUTH
     | CAP_TRUSTED_DEVICE_AUTH
-    | CAP_FILE_FLOW;
+    | CAP_FILE_FLOW
+    | CAP_AUTO_RESUME;
 pub const MAX_FRAME_BYTES: u32 = 4 * 1024 * 1024;
 pub const MAX_CHUNKS: usize = 65_536;
 pub const MAX_TASKS_PER_PEER: usize = 128;
@@ -192,14 +194,62 @@ pub enum Message {
     FlowWait {
         task_id: TaskId,
     },
+    /// Appended variants preserve all existing postcard discriminants.
+    AutomaticOffer {
+        task_id: TaskId,
+        group_id: Option<TaskId>,
+        relative_path: String,
+        entry: Entry,
+    },
+    AutomaticResumeTask {
+        task_id: TaskId,
+    },
 }
 
 impl Message {
+    pub(super) fn automatic(self) -> Self {
+        match self {
+            Self::Offer {
+                task_id,
+                group_id,
+                relative_path,
+                entry,
+            } => Self::AutomaticOffer {
+                task_id,
+                group_id,
+                relative_path,
+                entry,
+            },
+            Self::ResumeTask { task_id } => Self::AutomaticResumeTask { task_id },
+            other => other,
+        }
+    }
+    pub(super) fn manual(&self) -> Option<Self> {
+        match self {
+            Self::AutomaticOffer {
+                task_id,
+                group_id,
+                relative_path,
+                entry,
+            } => Some(Self::Offer {
+                task_id: task_id.clone(),
+                group_id: group_id.clone(),
+                relative_path: relative_path.clone(),
+                entry: entry.clone(),
+            }),
+            Self::AutomaticResumeTask { task_id } => Some(Self::ResumeTask {
+                task_id: task_id.clone(),
+            }),
+            _ => None,
+        }
+    }
     fn task_id(&self) -> Option<&TaskId> {
         match self {
             Self::Hello { .. } | Self::Ready | Self::TunnelReady | Self::TunnelOpen { .. } => None,
             Self::Speed(control) => Some(control.test_id()),
-            Self::Offer { task_id, .. }
+            Self::AutomaticOffer { task_id, .. }
+            | Self::AutomaticResumeTask { task_id }
+            | Self::Offer { task_id, .. }
             | Self::Resume { task_id, .. }
             | Self::Pause { task_id }
             | Self::Paused { task_id, .. }
@@ -217,6 +267,11 @@ impl Message {
     fn validate(&self) -> Result<()> {
         match self {
             Self::Offer {
+                relative_path,
+                entry,
+                ..
+            }
+            | Self::AutomaticOffer {
                 relative_path,
                 entry,
                 ..
@@ -472,6 +527,16 @@ impl TaskProtocol {
         actor: Actor,
         frame: &Frame,
     ) -> Result<()> {
+        if let Some(message) = frame.message.manual() {
+            return self.observe(
+                authenticated_peer,
+                actor,
+                &Frame {
+                    request_id: frame.request_id,
+                    message,
+                },
+            );
+        }
         if authenticated_peer != self.peer {
             return Err(invalid("桌面任务对端身份不符"));
         }
@@ -808,6 +873,38 @@ mod tests {
     use crate::protocol::message::ControlMessage;
     use tokio::io::{AsyncWriteExt, split};
 
+    #[test]
+    fn automatic_variants_are_appended_and_validate_the_same_bounded_bindings() {
+        let offer = Message::Offer {
+            task_id: task(),
+            group_id: None,
+            relative_path: "dir".into(),
+            entry: Entry::Directory,
+        };
+        let automatic = Frame {
+            request_id: 1,
+            message: offer.clone().automatic(),
+        };
+        let encoded = automatic.encode().unwrap();
+        assert_eq!(encoded[MAGIC.len() + 1], 17);
+        assert_eq!(Frame::decode(&encoded).unwrap(), automatic);
+        assert_eq!(automatic.message.manual(), Some(offer));
+        let resume = Frame {
+            request_id: 1,
+            message: Message::AutomaticResumeTask { task_id: task() },
+        };
+        assert_eq!(resume.encode().unwrap()[MAGIC.len() + 1], 18);
+        let invalid = Frame {
+            request_id: 1,
+            message: Message::AutomaticOffer {
+                task_id: task(),
+                group_id: None,
+                relative_path: "../escape".into(),
+                entry: Entry::Directory,
+            },
+        };
+        assert!(invalid.encode().is_err());
+    }
     fn task() -> TaskId {
         TaskId::parse("00112233445566778899aabbccddeeff").unwrap()
     }

@@ -52,6 +52,7 @@ pub(super) struct TaskRow {
     pub rate: f64,
     pub diagnostic: Option<&'static str>,
     pub retryable: bool,
+    pub auto_waiting: bool,
     pub can_delete_file: bool,
 }
 impl TaskRow {
@@ -84,6 +85,7 @@ impl TaskRow {
                 0.
             },
             diagnostic: r.diagnostic().map(|d| d.safe_message()),
+            auto_waiting: false,
             retryable: r.diagnostic().is_some_and(|d| d.is_retryable()),
             can_delete_file: r.direction() == TaskDirection::Receive
                 && r.state() == TaskState::Completed
@@ -103,17 +105,19 @@ impl TaskRow {
         }
     }
     pub fn can_pause(&self) -> bool {
-        matches!(
-            self.state,
-            TaskState::Queued
-                | TaskState::Connecting
-                | TaskState::Negotiating
-                | TaskState::Transferring
-        )
+        self.auto_waiting
+            || matches!(
+                self.state,
+                TaskState::Queued
+                    | TaskState::Connecting
+                    | TaskState::Negotiating
+                    | TaskState::Transferring
+            )
     }
     pub fn can_continue(&self) -> bool {
-        matches!(self.state, TaskState::Paused | TaskState::Interrupted)
-            || (self.state == TaskState::Failed && self.retryable)
+        !self.auto_waiting
+            && (matches!(self.state, TaskState::Paused | TaskState::Interrupted)
+                || (self.state == TaskState::Failed && self.retryable))
     }
     pub fn can_remove_history(&self) -> bool {
         self.state == TaskState::Completed
@@ -122,7 +126,11 @@ impl TaskRow {
         self.can_delete_file
     }
     pub fn state_label(&self) -> &'static str {
-        state_label(self.state)
+        if self.auto_waiting {
+            "等待自动恢复（重新连接并验证权限）"
+        } else {
+            state_label(self.state)
+        }
     }
 }
 pub(super) fn state_label(state: TaskState) -> &'static str {
@@ -376,6 +384,7 @@ mod tests {
             rate: 0.,
             diagnostic: None,
             retryable: false,
+            auto_waiting: false,
             can_delete_file: false,
         };
         let mut second = first.clone();
@@ -497,6 +506,7 @@ mod tests {
             rate: 0.,
             diagnostic: None,
             retryable: false,
+            auto_waiting: false,
             can_delete_file: false,
         };
         assert_eq!(a.percent(), 0.);

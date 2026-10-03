@@ -9,6 +9,7 @@
 //! MIT-licensed application code. See docs/gpui-mvp/THIRD_PARTY_NOTICES.md.
 
 mod activity;
+mod auto_resume;
 mod autostart;
 mod background;
 mod bandwidth;
@@ -3773,10 +3774,53 @@ impl DesktopShell {
             .child(self.trusted_devices_card(window, cx))
             .child(self.background_card(cx))
             .child(self.notifications_card(cx))
+            .child(self.auto_resume_card(cx))
             .child(self.file_limits_card(window, cx))
             .child(self.advanced_network_card(window, cx))
     }
 
+    fn auto_resume_card(&self, cx: &mut Context<Self>) -> gpui::Div {
+        ui_components::card()
+            .child(ui_components::section_header("↻", "断网自动恢复", "仅恢复本次运行中意外断网的任务"))
+            .child("默认关闭。恢复前重新验证身份和双向权限；从首次断线起累计最多尝试 5 次、等待 5 分钟。主动暂停、重启、权限或设置变更后需要手动继续；对端也需要支持自动恢复协议。")
+            .child(ui_components::secondary_button(if self.settings.auto_resume {"关闭自动恢复"} else {"开启自动恢复"}, self.can_save_settings && !self.is_saving_settings)
+                .on_mouse_up(MouseButton::Left, cx.listener(|shell, _, _, cx| shell.toggle_auto_resume(cx))))
+    }
+    fn toggle_auto_resume(&mut self, cx: &mut Context<Self>) {
+        if !self.can_save_settings || self.is_saving_settings {
+            return;
+        }
+        let enabled = !self.settings.auto_resume;
+        let config_file = self.config_file.clone();
+        let background = cx.background_executor().clone();
+        self.is_saving_settings = true;
+        cx.spawn(async move |shell, cx| {
+            let result = background
+                .spawn(async move { DesktopConfig::save_auto_resume(&config_file, enabled) })
+                .await;
+            let _ = shell.update(cx, |shell, cx| {
+                shell.is_saving_settings = false;
+                match result {
+                    Ok(()) => {
+                        shell.settings.auto_resume = enabled;
+                        if let Some(service) = &shell.transfer_service {
+                            service.set_auto_resume(enabled);
+                        }
+                        shell.set_status(
+                            if enabled {
+                                "自动恢复已开启并保存"
+                            } else {
+                                "自动恢复已关闭，等待中的恢复已取消"
+                            },
+                            cx,
+                        );
+                    }
+                    Err(error) => shell.set_status(format!("自动恢复偏好未保存：{error}"), cx),
+                }
+            });
+        })
+        .detach();
+    }
     fn notifications_card(&self, cx: &mut Context<Self>) -> gpui::Div {
         ui_components::card()
             .child(ui_components::section_header(
@@ -5457,6 +5501,7 @@ pub fn run(background_start: bool) {
             service
                 .set_file_limits(settings.file_limits)
                 .expect("validated file limits");
+            service.set_auto_resume(settings.auto_resume);
         }
         let initial_file_limits = settings.file_limits;
         let initial_notifications = settings.notifications;
