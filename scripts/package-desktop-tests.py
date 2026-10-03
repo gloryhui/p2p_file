@@ -4,6 +4,7 @@ import importlib.util
 import json
 from pathlib import Path
 import struct
+import subprocess
 import sys
 
 sys.dont_write_bytecode = True
@@ -24,7 +25,7 @@ verify = module('verify-desktop-package')
 
 
 class Boundaries(unittest.TestCase):
-    def test_architecture_rejects_cross_platform_and_intel_mac(self):
+    def test_architecture_matches_each_mac_target_and_rejects_cross_platform(self):
         with tempfile.TemporaryDirectory() as root:
             file = Path(root) / 'binary'
             elf = bytearray(64)
@@ -38,11 +39,39 @@ class Boundaries(unittest.TestCase):
             macho[:4] = b'\xcf\xfa\xed\xfe'
             struct.pack_into('<I', macho, 4, 0x01000007)
             file.write_bytes(macho)
+            pack.architecture(file, 'x86_64-apple-darwin')
             with self.assertRaises(ValueError):
                 pack.architecture(file, 'aarch64-apple-darwin')
             struct.pack_into('<I', macho, 4, 0x0100000c)
             file.write_bytes(macho)
             pack.architecture(file, 'aarch64-apple-darwin')
+            with self.assertRaises(ValueError):
+                pack.architecture(file, 'x86_64-apple-darwin')
+            macho[:4] = b'\xca\xfe\xba\xbe'
+            file.write_bytes(macho)
+            for target in pack.MACOS_ARCHES:
+                with self.subTest(target=target), self.assertRaises(ValueError):
+                    pack.architecture(file, target)
+            file.write_bytes(b'\xcf\xfa\xed\xfe')
+            with self.assertRaisesRegex(ValueError, 'truncated'):
+                pack.architecture(file, 'x86_64-apple-darwin')
+
+    def test_mac_native_host_rejects_other_architecture_and_rosetta(self):
+        with patch.object(pack.platform, 'system', return_value='Darwin'):
+            for target, (machine, _) in pack.MACOS_ARCHES.items():
+                with self.subTest(target=target), patch.object(pack.platform, 'machine', return_value=machine):
+                    with patch.object(pack.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, stdout='', stderr='unknown oid')):
+                        pack.native_host(target)  # The Rosetta sysctl is absent on native Intel.
+                    with patch.object(pack.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, stdout='1\n', stderr='')):
+                        with self.assertRaisesRegex(ValueError, 'Rosetta'):
+                            pack.native_host(target)
+                other = 'x86_64' if machine == 'arm64' else 'arm64'
+                with patch.object(pack.platform, 'machine', return_value=other):
+                    with self.assertRaisesRegex(ValueError, 'native'):
+                        pack.native_host(target)
+        with patch.object(pack.platform, 'system', return_value='Linux'):
+            with self.assertRaisesRegex(ValueError, 'native platform'):
+                pack.native_host('x86_64-apple-darwin')
 
     def test_pe_x64_imports_use_actual_section_rvas(self):
         with tempfile.TemporaryDirectory() as root:

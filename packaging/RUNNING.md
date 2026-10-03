@@ -27,7 +27,12 @@ Get-AuthenticodeSignature .\p2p-desktop.exe
 
 候选未用开发者证书签名，Windows 安全提示应以操作系统实际显示为准。CI windows-2022/windows-all 是 hosted runner，不证明 Win10/Win11 真机运行。PE x64 架构、导入依赖和实际 Authenticode 状态随包记录。
 
-macOS：只支持 Apple Silicon arm64，产品目标 macOS 13+，不提供 Intel Mac 包。解压 zip，将 `P2P File.app` 放在 Applications 或用户可读目录，使用 Finder 打开。`.app` 的 Info.plist 保持 `LSMinimumSystemVersion=13.0`；CI 检查 Mach-O 最低部署版本，不能用 macos-14 runner 冒充 macOS13 交互验收。
+macOS：产品目标 macOS 13+，分别提供 Apple Silicon arm64 与 Intel x86_64 包。
+Apple Silicon 选择 `aarch64-apple-darwin`，Intel Mac 选择 `x86_64-apple-darwin`。
+CI 下载中 `p2p-desktop-app-only-*` 是轻量应用 ZIP，`p2p-desktop-*` 是含依赖来源材料的
+完整候选。解压 ZIP，将 `P2P File.app` 放在 Applications 或用户可读目录，通过 Finder 打开。
+两种包的 Info.plist 都保持 `LSMinimumSystemVersion=13.0`；CI 检查 Mach-O 最低部署版本，
+并在各自架构的 macOS runner 原生执行回归，不能代替 macOS13 实机交互验收。
 
 ```sh
 "P2P File.app/Contents/MacOS/p2p-desktop" --build-info
@@ -44,6 +49,16 @@ python3.12 scripts/package-desktop.py \
   --app-only
 open "$P2P_PACKAGE_DIR/P2P File.app"
 ```
+
+Intel 本机构建使用 [macos-x86_64 入口](macos-x86_64/README.md)：
+
+```sh
+./packaging/macos-x86_64/doctor.sh
+./packaging/macos-x86_64/build.sh --app-only --output "$P2P_PACKAGE_DIR"
+```
+
+Apple Silicon 本机使用 [macos-arm64 入口](macos-arm64/README.md)。构建时要求匹配架构的
+原生终端和硬件；Rosetta 不作为 Intel 本机验证。不提供 Universal 包。
 
 没有 Developer ID/公证凭证；包只有实际验证的 ad-hoc 签名（没有开发者证书），未公证。不要把 ad-hoc 叫正式签名，也不删除系统 quarantine 以制造通过截图。允许打开候选的操作应由设备持有人按系统提示完成。
 

@@ -34,6 +34,10 @@ jobs:
             target: aarch64-apple-darwin
             executable: p2p-desktop
             packages: ""
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            executable: p2p-desktop
+            packages: ""
     steps:
       - uses: actions/checkout@v4
         with:
@@ -49,6 +53,11 @@ jobs:
           python-version: '3.12'
       - name: Check packaging validation boundaries
         run: python scripts/package-desktop-tests.py
+      - name: Check Intel Mac native environment and prerequisite gates
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: |
+          python scripts/macos-intel-packaging-tests.py
+          ./packaging/macos-x86_64/doctor.sh
       - name: Check native desktop shell
         run: cargo check --locked --features gui --bin p2p-desktop --target ${{ matrix.target }}
       - name: Build native desktop shell
@@ -78,9 +87,13 @@ jobs:
           MACOSX_DEPLOYMENT_TARGET: '13.0'
         run: cargo build --locked --release --features gui --bin p2p-desktop --target ${{ matrix.target }}
       - name: Package and verify the literal-head native candidate
+        if: matrix.target != 'x86_64-apple-darwin'
         run: |
           python scripts/package-desktop.py --binary target/${{ matrix.target }}/release/${{ matrix.executable }} --target ${{ matrix.target }} --output "${{ runner.temp }}/p2p-desktop-candidate"
           python scripts/verify-desktop-package.py "${{ runner.temp }}/p2p-desktop-candidate/candidate.json"
+      - name: Verify the native Intel Mac build and packaging entrypoint
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: ./packaging/macos-x86_64/build.sh --output "${{ runner.temp }}/p2p-desktop-candidate"
       - uses: actions/upload-artifact@v4
         with:
           name: p2p-desktop-${{ matrix.target }}-${{ github.event.pull_request.head.sha || github.sha }}
@@ -89,6 +102,23 @@ jobs:
             ${{ runner.temp }}/p2p-desktop-candidate/*.zip
             ${{ runner.temp }}/p2p-desktop-candidate/*.sha256
             ${{ runner.temp }}/p2p-desktop-candidate/candidate.json
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+      - name: Package lightweight macOS app with license material
+        if: runner.os == 'macOS'
+        run: |
+          python scripts/package-desktop.py --binary target/${{ matrix.target }}/release/${{ matrix.executable }} --target ${{ matrix.target }} --output "${{ runner.temp }}/p2p-desktop-app-only" --app-only
+          cd "${{ runner.temp }}/p2p-desktop-app-only"
+          ditto -c -k --keepParent "P2P File.app" "p2p-desktop-app-only-${{ matrix.target }}-${{ github.event.pull_request.head.sha || github.sha }}.zip"
+          shasum -a256 "p2p-desktop-app-only-${{ matrix.target }}-${{ github.event.pull_request.head.sha || github.sha }}.zip" > "p2p-desktop-app-only-${{ matrix.target }}-${{ github.event.pull_request.head.sha || github.sha }}.zip.sha256"
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'macOS'
+        with:
+          name: p2p-desktop-app-only-${{ matrix.target }}-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            ${{ runner.temp }}/p2p-desktop-app-only/*.zip
+            ${{ runner.temp }}/p2p-desktop-app-only/*.sha256
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
