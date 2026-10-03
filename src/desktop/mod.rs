@@ -1925,7 +1925,7 @@ impl DesktopShell {
         card = card.child(div().text_xs().text_color(rgb(ui_theme::TEXT_SECONDARY)).child(detail.scope_label))
             .child(Self::detail_field("任务名称", detail.name.clone()))
             .child(Self::detail_field("设备 / 方向 / 状态", format!("{} · {direction} · {}", detail.peer.short(), detail.state)))
-            .child(Self::detail_field("大小 / 已确认", format!("{} / {}（{} / {} 字节）", format_bytes(detail.confirmed), format_bytes(detail.total), detail.confirmed, detail.total)))
+            .child(Self::detail_field("已确认 / 总大小", format!("{} / {}（{} / {} 字节）", format_bytes(detail.confirmed), format_bytes(detail.total), detail.confirmed, detail.total)))
             .child(Self::detail_field("当前文件速度", if detail.rate > 0. { format!("{:.2} MiB/s", detail.rate / 1_048_576.) } else { "未知 / 无活动文件速度".into() }))
             .child(Self::detail_field("数据预计剩余", detail.eta.map_or_else(|| "未知".into(), task_details::duration)))
             .child(Self::detail_field("创建至今或结果", format!("{elapsed}（含等待和暂停）")))

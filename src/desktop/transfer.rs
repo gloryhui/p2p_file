@@ -69,6 +69,8 @@ pub(crate) struct TransferService {
     #[cfg(test)]
     pub(super) first_chunk_gate: TestGate,
     #[cfg(test)]
+    statistics_cleanup_gate: TestGate,
+    #[cfg(test)]
     pub(super) checkpoint_gate: TestGate,
     #[cfg(test)]
     admission_gate: TestGate,
@@ -127,13 +129,25 @@ struct ActiveGuard {
 }
 impl Drop for ActiveGuard {
     fn drop(&mut self) {
-        self.service.active.lock().unwrap().remove(&self.id);
-        self.service.rates.lock().unwrap().remove(&self.id);
-        self.service
-            .measurements
-            .lock()
-            .unwrap()
-            .finish(&self.id, Instant::now());
+        {
+            // Claim shares this lock order. Publish an idle task only after
+            // this attempt's rates and measurements have been retired.
+            let mut active = self.service.active.lock().unwrap();
+            #[cfg(test)]
+            if let Some((reached, release)) =
+                self.service.statistics_cleanup_gate.lock().unwrap().take()
+            {
+                let _ = reached.send(());
+                let _ = release.blocking_recv();
+            }
+            self.service.rates.lock().unwrap().remove(&self.id);
+            self.service
+                .measurements
+                .lock()
+                .unwrap()
+                .finish(&self.id, Instant::now());
+            active.remove(&self.id);
+        }
         self.service
             .changed
             .send_modify(|version| *version = version.wrapping_add(1));
@@ -181,6 +195,8 @@ impl TransferService {
             drop_completion: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             first_chunk_gate: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            statistics_cleanup_gate: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             checkpoint_gate: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -5362,6 +5378,67 @@ mod tests {
         let second = next.await.unwrap().unwrap();
         assert_ne!(second.test_id, first.test_id);
         assert_eq!(second.direction, SpeedDirection::Download);
+        pair.shutdown().await;
+    }
+    #[tokio::test]
+    async fn task_details_attempt_cleanup_fences_a_replacement_claim() {
+        let pair = Pair::new().await;
+        let id = TaskId::generate();
+        let (old, _) = pair
+            .b
+            .claim(
+                pair.ia,
+                &id,
+                TaskDirection::Receive,
+                false,
+                None,
+                pair.cb.stable_id(),
+            )
+            .unwrap();
+        // Pause exactly after the old attempt begins retiring its statistics.
+        let (reached, wait) = tokio::sync::oneshot::channel();
+        let (release, resume) = tokio::sync::oneshot::channel();
+        *pair.b.statistics_cleanup_gate.lock().unwrap() = Some((reached, resume));
+        let old = std::thread::spawn(move || drop(old));
+        tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .unwrap()
+            .unwrap();
+        let fenced = matches!(
+            pair.b.active.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+        release.send(()).unwrap();
+        old.join().unwrap();
+        assert!(
+            fenced,
+            "replacement can overtake the old attempt's statistics cleanup"
+        );
+        let (new, _) = pair
+            .b
+            .claim(
+                pair.ia,
+                &id,
+                TaskDirection::Receive,
+                false,
+                None,
+                pair.cb.stable_id(),
+            )
+            .unwrap();
+        {
+            let measurements = pair.b.measurements.lock().unwrap();
+            let now = Instant::now();
+            let sample = measurements.sample(&id, now).unwrap();
+            assert_eq!(sample.attempts, 2);
+            assert!(
+                measurements
+                    .sample(&id, now + Duration::from_secs(1))
+                    .unwrap()
+                    .elapsed
+                    > sample.elapsed
+            );
+        }
+        drop(new);
         pair.shutdown().await;
     }
     #[tokio::test]
