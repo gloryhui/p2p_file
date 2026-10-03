@@ -112,6 +112,9 @@ jobs:
           cd "${{ runner.temp }}/p2p-desktop-app-only"
           ditto -c -k --keepParent "P2P File.app" "p2p-desktop-app-only-${{ matrix.target }}-${{ github.event.pull_request.head.sha || github.sha }}.zip"
           shasum -a256 "p2p-desktop-app-only-${{ matrix.target }}-${{ github.event.pull_request.head.sha || github.sha }}.zip" > "p2p-desktop-app-only-${{ matrix.target }}-${{ github.event.pull_request.head.sha || github.sha }}.zip.sha256"
+          ditto -x -k "p2p-desktop-app-only-${{ matrix.target }}-${{ github.event.pull_request.head.sha || github.sha }}.zip" "${{ runner.temp }}/p2p-desktop-app-only-unpacked"
+          codesign --verify --strict "${{ runner.temp }}/p2p-desktop-app-only-unpacked/P2P File.app"
+          "${{ runner.temp }}/p2p-desktop-app-only-unpacked/P2P File.app/Contents/MacOS/p2p-desktop" --build-info
       - uses: actions/upload-artifact@v4
         if: runner.os == 'macOS'
         with:
