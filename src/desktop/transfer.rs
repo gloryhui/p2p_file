@@ -59,6 +59,8 @@ pub(crate) struct TransferService {
     sender_queue: Arc<Mutex<super::queue::TaskQueue>>,
     recovery: Arc<Mutex<super::auto_resume::Recovery>>,
     pub(super) receive_space: super::space_budget::SpaceBudget,
+    measurements: Arc<Mutex<super::task_details::Measurements>>,
+    detail_selection: Arc<Mutex<Option<super::task_details::Selection>>>,
     automatic_sends: Arc<Mutex<HashMap<TaskId, super::auto_resume::Ticket>>>,
     pub(super) activity: super::activity::Activity,
     speed_peers: Arc<Mutex<HashMap<NodeId, super::speed::SpeedPeer>>>,
@@ -66,6 +68,8 @@ pub(crate) struct TransferService {
     drop_completion: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     pub(super) first_chunk_gate: TestGate,
+    #[cfg(test)]
+    statistics_cleanup_gate: TestGate,
     #[cfg(test)]
     pub(super) checkpoint_gate: TestGate,
     #[cfg(test)]
@@ -125,8 +129,25 @@ struct ActiveGuard {
 }
 impl Drop for ActiveGuard {
     fn drop(&mut self) {
-        self.service.active.lock().unwrap().remove(&self.id);
-        self.service.rates.lock().unwrap().remove(&self.id);
+        {
+            // Claim shares this lock order. Publish an idle task only after
+            // this attempt's rates and measurements have been retired.
+            let mut active = self.service.active.lock().unwrap();
+            #[cfg(test)]
+            if let Some((reached, release)) =
+                self.service.statistics_cleanup_gate.lock().unwrap().take()
+            {
+                let _ = reached.send(());
+                let _ = release.blocking_recv();
+            }
+            self.service.rates.lock().unwrap().remove(&self.id);
+            self.service
+                .measurements
+                .lock()
+                .unwrap()
+                .finish(&self.id, Instant::now());
+            active.remove(&self.id);
+        }
         self.service
             .changed
             .send_modify(|version| *version = version.wrapping_add(1));
@@ -167,11 +188,15 @@ impl TransferService {
             sender_queue: Arc::new(Mutex::new(super::queue::TaskQueue::default())),
             recovery: Default::default(),
             receive_space: Default::default(),
+            measurements: Default::default(),
+            detail_selection: Default::default(),
             automatic_sends: Default::default(),
             #[cfg(test)]
             drop_completion: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             first_chunk_gate: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            statistics_cleanup_gate: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             checkpoint_gate: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -1029,6 +1054,10 @@ impl TransferService {
                 pause,
             },
         );
+        self.measurements
+            .lock()
+            .unwrap()
+            .start(id.clone(), Instant::now());
         self.recovery
             .lock()
             .unwrap()
@@ -1240,17 +1269,51 @@ impl TransferService {
             queue: self.queue_metrics(),
         })
     }
+    pub(super) fn select_detail(&self, selection: Option<super::task_details::Selection>) {
+        *self.detail_selection.lock().unwrap() = selection;
+    }
+    /// Only called on a background worker; keep lookup and validation in the
+    /// store reader, so cleanup cannot change the binding during validation.
+    pub(super) fn reveal_task(
+        &self,
+        selection: &super::task_details::Selection,
+    ) -> Result<PathBuf> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| disk::failure("任务库锁不可用"))?;
+        super::task_details::reveal(store.list(), selection)
+    }
     /// Called only on GPUI's background executor. Copy small display fields,
     /// never chunk manifests, while holding the store reader. No UI disk/locks.
     pub(super) fn ui_snapshot(&self) -> Result<super::ui_model::Snapshot> {
         let now = self.monotonic_ms();
-        let mut tasks = {
+        let selection = self.detail_selection.lock().unwrap().clone();
+        let (mut tasks, detail) = {
             let store = self
                 .store
                 .lock()
                 .map_err(|_| disk::failure("任务库锁不可用"))?;
             let rates = self.rates.lock().unwrap();
-            store
+            let mut measurements = self.measurements.lock().unwrap();
+            measurements.retain(store.list());
+            let wall = system_time_unix_ms().unwrap_or(-1);
+            let recovery = self.recovery.lock().unwrap();
+            let detail = selection.as_ref().and_then(|selection| {
+                super::task_details::project(
+                    store.list(),
+                    selection,
+                    |record| {
+                        rates.get(record.task_id()).map_or(0., |rate| {
+                            rate.bytes_per_second(now, record.state() == TaskState::Transferring)
+                        })
+                    },
+                    |id| measurements.sample(id, Instant::now()),
+                    |id| recovery.pending(id),
+                    wall,
+                )
+            });
+            let tasks = store
                 .list()
                 .iter()
                 .map(|record| {
@@ -1259,15 +1322,18 @@ impl TransferService {
                     });
                     (record.created_at_unix_ms(), {
                         let mut row = super::ui_model::TaskRow::from_record(record, rate);
-                        row.auto_waiting = self.recovery.lock().unwrap().pending(record.task_id());
+                        row.auto_waiting = recovery.pending(record.task_id());
                         row
                     })
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (tasks, detail)
         };
         tasks.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.id.cmp(&b.1.id)));
         Ok(super::ui_model::Snapshot {
             space: self.receive_space.summary(),
+            detail_selection: selection,
+            detail,
             tasks: tasks.into_iter().map(|(_, row)| row).collect(),
             queue: self.queue_metrics(),
             speeds: self.speed_snapshots(),
@@ -1349,6 +1415,9 @@ impl TransferService {
         mode: SendMode,
     ) -> Result<()> {
         let automatic = mode.automatic;
+        if automatic {
+            self.measurements.lock().unwrap().automatic(id);
+        }
         let lookup = id.clone();
         let recovery = self.recovery.clone();
         let record = self
@@ -1992,6 +2061,9 @@ impl TransferService {
             .claim_receive(&mut send, peer, &task_id, false, connection.stable_id())
             .await?;
         let _guard = Arc::new(_guard);
+        if automatic {
+            self.measurements.lock().unwrap().automatic(&task_id);
+        }
         let mut io = TaskIo::new(send, recv, peer, task_id.clone(), self.frame_budget.clone());
         io.observe(&first)?;
         drop(first);
@@ -2086,6 +2158,9 @@ impl TransferService {
             .claim_receive(&mut send, peer, &task_id, true, connection.stable_id())
             .await?;
         let _guard = Arc::new(_guard);
+        if automatic {
+            self.measurements.lock().unwrap().automatic(&task_id);
+        }
         let mut io = TaskIo::new(send, recv, peer, task_id.clone(), self.frame_budget.clone());
         io.observe(&first)?;
         drop(first);
@@ -3238,6 +3313,13 @@ mod tests {
             bytes
         );
         assert!(pair.a.automatic_sends.lock().unwrap().is_empty());
+        for service in [&pair.a, &pair.b] {
+            service.wait_previous_attempt(&id).await.unwrap();
+            let measurements = service.measurements.lock().unwrap();
+            let sample = measurements.sample(&id, Instant::now()).unwrap();
+            assert_eq!(sample.attempts, 2);
+            assert_eq!(sample.automatic, 1);
+        }
         pair.shutdown().await;
     }
     #[tokio::test]
@@ -4265,6 +4347,31 @@ mod tests {
                 .iter()
                 .all(|r| r.group_id() == records[0].group_id())
         );
+        use super::super::task_details::Selection;
+        let selection = Selection::Group(records[0].group_id().unwrap().clone());
+        for service in [&pair.a, &pair.b] {
+            service.select_detail(Some(selection.clone()));
+            let detail = service.ui_snapshot().unwrap().detail.unwrap();
+            assert_eq!(detail.members.len(), 5);
+            assert_eq!(detail.counts.files, 2);
+            assert_eq!(detail.counts.directories, 3);
+            assert_eq!(detail.counts.completed, 5);
+            assert_eq!(detail.total, b"new selected content".len() as u64);
+            for record in service.snapshot().await.unwrap() {
+                let target = service
+                    .reveal_task(&Selection::Task(record.task_id().clone()))
+                    .unwrap();
+                assert!(target.exists());
+            }
+        }
+        assert_eq!(
+            pair.a.reveal_task(&selection).unwrap(),
+            pair.root.join("目录")
+        );
+        assert_eq!(
+            pair.b.reveal_task(&selection).unwrap(),
+            pair.root.join("b-receive")
+        );
         // Completed task replay does not create another backup or another record.
         pair.a.send_selection(&pair.ca, pair.ib, ids).await.unwrap();
         assert_eq!(pair.b.snapshot().await.unwrap().len(), 5);
@@ -4321,6 +4428,13 @@ mod tests {
         assert_eq!(fs::read_dir(changed_root).unwrap().count(), 0);
         for record in pair.b.snapshot().await.unwrap() {
             assert_eq!(record.local_path(), pair.root.join("b-receive"));
+            let target = pair
+                .b
+                .reveal_task(&super::super::task_details::Selection::Task(
+                    record.task_id().clone(),
+                ))
+                .unwrap();
+            assert!(target.starts_with(pair.root.join("b-receive")));
         }
         pair.shutdown().await;
     }
@@ -5264,6 +5378,154 @@ mod tests {
         let second = next.await.unwrap().unwrap();
         assert_ne!(second.test_id, first.test_id);
         assert_eq!(second.direction, SpeedDirection::Download);
+        pair.shutdown().await;
+    }
+    #[tokio::test]
+    async fn task_details_attempt_cleanup_fences_a_replacement_claim() {
+        let pair = Pair::new().await;
+        let id = TaskId::generate();
+        let (old, _) = pair
+            .b
+            .claim(
+                pair.ia,
+                &id,
+                TaskDirection::Receive,
+                false,
+                None,
+                pair.cb.stable_id(),
+            )
+            .unwrap();
+        // Pause exactly after the old attempt begins retiring its statistics.
+        let (reached, wait) = tokio::sync::oneshot::channel();
+        let (release, resume) = tokio::sync::oneshot::channel();
+        *pair.b.statistics_cleanup_gate.lock().unwrap() = Some((reached, resume));
+        let old = std::thread::spawn(move || drop(old));
+        tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .unwrap()
+            .unwrap();
+        let fenced = matches!(
+            pair.b.active.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+        release.send(()).unwrap();
+        old.join().unwrap();
+        assert!(
+            fenced,
+            "replacement can overtake the old attempt's statistics cleanup"
+        );
+        let (new, _) = pair
+            .b
+            .claim(
+                pair.ia,
+                &id,
+                TaskDirection::Receive,
+                false,
+                None,
+                pair.cb.stable_id(),
+            )
+            .unwrap();
+        {
+            let measurements = pair.b.measurements.lock().unwrap();
+            let now = Instant::now();
+            let sample = measurements.sample(&id, now).unwrap();
+            assert_eq!(sample.attempts, 2);
+            assert!(
+                measurements
+                    .sample(&id, now + Duration::from_secs(1))
+                    .unwrap()
+                    .elapsed
+                    > sample.elapsed
+            );
+        }
+        drop(new);
+        pair.shutdown().await;
+    }
+    #[tokio::test]
+    async fn task_details_follow_real_pause_retry_receipts_and_history_removal() {
+        use super::super::task_details::Selection;
+        let pair = Pair::new().await;
+        let (id, bytes) = pair.select(8 * 1024 * 1024).await;
+        let selected = Selection::Task(id.clone());
+        pair.a.select_detail(Some(selected.clone()));
+        pair.b.select_detail(Some(selected.clone()));
+        let (reached, release) = pair.gate();
+        let sender = pair.sender(id.clone());
+        reached.await.unwrap();
+        assert_eq!(
+            pair.b.reveal_task(&selected).unwrap(),
+            pair.root.join("b-receive")
+        );
+        pair.b.pause_task(id.clone()).await.unwrap();
+        release.send(()).unwrap();
+        sender.await.unwrap().unwrap();
+        wait_state(&pair.b, &id, TaskState::Paused).await;
+        for service in [&pair.a, &pair.b] {
+            service.wait_previous_attempt(&id).await.unwrap();
+            let detail = service.ui_snapshot().unwrap().detail.unwrap();
+            assert_eq!(detail.rate, 0.);
+            assert_eq!(detail.eta, None);
+            assert_eq!(detail.run.attempts, 1);
+            let measurements = service.measurements.lock().unwrap();
+            let now = Instant::now();
+            assert_eq!(
+                measurements.sample(&id, now).unwrap().elapsed,
+                measurements
+                    .sample(&id, now + Duration::from_secs(100))
+                    .unwrap()
+                    .elapsed
+            );
+        }
+        pair.b.resume(&pair.cb, pair.ia, id.clone()).await.unwrap();
+        wait_state(&pair.b, &id, TaskState::Completed).await;
+        for service in [&pair.a, &pair.b] {
+            service.wait_previous_attempt(&id).await.unwrap();
+            let before = service.snapshot().await.unwrap();
+            let changed = *service.changed.borrow();
+            let detail = service.ui_snapshot().unwrap().detail.unwrap();
+            assert_eq!(detail.confirmed, bytes.len() as u64);
+            assert_eq!(detail.run.attempts, 2);
+            assert_eq!(detail.run.retries, 1);
+            assert_eq!(detail.run.automatic, 0);
+            assert_eq!(detail.rate, 0.);
+            assert_eq!(detail.eta, None);
+            assert!(service.reveal_task(&selected).unwrap().is_file());
+            assert_eq!(*service.changed.borrow(), changed);
+            assert_eq!(service.snapshot().await.unwrap(), before);
+        }
+        let destination = pair.root.join("b-receive/文件.bin");
+        assert_eq!(pair.b.reveal_task(&selected).unwrap(), destination);
+        pair.b.remove_completed_task(&id).unwrap();
+        assert!(pair.b.ui_snapshot().unwrap().detail.is_none());
+        assert!(pair.b.reveal_task(&selected).is_err());
+        assert_eq!(fs::read(destination).unwrap(), bytes);
+        pair.shutdown().await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn task_details_locator_rejects_replaced_source_parent_and_receive_leaf_links() {
+        use super::super::task_details::Selection;
+        let pair = Pair::new().await;
+        let folder = pair.root.join("source");
+        fs::create_dir(&folder).unwrap();
+        let path = folder.join("data.bin");
+        fs::write(&path, b"original").unwrap();
+        let id = pair.a.select_file(pair.ib, path.clone()).await.unwrap();
+        let selected = Selection::Task(id.clone());
+        assert_eq!(pair.a.reveal_task(&selected).unwrap(), path);
+        pair.sender(id.clone()).await.unwrap().unwrap();
+        wait_state(&pair.b, &id, TaskState::Completed).await;
+        pair.b.wait_previous_attempt(&id).await.unwrap();
+        let received = pair.b.reveal_task(&selected).unwrap();
+        let outside = pair.root.join("outside.bin");
+        fs::write(&outside, b"untouched").unwrap();
+        fs::remove_file(&received).unwrap();
+        std::os::unix::fs::symlink(&outside, &received).unwrap();
+        assert!(pair.b.reveal_task(&selected).is_err());
+        fs::rename(&folder, pair.root.join("old-source")).unwrap();
+        std::os::unix::fs::symlink(pair.root.join("old-source"), &folder).unwrap();
+        assert!(pair.a.reveal_task(&selected).is_err());
+        assert_eq!(fs::read(outside).unwrap(), b"untouched");
         pair.shutdown().await;
     }
     #[tokio::test]

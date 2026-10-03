@@ -32,6 +32,7 @@ pub(crate) mod secure_fs;
 mod session;
 mod space_budget;
 mod speed;
+mod task_details;
 #[allow(dead_code)] // Task list consumers arrive in later GPUI task integrations.
 mod task_events;
 #[allow(dead_code)] // T003 establishes the domain model before transfer consumers exist.
@@ -1042,6 +1043,10 @@ struct DesktopShell {
     notification_note: SharedString,
     expanded_groups: HashSet<task_model::TaskId>,
     selected_task: Option<task_model::TaskId>,
+    detail_selection: Option<task_details::Selection>,
+    task_details: Option<task_details::Detail>,
+    detail_page: usize,
+    revealing_task: bool,
     queue_status: SharedString,
     receive_space_status: SharedString,
     speed_views: ui_model::SpeedViews,
@@ -1208,6 +1213,21 @@ impl DesktopShell {
                     .update(cx, |shell, cx| {
                         match result {
                             Ok(snapshot) => {
+                                if snapshot.detail_selection == shell.detail_selection
+                                    && shell.detail_selection.is_some()
+                                {
+                                    if let Some(detail) = snapshot.detail {
+                                        if Some(&detail.selection)
+                                            == shell.detail_selection.as_ref()
+                                        {
+                                            shell.task_details = Some(detail);
+                                        }
+                                    } else {
+                                        shell.close_task_details(cx);
+                                        shell
+                                            .set_status("所选任务或目录组已不可用，详情已关闭", cx);
+                                    }
+                                }
                                 shell.receive_space_status = format!(
                                     "接收预算已预约 {:.1} MiB · {} 个文件系统",
                                     snapshot.space.reserved as f64 / (1024. * 1024.),
@@ -1496,6 +1516,8 @@ impl DesktopShell {
     fn refresh_task_rows(&mut self, cx: &mut Context<Self>) {
         let snapshot = ui_model::Snapshot {
             space: Default::default(),
+            detail_selection: None,
+            detail: None,
             tasks: self.task_snapshot.clone(),
             queue: queue::TaskQueue::default().metrics(),
             speeds: HashMap::new(),
@@ -1765,6 +1787,243 @@ impl DesktopShell {
         })
         .detach();
     }
+    fn show_task_details(&mut self, selection: task_details::Selection, cx: &mut Context<Self>) {
+        if self.detail_selection.as_ref() != Some(&selection) {
+            self.task_details = None;
+            self.detail_page = 0;
+        }
+        self.detail_selection = Some(selection.clone());
+        if let Some(service) = &self.transfer_service {
+            service.select_detail(Some(selection));
+        }
+        cx.notify();
+    }
+    fn close_task_details(&mut self, cx: &mut Context<Self>) {
+        self.detail_selection = None;
+        self.task_details = None;
+        self.detail_page = 0;
+        if let Some(service) = &self.transfer_service {
+            service.select_detail(None);
+        }
+        cx.notify();
+    }
+    fn reveal_task_details(&mut self, cx: &mut Context<Self>) {
+        if self.revealing_task || self.native_dialogs > 0 || self.clearing_history {
+            return;
+        }
+        let Some(selection) = self.detail_selection.clone() else {
+            return;
+        };
+        let Some(service) = self.transfer_service.clone() else {
+            return;
+        };
+        let requested = selection.clone();
+        let executor = cx.background_executor().clone();
+        self.revealing_task = true;
+        cx.notify();
+        cx.spawn(async move |shell, cx| {
+            let result = executor
+                .spawn(async move { service.reveal_task(&requested) })
+                .await;
+            let _ = shell.update(cx, |shell, cx| {
+                shell.revealing_task = false;
+                if shell.detail_selection.as_ref() == Some(&selection)
+                    && shell.native_dialogs == 0
+                    && !shell.clearing_history
+                    && !shell.show_settings_home
+                {
+                    match result {
+                        Ok(path) => {
+                            cx.reveal_path(&path);
+                            shell.set_status("已请求在本机文件管理器定位任务路径", cx);
+                        }
+                        Err(error) => shell.set_status(format!("本机路径暂无法定位：{error}"), cx),
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+    fn detail_field(label: &str, value: String) -> gpui::Div {
+        div()
+            .flex()
+            .items_start()
+            .gap_3()
+            .child(
+                div()
+                    .w(px(132.))
+                    .flex_shrink_0()
+                    .text_xs()
+                    .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                    .child(label.to_owned()),
+            )
+            .child(div().flex_1().min_w_0().text_sm().child(value))
+    }
+    fn task_details_card(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let mut card = ui_components::card().child(
+            div()
+                .flex()
+                .justify_between()
+                .items_center()
+                .child(ui_components::section_header(
+                    "ⓘ",
+                    "任务详情",
+                    "选择任务或目录组，查看统计与本机位置",
+                ))
+                .child(
+                    ui_components::compact_secondary_button("关闭详情", true).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|shell, _, _, cx| shell.close_task_details(cx)),
+                    ),
+                ),
+        );
+        let Some(detail) = &self.task_details else {
+            return card.child("正在读取任务详情…");
+        };
+        if let Some(parent) = &detail.parent_group {
+            let parent = parent.clone();
+            card = card.child(
+                ui_components::compact_secondary_button("返回目录组", true).on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |shell, _, _, cx| {
+                        shell.show_task_details(task_details::Selection::Group(parent.clone()), cx)
+                    }),
+                ),
+            );
+        }
+        let group = matches!(detail.selection, task_details::Selection::Group(_));
+        let direction = if detail.direction == task_model::TaskDirection::Send {
+            "发送"
+        } else {
+            "接收"
+        };
+        let elapsed = detail
+            .wall_seconds
+            .map_or_else(|| "未知（系统时间不可用）".into(), task_details::duration);
+        let activity = if detail.run.covered == 0 {
+            "本次运行暂无活动统计".to_owned()
+        } else {
+            format!(
+                "{} · 已记录 {}/{} 项{}",
+                task_details::duration(detail.run.seconds),
+                detail.run.covered,
+                detail.members.len(),
+                if group { "（子项累计）" } else { "" }
+            )
+        };
+        let attempts = if detail.run.covered == 0 {
+            "本次运行暂无尝试统计".to_owned()
+        } else {
+            format!(
+                "已启动 {} 次 · 重新尝试 {} 次 · 自动尝试 {} 次",
+                detail.run.attempts, detail.run.retries, detail.run.automatic
+            )
+        };
+        let path = detail.local_path.to_string_lossy().into_owned();
+        let copy_path = path.clone();
+        card = card.child(div().text_xs().text_color(rgb(ui_theme::TEXT_SECONDARY)).child(detail.scope_label))
+            .child(Self::detail_field("任务名称", detail.name.clone()))
+            .child(Self::detail_field("设备 / 方向 / 状态", format!("{} · {direction} · {}", detail.peer.short(), detail.state)))
+            .child(Self::detail_field("已确认 / 总大小", format!("{} / {}（{} / {} 字节）", format_bytes(detail.confirmed), format_bytes(detail.total), detail.confirmed, detail.total)))
+            .child(Self::detail_field("当前文件速度", if detail.rate > 0. { format!("{:.2} MiB/s", detail.rate / 1_048_576.) } else { "未知 / 无活动文件速度".into() }))
+            .child(Self::detail_field("数据预计剩余", detail.eta.map_or_else(|| "未知".into(), task_details::duration)))
+            .child(Self::detail_field("创建至今或结果", format!("{elapsed}（含等待和暂停）")))
+            .child(Self::detail_field("本次活动用时", activity))
+            .child(Self::detail_field("本次尝试统计", attempts))
+            .child(Self::detail_field("本机绑定位置", path))
+            .child(div().flex().gap_2()
+                .child(ui_components::compact_secondary_button("复制本机路径", true).on_mouse_up(MouseButton::Left, cx.listener(move |shell, _, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone())); shell.set_status("已复制任务绑定的本机路径", cx);
+                })))
+                .child(ui_components::compact_secondary_button(detail.reveal_label, !self.revealing_task && self.native_dialogs == 0 && !self.clearing_history)
+                    .on_mouse_up(MouseButton::Left, cx.listener(|shell, _, _, cx| shell.reveal_task_details(cx)))))
+            .child(div().text_xs().text_color(rgb(ui_theme::TEXT_MUTED)).child("预计时间按当前文件速度估算，不含排队等待和验证收尾；等待、暂停、失败或缺少速度时显示未知。本次活动时间包含验证及收尾，暂停和排队时不累计。"));
+        for (message, count, retryable) in &detail.errors {
+            card = card.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(ui_theme::DANGER))
+                    .child(format!(
+                        "{message} · {count} 项{}",
+                        if *retryable {
+                            " · 可手动继续"
+                        } else {
+                            ""
+                        }
+                    )),
+            );
+        }
+        if group {
+            let counts = detail.counts;
+            card = card.child(Self::detail_field("全部保留子项", format!("文件 {} · 目录 {} · 完成 {} · 失败 {} · 暂停 {} · 中断 {} · 自动等待 {} · 排队 {} · 活动 {}", counts.files, counts.directories, counts.completed, counts.failed, counts.paused, counts.interrupted, counts.waiting, counts.queued, counts.active)));
+            let pages = detail.members.len().div_ceil(10).max(1);
+            let page = self.detail_page.min(pages - 1);
+            for member in detail.members.iter().skip(page * 10).take(10) {
+                let id = member.id.clone();
+                card = card.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().flex_1().min_w_0().text_xs().child(format!(
+                                "{} · {} · {} / {} · {}{}",
+                                if member.directory { "目录" } else { "文件" },
+                                member.name,
+                                format_bytes(member.confirmed),
+                                format_bytes(member.total),
+                                member.state,
+                                member
+                                    .diagnostic
+                                    .map_or(String::new(), |message| format!(" · {message}"))
+                            )))
+                        .child(
+                            ui_components::compact_secondary_button("查看", true).on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |shell, _, _, cx| {
+                                    shell.show_task_details(
+                                        task_details::Selection::Task(id.clone()),
+                                        cx,
+                                    )
+                                }),
+                            ),
+                        ),
+                );
+            }
+            card = card.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        ui_components::compact_secondary_button("上一页", page > 0).on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|shell, _, _, cx| {
+                                shell.detail_page = shell.detail_page.saturating_sub(1);
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(format!(
+                        "子项 {}/{} 页 · 共 {} 项",
+                        page + 1,
+                        pages,
+                        detail.members.len()
+                    ))
+                    .child(
+                        ui_components::compact_secondary_button("下一页", page + 1 < pages)
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |shell, _, _, cx| {
+                                    shell.detail_page = (shell.detail_page + 1).min(pages - 1);
+                                    cx.notify();
+                                }),
+                            ),
+                    ),
+            );
+        }
+        card
+    }
     fn task_row(&mut self, index: usize, cx: &mut Context<Self>) -> gpui::Div {
         let row = self.task_rows[index].clone();
         match row {
@@ -1772,6 +2031,7 @@ impl DesktopShell {
                 let expanded =
                     self.task_filter.active() || self.expanded_groups.contains(&group.id);
                 let id = group.id.clone();
+                let detail_id = id.clone();
                 div()
                     .w_full()
                     .h(px(64.))
@@ -1816,6 +2076,18 @@ impl DesktopShell {
                                     .truncate()
                                     .child(group.label()),
                             ),
+                    )
+                    .child(
+                        ui_components::compact_secondary_button("详情", true).on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |shell, _, _, cx| {
+                                cx.stop_propagation();
+                                shell.show_task_details(
+                                    task_details::Selection::Group(detail_id.clone()),
+                                    cx,
+                                );
+                            }),
+                        ),
                     )
                     .on_mouse_up(
                         MouseButton::Left,
@@ -1874,7 +2146,25 @@ impl DesktopShell {
                     diagnostic.unwrap_or_default()
                 );
                 let icon = if is_send { "↑" } else { "↓" };
-                let mut actions = div().w(px(64.)).flex().items_center().justify_end().gap_1();
+                let detail_id = id.clone();
+                let mut actions = div()
+                    .w(px(104.))
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap_1()
+                    .child(
+                        ui_components::compact_secondary_button("详情", true).on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |shell, _, _, cx| {
+                                cx.stop_propagation();
+                                shell.show_task_details(
+                                    task_details::Selection::Task(detail_id.clone()),
+                                    cx,
+                                );
+                            }),
+                        ),
+                    );
                 if can_pause {
                     actions = actions.child(
                         ui_components::task_icon_button(
@@ -4011,6 +4301,8 @@ impl DesktopShell {
         }
         let snapshot = ui_model::Snapshot {
             space: Default::default(),
+            detail_selection: None,
+            detail: None,
             tasks: self.task_snapshot.clone(),
             queue: queue::TaskQueue::default().metrics(),
             speeds: HashMap::new(),
@@ -5575,12 +5867,13 @@ impl Render for DesktopShell {
             })
             .child(self.connection_receive_row(window, cx))
             .when_some(speed_card, |page, speed_card| page.child(speed_card))
-            .child(
-                self.transfer_card(window, cx)
-                    .when(self.show_diagnostics, |card| {
-                        card.min_h(px(320.)).flex_shrink_0()
-                    }),
-            )
+            .child(self.transfer_card(window, cx).when(
+                self.show_diagnostics || self.detail_selection.is_some(),
+                |card| card.min_h(px(320.)).flex_shrink_0(),
+            ))
+            .when(self.detail_selection.is_some(), |page| {
+                page.child(self.task_details_card(cx))
+            })
             .child(
                 div()
                     .w_full()
@@ -5920,6 +6213,10 @@ pub fn run(background_start: bool) {
                         .into(),
                         expanded_groups: HashSet::new(),
                         selected_task: None,
+                        detail_selection: None,
+                        task_details: None,
+                        detail_page: 0,
+                        revealing_task: false,
                         queue_status: "正在载入任务…".into(),
                         receive_space_status: "接收预算尚未预约".into(),
                         speed_views: Default::default(),

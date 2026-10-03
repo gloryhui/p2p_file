@@ -173,6 +173,7 @@ $BIN push --signal $SIGNAL --peer $HOME_ID ./大文件.mkv
 [断网自动恢复](docs/DESKTOP_AUTO_RESUME.md)，仅恢复本次进程中的网络中断任务。
 - [桌面接收空间预检查与共享预算](docs/DESKTOP_RECEIVE_SPACE.md)
 - [桌面拖拽文件与目录发送](docs/DESKTOP_DROP_SEND.md)
+- [桌面任务详情与本机定位](docs/DESKTOP_TASK_DETAILS.md)
 
 
 ```bash
