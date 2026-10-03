@@ -986,6 +986,9 @@ struct DesktopShell {
     download_limit_input: Entity<TextField>,
     signal_host: Entity<TextField>,
     signal_port: Entity<TextField>,
+    signal_tls_enabled: bool,
+    signal_ca_file: Entity<TextField>,
+    signal_server_name: Entity<TextField>,
     relay_server: Entity<TextField>,
     allowed_name: Entity<TextField>,
     allowed_target: Entity<TextField>,
@@ -1112,6 +1115,8 @@ impl DesktopShell {
             vec![
                 self.signal_host.clone(),
                 self.signal_port.clone(),
+                self.signal_ca_file.clone(),
+                self.signal_server_name.clone(),
                 self.relay_server.clone(),
                 self.local_password.clone(),
                 self.allowed_name.clone(),
@@ -2397,6 +2402,7 @@ impl DesktopShell {
             return false;
         };
         config.remote_auth = self.settings.remote_auth.clone();
+        config.signal_tls = self.settings.signal_tls.clone();
         config.trusted_devices = self.settings.trusted_devices.clone();
         config.config_path = Some(self.config_file.clone());
         config.transfer = self.transfer_service.clone();
@@ -2424,6 +2430,9 @@ impl DesktopShell {
                                     return;
                                 }
                                 match event {
+                                    session::SessionEvent::SignalSecurity { tls } => {
+                                        shell.connection_diagnostics.signal_security(tls, Instant::now()); cx.notify();
+                                    }
                                     session::SessionEvent::NetworkFamilies { ipv4, ipv6, relay_configured } => {
                                         shell.connection_diagnostics.network_families(ipv4, ipv6, relay_configured); cx.notify();
                                     }
@@ -2932,6 +2941,14 @@ impl DesktopShell {
         let mut draft = self.settings.clone();
         draft.signal_host = self.signal_host.read(cx).content.to_string();
         draft.signal_port = self.signal_port.read(cx).content.to_string();
+        draft.signal_tls = self.signal_tls_enabled.then(|| {
+            let ca = self.signal_ca_file.read(cx).content.trim().to_owned();
+            let name = self.signal_server_name.read(cx).content.trim().to_owned();
+            crate::discovery::signal_tls::SignalTlsClient {
+                ca_file: (!ca.is_empty()).then(|| PathBuf::from(ca)),
+                server_name: (!name.is_empty()).then_some(name),
+            }
+        });
         let relay = self.relay_server.read(cx).content.trim().to_owned();
         draft.relay_server = (!relay.is_empty()).then_some(relay);
         let relay_server = draft.relay_server.clone();
@@ -2941,7 +2958,8 @@ impl DesktopShell {
         let saved_send_limit = draft.send_concurrency;
         let signal_changed = draft.signal_host != self.settings.signal_host
             || draft.signal_port != self.settings.signal_port
-            || draft.relay_server != self.settings.relay_server;
+            || draft.relay_server != self.settings.relay_server
+            || draft.signal_tls != self.settings.signal_tls;
         let saved_draft = draft.clone();
         let background = cx.background_executor().clone();
         self.is_saving_settings = true;
@@ -2993,6 +3011,7 @@ impl DesktopShell {
                                 match session.reconfigure_network(
                                     signal_server.clone(),
                                     relay_server.clone(),
+                                    shell.settings.signal_tls.clone(),
                                 ) {
                                     Ok(()) => {
                                         shell.network_status = "正在使用新信令配置重连".into();
@@ -5083,7 +5102,16 @@ impl DesktopShell {
         let summary = if host.trim().is_empty() || port.trim().is_empty() {
             "尚未配置完整信令地址".to_owned()
         } else {
-            format!("{}:{}", host.trim(), port.trim())
+            format!(
+                "{}:{} · {}",
+                host.trim(),
+                port.trim(),
+                if self.settings.signal_tls.is_some() {
+                    "TLS（已保存）"
+                } else {
+                    "明文 TCP（已保存）"
+                }
+            )
         };
         let toggle = ui_components::secondary_button(
             if self.show_settings {
@@ -5168,6 +5196,14 @@ impl DesktopShell {
                                 .child(Self::text_field_frame(&self.signal_port, window, cx)),
                         ),
                 )
+                .child(ui_components::secondary_button(if self.signal_tls_enabled { "信令 TLS：开（保存后应用）" } else { "信令 TLS：关，明文 TCP（保存后应用）" }, !self.is_saving_settings)
+                    .on_mouse_up(MouseButton::Left, cx.listener(|shell, _, _, cx| { if !shell.is_saving_settings { shell.signal_tls_enabled = !shell.signal_tls_enabled; cx.notify(); } })))
+                .when(self.signal_tls_enabled, |card| card
+                    .child(ui_components::field_label("信令 CA 文件（可选，PEM 绝对路径）"))
+                    .child(Self::text_field_frame(&self.signal_ca_file, window, cx))
+                    .child(ui_components::field_label("证书校验主机名（可选）"))
+                    .child(Self::text_field_frame(&self.signal_server_name, window, cx)))
+                .child("TLS 开启时验证证书与主机名；校验失败停止连接，不降级为明文。关闭则使用兼容的明文 TCP。")
                 .child(ui_components::field_label(
                     "Relay Server（可选，HOST:UDP_PORT）",
                 ))
@@ -5427,6 +5463,8 @@ pub fn run(background_start: bool) {
         let initial_receive_root = settings.receive_directory.clone();
         let initial_concurrency = settings.send_concurrency;
         let initial_host = settings.signal_host.clone();
+        let initial_signal_tls = settings.signal_tls.clone();
+        let initial_tls_enabled = initial_signal_tls.is_some();
         let initial_port = settings.signal_port.clone();
         let initial_relay = settings.relay_server.clone().unwrap_or_default();
         let startup_session_config = if has_saved_network_config && identity.is_some() {
@@ -5434,6 +5472,7 @@ pub fn run(background_start: bool) {
                 &settings.signal_host,
                 &settings.signal_port,
             ));
+            config.signal_tls = settings.signal_tls.clone();
             config.network.relay_server = settings.relay_server.clone();
             Some(config)
         } else {
@@ -5499,6 +5538,27 @@ pub fn run(background_start: bool) {
                     field.content = initial_port.into();
                     field
                 });
+                let signal_ca_file = cx.new(|cx| {
+                    let mut field = TextField::new(cx, "留空使用内置 CA，或填写 PEM CA 的绝对路径");
+                    field.content = initial_signal_tls
+                        .as_ref()
+                        .and_then(|tls| tls.ca_file.as_ref())
+                        .and_then(|p| p.to_str())
+                        .unwrap_or("")
+                        .to_owned()
+                        .into();
+                    field
+                });
+                let signal_server_name = cx.new(|cx| {
+                    let mut field =
+                        TextField::new(cx, "留空按信令主机校验；可填写证书 DNS 名或 IP");
+                    field.content = initial_signal_tls
+                        .as_ref()
+                        .and_then(|tls| tls.server_name.clone())
+                        .unwrap_or_default()
+                        .into();
+                    field
+                });
                 let relay_server = cx.new(|cx| {
                     let mut field = TextField::new(cx, "留空或 relay.example:7001 / [IPv6]:7001");
                     field.content = initial_relay.into();
@@ -5555,6 +5615,9 @@ pub fn run(background_start: bool) {
                         download_limit_input,
                         signal_host,
                         signal_port,
+                        signal_tls_enabled: initial_tls_enabled,
+                        signal_ca_file,
+                        signal_server_name,
                         relay_server,
                         allowed_name,
                         allowed_target,

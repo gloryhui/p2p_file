@@ -61,6 +61,7 @@ async fn run(cli: Cli) -> Result<()> {
         } => cmd_send(&key_file, file, peer, chunk_size).await,
 
         Command::SignalServer {
+            tls,
             relay,
             listen,
             short_id_db,
@@ -75,6 +76,7 @@ async fn run(cli: Cli) -> Result<()> {
                 new_device_ids_per_minute,
                 new_device_ids_per_ip_per_minute,
                 relay,
+                tls,
             )
             .await
         }
@@ -314,6 +316,12 @@ async fn cmd_send(
 /// 把命令行参数翻译成打洞配置。
 fn direct_config(opts: &DirectOpts, peer: p2p_file::identity::NodeId) -> DirectConfig {
     let mut config = DirectConfig::new(opts.signal.clone(), peer);
+    config.signal_tls = opts
+        .signal_tls
+        .then(|| p2p_file::discovery::signal_tls::SignalTlsClient {
+            ca_file: opts.signal_ca_file.clone(),
+            server_name: opts.signal_server_name.clone(),
+        });
     config.local_port = opts.port;
     config.relay_server = opts.relay.clone();
     config.advertise_only = opts.advertise_only;
@@ -382,9 +390,11 @@ async fn cmd_signal_server(
     new_device_ids_per_minute: u32,
     new_device_ids_per_ip_per_minute: u32,
     relay: p2p_file::cli::RelayServerOpts,
+    tls: p2p_file::cli::SignalTlsServerOpts,
 ) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let config = SignalServerConfig {
+        tls: tls.config()?,
         relay: relay.config()?,
         short_id_database: Some(short_id_db),
         max_short_id_mappings: max_device_ids,
@@ -393,6 +403,14 @@ async fn cmd_signal_server(
         ..SignalServerConfig::default()
     };
     println!("信令服务器监听 {listen}");
+    println!(
+        "信令模式：{}",
+        if config.tls.is_some() {
+            "TLS（客户端校验证书；本端口仅接受 TLS）"
+        } else {
+            "明文 TCP（兼容模式）"
+        }
+    );
     if let Some(relay) = &config.relay {
         println!(
             "Relay UDP enabled: {:?}；仅转发已 pairing 且双边认证的加密 datagram。",

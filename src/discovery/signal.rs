@@ -11,9 +11,9 @@
 //!
 //! 信令走 TCP + 长度前缀 postcard；启用 Relay 还需放通配置的 UDP 端口。
 //!
-//! # 信令本身是明文的，所以注册必须自证身份
+//! # 无论是否启用 TLS，登记都必须自证身份
 //!
-//! 信令跑在明文 TCP 上，任何人都能连上来。因此登记不能只看「你声称自己是谁」：
+//! 信令默认明文 TCP，可选严格验证服务端的 TLS；登记仍使用签名证明客户端身份：
 //!
 //! ```text
 //! 客户端                                  服务器
@@ -41,17 +41,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore, mpsc, watch};
 
+use super::signal_tls::{SignalTlsClient, SignalTlsServer};
 use crate::error::{Error, Result};
 use crate::identity::{
     Identity, NodeId, public_key_from_bytes, signature_from_bytes, verify_signature,
 };
 use crate::nat::punch::PunchToken;
 use crate::protocol::frame::{read_raw_frame_limited, write_raw_frame_limited};
+trait SignalIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> SignalIo for T {}
+type SignalStream = Box<dyn SignalIo>;
+type SignalRead = ReadHalf<SignalStream>;
+type SignalWrite = WriteHalf<SignalStream>;
 
 /// 信令服务器默认端口。
 pub const DEFAULT_SIGNAL_PORT: u16 = 7000;
@@ -104,6 +109,9 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// 默认值面向公网部署；测试用更小的值来快速验证边界行为。
 #[derive(Clone, Debug)]
 pub struct SignalServerConfig {
+    pub tls: Option<SignalTlsServer>,
+    pub tls_handshake_timeout: Duration,
+    pub max_tls_handshakes: usize,
     /// None preserves the direct-only server startup and wire protocol.
     pub relay: Option<crate::relay::server::RelayServerConfig>,
     /// Persistent by default. None explicitly opts into an ephemeral embedded/test registry.
@@ -149,6 +157,9 @@ pub struct SignalServerConfig {
 impl Default for SignalServerConfig {
     fn default() -> Self {
         Self {
+            tls: None,
+            tls_handshake_timeout: Duration::from_secs(10),
+            max_tls_handshakes: 64,
             relay: None,
             short_id_database: Some(PathBuf::from("signal-device-ids.sqlite3")),
             max_short_id_mappings: 1_000_000,
@@ -766,6 +777,19 @@ pub(crate) async fn run_signal_server_on_borrowed(
     config: SignalServerConfig,
 ) -> Result<()> {
     let local = listener.local_addr()?;
+    let tls = config
+        .tls
+        .as_ref()
+        .map(SignalTlsServer::prepare)
+        .transpose()?;
+    if config.max_tls_handshakes == 0
+        || config.max_tls_handshakes > 1024
+        || config.tls_handshake_timeout.is_zero()
+    {
+        return Err(Error::Discovery("信令 TLS 握手资源配置无效".into()));
+    }
+    let handshakes = Arc::new(Semaphore::new(config.max_tls_handshakes));
+    tracing::info!(tls = tls.is_some(), "信令连接模式（TLS 开启时禁止明文）");
     tracing::info!(%local, "信令服务器已启动，等待节点接入");
 
     let mut relay_tasks = tokio::task::JoinSet::new();
@@ -818,6 +842,14 @@ pub(crate) async fn run_signal_server_on_borrowed(
             }
         };
         tracing::debug!(%remote, "信令连接建立");
+        let permit = if tls.is_some() {
+            match handshakes.clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => continue,
+            }
+        } else {
+            None
+        };
 
         let connection_id = next_connection_id;
         next_connection_id = next_connection_id.wrapping_add(1);
@@ -828,10 +860,34 @@ pub(crate) async fn run_signal_server_on_borrowed(
         let registry = Arc::clone(&registry);
         let config = Arc::clone(&config);
         let short_ids = short_ids.clone();
+        let tls = tls.clone();
         clients.spawn(async move {
-            if let Err(err) =
-                handle_signal_client(stream, registry, connection_id, config, short_ids).await
-            {
+            let result = async {
+                if let Some(tls) = tls {
+                    let _ = stream.set_nodelay(true);
+                    let secured =
+                        tokio::time::timeout(config.tls_handshake_timeout, tls.accept(stream))
+                            .await
+                            .map_err(|_| Error::Discovery("信令 TLS 握手超时".into()))?
+                            .map_err(|_| {
+                                Error::Discovery("信令 TLS 握手失败；该端口仅接受 TLS".into())
+                            })?;
+                    drop(permit);
+                    handle_signal_io(
+                        Box::new(secured),
+                        remote.ip(),
+                        registry,
+                        connection_id,
+                        config,
+                        short_ids,
+                    )
+                    .await
+                } else {
+                    handle_signal_client(stream, registry, connection_id, config, short_ids).await
+                }
+            }
+            .await;
+            if let Err(err) = result {
                 tracing::debug!(%remote, error = %err, "信令连接结束");
             }
         });
@@ -866,11 +922,29 @@ async fn handle_signal_client(
     short_ids: ShortIdResources,
 ) -> Result<()> {
     let remote_ip = stream.peer_addr()?.ip();
-    let mut short_window = LookupWindow::new();
-    let mut node_window = LookupWindow::new();
     // 信令消息都很小，别让 Nagle 拖慢牵线。
     let _ = stream.set_nodelay(true);
-    let (read_half, write_half) = stream.into_split();
+    handle_signal_io(
+        Box::new(stream),
+        remote_ip,
+        registry,
+        connection_id,
+        config,
+        short_ids,
+    )
+    .await
+}
+async fn handle_signal_io(
+    stream: SignalStream,
+    remote_ip: IpAddr,
+    registry: Arc<Mutex<Registry>>,
+    connection_id: u64,
+    config: Arc<SignalServerConfig>,
+    short_ids: ShortIdResources,
+) -> Result<()> {
+    let mut short_window = LookupWindow::new();
+    let mut node_window = LookupWindow::new();
+    let (read_half, write_half) = tokio::io::split(stream);
 
     // 有界队列：慢客户端最多积压这么多条，写不出去就断开，不会无限占内存。
     let (outbox, inbox) = mpsc::channel::<SignalMessage>(config.outbox_capacity);
@@ -1334,7 +1408,7 @@ async fn handle_signal_client(
 }
 
 async fn writer_loop(
-    mut writer: OwnedWriteHalf,
+    mut writer: SignalWrite,
     mut inbox: mpsc::Receiver<SignalMessage>,
     config: Arc<SignalServerConfig>,
 ) {
@@ -1440,6 +1514,40 @@ impl Drop for ClientTasks {
 }
 
 impl SignalingClient {
+    pub async fn connect_with_tls(
+        server: &str,
+        identity: &Identity,
+        candidates: Vec<Candidate>,
+        tls: Option<&SignalTlsClient>,
+    ) -> Result<Self> {
+        Self::connect_with_options(
+            server,
+            identity,
+            candidates,
+            Some(DEFAULT_HEARTBEAT_INTERVAL),
+            false,
+            SIGNAL_PROTOCOL_VERSION,
+            tls,
+        )
+        .await
+    }
+    pub async fn connect_desktop_with_tls(
+        server: &str,
+        identity: &Identity,
+        candidates: Vec<Candidate>,
+        tls: Option<&SignalTlsClient>,
+    ) -> Result<Self> {
+        Self::connect_with_options(
+            server,
+            identity,
+            candidates,
+            Some(DEFAULT_HEARTBEAT_INTERVAL),
+            true,
+            SHORT_ID_PROTOCOL_VERSION,
+            tls,
+        )
+        .await
+    }
     /// 连上信令服务器，通过 challenge-response 认证完成登记，并启动自动心跳。
     pub async fn connect(
         server: &str,
@@ -1472,6 +1580,7 @@ impl SignalingClient {
             heartbeat_interval,
             false,
             SIGNAL_PROTOCOL_VERSION,
+            None,
         )
         .await
     }
@@ -1491,6 +1600,7 @@ impl SignalingClient {
             Some(DEFAULT_HEARTBEAT_INTERVAL),
             true,
             SIGNAL_PROTOCOL_VERSION,
+            None,
         )
         .await
     }
@@ -1507,6 +1617,7 @@ impl SignalingClient {
             Some(DEFAULT_HEARTBEAT_INTERVAL),
             true,
             SHORT_ID_PROTOCOL_VERSION,
+            None,
         )
         .await
     }
@@ -1518,6 +1629,7 @@ impl SignalingClient {
         heartbeat_interval: Option<Duration>,
         forward_pongs: bool,
         protocol_version: u32,
+        tls: Option<&SignalTlsClient>,
     ) -> Result<Self> {
         // 服务端也会拦，但客户端自己收一下，避免明知超限还去发一个大包。
         let mut candidates = candidates;
@@ -1531,6 +1643,17 @@ impl SignalingClient {
         }
         // 周期为 0 会 panic，按「不心跳」处理。
         let heartbeat_interval = heartbeat_interval.filter(|period| !period.is_zero());
+        let tls = if let Some(options) = tls {
+            let options = options.clone();
+            let server = server.to_owned();
+            Some(
+                tokio::task::spawn_blocking(move || options.prepare(&server))
+                    .await
+                    .map_err(|_| Error::Discovery("信令 TLS 配置载入失败".into()))??,
+            )
+        } else {
+            None
+        };
 
         let stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(server))
             .await
@@ -1538,7 +1661,21 @@ impl SignalingClient {
             .map_err(|err| Error::Discovery(format!("连接信令服务器 {server} 失败: {err}")))?;
         let _ = stream.set_nodelay(true);
 
-        let (read_half, mut write_half) = stream.into_split();
+        let stream: SignalStream = if let Some((connector, name)) = tls {
+            Box::new(
+                tokio::time::timeout(Duration::from_secs(10), connector.connect(name, stream))
+                    .await
+                    .map_err(|_| Error::Discovery("信令 TLS 握手超时；未降级为明文".into()))?
+                    .map_err(|error| {
+                        Error::Discovery(format!(
+                            "信令 TLS 握手或证书/主机名校验失败；未降级为明文：{error}"
+                        ))
+                    })?,
+            )
+        } else {
+            Box::new(stream)
+        };
+        let (read_half, mut write_half) = tokio::io::split(stream);
         let mut reader = BufReader::new(read_half);
         let node_id = identity.node_id();
 
@@ -1738,7 +1875,7 @@ impl SignalingClient {
 
 /// 客户端 writer 任务：串行写出站消息，并周期发心跳。
 async fn client_writer_loop(
-    mut writer: OwnedWriteHalf,
+    mut writer: SignalWrite,
     mut outgoing: mpsc::Receiver<SignalMessage>,
     heartbeat_interval: Option<Duration>,
 ) {
@@ -1800,7 +1937,7 @@ async fn client_writer_loop(
 /// 丢弃 Pong；长期桌面会话将 Pong 转交给唯一事件消费者。任务退出时 sender
 /// 被 drop，前台等待者会看到 `None` 并报「连接已断开」。
 async fn client_reader_loop(
-    mut reader: BufReader<OwnedReadHalf>,
+    mut reader: BufReader<SignalRead>,
     events: mpsc::Sender<SignalMessage>,
     forward_pongs: bool,
 ) {
@@ -1837,9 +1974,9 @@ async fn client_reader_loop(
 }
 
 /// 完成一次 challenge-response 注册（连接建立后的前两个来回）。
-async fn register_session(
-    reader: &mut BufReader<OwnedReadHalf>,
-    writer: &mut OwnedWriteHalf,
+async fn register_session<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut BufReader<R>,
+    writer: &mut W,
     identity: &Identity,
     candidates: Vec<Candidate>,
     protocol_version: u32,

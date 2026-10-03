@@ -164,6 +164,7 @@ impl DesktopNetwork {
 /// 建立直连所需的参数。
 #[derive(Clone, Debug)]
 pub struct DirectConfig {
+    pub signal_tls: Option<crate::discovery::signal_tls::SignalTlsClient>,
     pub relay_server: Option<String>,
     pub advertise_only: bool,
     /// 信令服务器地址（阿里云那台）。
@@ -195,6 +196,7 @@ pub struct DirectConfig {
 impl DirectConfig {
     pub fn new(signal_server: impl Into<String>, peer: NodeId) -> Self {
         Self {
+            signal_tls: None,
             relay_server: None,
             advertise_only: false,
             signal_server: signal_server.into(),
@@ -221,6 +223,7 @@ pub struct DirectLink {
     signal: tokio::sync::Mutex<SignalingClient>,
     relay_used: tokio::sync::Mutex<bool>,
     signal_server: String,
+    signal_tls: Option<crate::discovery::signal_tls::SignalTlsClient>,
     probes: tokio::task::JoinSet<()>,
     observations: Vec<race::ProbeObservation>,
 }
@@ -283,10 +286,11 @@ impl DirectLink {
             let mut used = self.relay_used.lock().await;
             let mut probes = tokio::task::JoinSet::new();
             let (token, candidates, observations) = if *used {
-                let mut signal = SignalingClient::connect(
+                let mut signal = SignalingClient::connect_with_tls(
                     &self.signal_server,
                     identity,
                     self.network.local_candidates.clone(),
+                    self.signal_tls.as_ref(),
                 )
                 .await?;
                 let offer =
@@ -361,10 +365,11 @@ pub async fn establish(identity: &Identity, config: &DirectConfig) -> Result<Dir
         include_loopback: config.include_loopback,
     })
     .await?;
-    let mut signal = SignalingClient::connect(
+    let mut signal = SignalingClient::connect_with_tls(
         &config.signal_server,
         identity,
         network.local_candidates.clone(),
+        config.signal_tls.as_ref(),
     )
     .await?;
     let offer = resolve_peer_waiting(&mut signal, config.peer, config.signal_timeout).await?;
@@ -422,6 +427,7 @@ pub async fn establish(identity: &Identity, config: &DirectConfig) -> Result<Dir
         peer_node_id: config.peer,
         peer_candidates,
         signal_server: config.signal_server.clone(),
+        signal_tls: config.signal_tls.clone(),
         signal: tokio::sync::Mutex::new(signal),
         relay_used: tokio::sync::Mutex::new(false),
         probes,

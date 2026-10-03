@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const APP_DIR_NAME: &str = "p2p_file";
-const CONFIG_SCHEMA_VERSION: u32 = 8;
+const CONFIG_SCHEMA_VERSION: u32 = 9;
 static CONFIG_MUTATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const LEGACY_CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -99,6 +99,7 @@ impl SpeedtestDirection {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SettingsDraft {
+    pub signal_tls: Option<crate::discovery::signal_tls::SignalTlsClient>,
     pub background: super::background::BackgroundOptions,
     pub file_limits: super::bandwidth::FileLimits,
     pub notifications: bool,
@@ -196,6 +197,7 @@ impl SettingsDraft {
             background: Default::default(),
             file_limits: Default::default(),
             notifications: false,
+            signal_tls: None,
             relay_server: None,
             signal_host: String::new(),
             signal_port: String::new(),
@@ -221,6 +223,7 @@ impl SettingsDraft {
             background: config.background,
             file_limits: config.file_limits,
             notifications: config.notifications,
+            signal_tls: config.signal_tls,
             relay_server: config.relay_server,
             signal_host: config
                 .signal
@@ -265,6 +268,7 @@ impl SettingsDraft {
         }
 
         let config = DesktopConfig {
+            signal_tls: self.signal_tls.clone(),
             background: self.background,
             file_limits: self.file_limits,
             notifications: self.notifications,
@@ -290,6 +294,15 @@ impl SettingsDraft {
     pub fn save_atomic(&self, path: &Path) -> Result<(), ConfigError> {
         let _guard = config_mutation_lock()?;
         let mut config = self.to_config()?;
+        if let (Some(tls), Some(signal)) = (&config.signal_tls, &config.signal) {
+            let server = if signal.host.parse::<std::net::Ipv6Addr>().is_ok() {
+                format!("[{}]:{}", signal.host, signal.port)
+            } else {
+                format!("{}:{}", signal.host, signal.port)
+            };
+            tls.prepare(&server)
+                .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        }
         if let Some(saved) = DesktopConfig::load(path)? {
             // A settings draft predating a trust/password mutation must not undo it.
             config.background = saved.background;
@@ -341,6 +354,8 @@ impl DesktopConfig {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DesktopConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signal_tls: Option<crate::discovery::signal_tls::SignalTlsClient>,
     #[serde(default)]
     background: super::background::BackgroundOptions,
     #[serde(default)]
@@ -398,6 +413,7 @@ impl DesktopConfig {
                 background: Default::default(),
                 file_limits: Default::default(),
                 notifications: false,
+                signal_tls: None,
                 relay_server: None,
                 schema_version: CONFIG_SCHEMA_VERSION,
                 signal: None,
@@ -524,6 +540,7 @@ impl DesktopConfig {
                     background: Default::default(),
                     file_limits: Default::default(),
                     notifications: false,
+                    signal_tls: None,
                     relay_server: None,
                     schema_version: CONFIG_SCHEMA_VERSION,
                     signal: Some(legacy.signal),
@@ -537,7 +554,7 @@ impl DesktopConfig {
                     trusted_devices: Vec::new(),
                 }
             }
-            2 | 3 | 4 | 5 | 6 | 7 | CONFIG_SCHEMA_VERSION => {
+            2 | 3 | 4 | 5 | 6 | 7 | 8 | CONFIG_SCHEMA_VERSION => {
                 let mut config = serde_json::from_slice::<Self>(&bytes)
                     .map_err(|error| ConfigError::Corrupt(error.to_string()))?;
                 if version < 4 && (config.signal.is_none() || config.receive_directory.is_none()) {
@@ -558,6 +575,9 @@ impl DesktopConfig {
                 }
                 if version < 8 && config.notifications {
                     return Err(ConfigError::Corrupt("旧配置版本不能启用系统通知".into()));
+                }
+                if version < 9 && config.signal_tls.is_some() {
+                    return Err(ConfigError::Corrupt("旧配置版本不能启用信令 TLS".into()));
                 }
                 // v2 had target-only grants. Preserve rows, but require explicit peer authorization.
                 if version == 2 {
@@ -581,6 +601,24 @@ impl DesktopConfig {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(tls) = &self.signal_tls {
+            let signal = self
+                .signal
+                .as_ref()
+                .ok_or_else(|| ConfigError::Invalid("信令 TLS 必须配置主机".into()))?;
+            crate::discovery::signal_tls::server_name(
+                "",
+                tls.server_name.as_deref().or(Some(&signal.host)),
+            )
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+            if let Some(path) = &tls.ca_file
+                && (!path.is_absolute() || path.to_str().is_none())
+            {
+                return Err(ConfigError::Invalid(
+                    "信令 CA 文件必须使用可显示的绝对路径".into(),
+                ));
+            }
+        }
         if self.schema_version != CONFIG_SCHEMA_VERSION {
             return Err(ConfigError::Invalid(format!(
                 "不支持的 schema_version {}",
@@ -1011,11 +1049,60 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn signaling_tls_configuration_migrates_plaintext_and_missing_ca_never_disables_tls() {
+        let dir = temp_dir("signaling-tls");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let draft = valid_draft(dir.clone());
+        draft.save_atomic(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        for version in 2..=8 {
+            let mut old: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            old["schema_version"] = version.into();
+            std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+            assert!(
+                DesktopConfig::load(&path)
+                    .unwrap()
+                    .unwrap()
+                    .signal_tls
+                    .is_none()
+            );
+            old["signal_tls"] = serde_json::json!({"ca_file": null, "server_name": null});
+            std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+            assert!(DesktopConfig::load(&path).is_err());
+        }
+        std::fs::write(&path, &original).unwrap();
+        let fixture = crate::discovery::signal_tls::tests::Fixture::new(false);
+        let mut secured = draft.clone();
+        secured.signal_tls = Some(fixture.client.clone());
+        secured.save_atomic(&path).unwrap();
+        assert_eq!(
+            DesktopConfig::load(&path).unwrap().unwrap().signal_tls,
+            secured.signal_tls
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        let mut invalid = secured.clone();
+        invalid.signal_tls.as_mut().unwrap().ca_file = Some(dir.join("missing.pem"));
+        assert!(invalid.save_atomic(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::remove_file(fixture.client.ca_file.as_ref().unwrap()).unwrap();
+        // Load preserves TLS policy even if the CA disappears after saving.
+        assert_eq!(
+            DesktopConfig::load(&path).unwrap().unwrap().signal_tls,
+            secured.signal_tls
+        );
+        let mut invalid = secured;
+        invalid.signal_tls.as_mut().unwrap().server_name = Some("bad/name".into());
+        assert!(invalid.to_config().is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     fn valid_draft(receive_directory: PathBuf) -> SettingsDraft {
         SettingsDraft {
             background: Default::default(),
             file_limits: Default::default(),
             notifications: false,
+            signal_tls: None,
             relay_server: None,
             signal_host: "relay.example.test".into(),
             signal_port: "7000".into(),
@@ -1096,6 +1183,7 @@ mod tests {
             background: Default::default(),
             file_limits: Default::default(),
             notifications: false,
+            signal_tls: None,
             relay_server: None,
             schema_version: CONFIG_SCHEMA_VERSION,
             signal: Some(SignalConfig {

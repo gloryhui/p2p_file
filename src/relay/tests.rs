@@ -271,12 +271,23 @@ pub(crate) async fn signaling_fixture() -> (
     SocketAddr,
     tokio::task::JoinHandle<crate::Result<()>>,
 ) {
+    signaling_fixture_with_tls(None).await
+}
+
+pub(crate) async fn signaling_fixture_with_tls(
+    tls: Option<crate::discovery::signal_tls::SignalTlsServer>,
+) -> (
+    SocketAddr,
+    SocketAddr,
+    tokio::task::JoinHandle<crate::Result<()>>,
+) {
     let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = tcp.local_addr().unwrap();
     let reserve = socket(AddressFamily::Ipv4).await;
     let relay = reserve.local_addr().unwrap();
     drop(reserve);
     let config = crate::discovery::signal::SignalServerConfig {
+        tls,
         relay: Some(server::RelayServerConfig {
             listen: vec![relay],
             ..Default::default()
