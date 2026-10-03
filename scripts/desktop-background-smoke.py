@@ -69,6 +69,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--diagnostics-preview", action="store_true")
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
     output = args.output.resolve()
@@ -150,6 +151,11 @@ def main():
             command("xdotool", "click", "1")
             time.sleep(0.3)
             command("import", "-window", window, str(output / "main-window.png"))
+            if args.diagnostics_preview:
+                command("xdotool", "mousemove", "--window", window, str(int(geometry["WIDTH"]) - 140), "48")
+                command("xdotool", "click", "1")
+                time.sleep(0.3)
+                command("import", "-window", window, str(output / "connection-diagnostics.png"))
         command("xdotool", "key", "alt+F4")
         wait_for(lambda: not mapped(window))
         assert app.poll() is None
