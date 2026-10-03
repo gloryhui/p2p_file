@@ -54,11 +54,13 @@ fn parse_speedtest_block_size(raw: &str) -> std::result::Result<u32, String> {
 ///
 /// 目标是在公网上把文件直接发给对方：STUN 探出各自的公网映射，双方同时
 /// 打洞，打通后走 QUIC 加密通道传数据；IPv6 原生直连与 IPv4 并行尝试。
+/// 用户配置 Relay 且 Direct 未及时认证成功时，延迟通过 UDP Relay 转发端到端
+/// 加密的 QUIC datagram；Relay 看不到业务明文，设备间 QUIC / Ed25519 身份认证不变。
 #[derive(Debug, Parser)]
 #[command(
     name = "p2p_file",
     version,
-    about = "点对点直连：NAT 穿透 + 文件传输 + 通用 TCP 隧道",
+    about = "点对点直连：IPv4/IPv6 NAT 穿透 + QUIC，支持文件传输、TCP 隧道与端到端加密 UDP Relay 兜底",
     propagate_version = true
 )]
 pub struct Cli {
@@ -77,7 +79,7 @@ pub struct Cli {
 /// 打洞相关的公共参数。`serve` / `tunnel` / `push` 都要用。
 #[derive(Debug, Args, Clone)]
 pub struct DirectOpts {
-    /// Optional authenticated UDP Relay; starts only after direct fallback delay.
+    /// Optional UDP Relay if Direct cannot authenticate promptly; forwards end-to-end encrypted QUIC only.
     #[arg(long, value_name = "HOST:PORT", value_parser = parse_relay_spec)]
     pub relay: Option<String>,
     /// Advertise only explicit addresses (network diagnostics / deterministic fixtures).
@@ -175,7 +177,7 @@ pub enum Command {
         port: u16,
     },
 
-    /// 跑信令服务器，可选转发加密 UDP datagram 的 Relay
+    /// 跑信令服务；Direct 优先，可选 UDP Relay 只转发端到端加密的 QUIC datagram
     SignalServer {
         #[command(flatten)]
         relay: RelayServerOpts,
@@ -303,7 +305,7 @@ fn parse_relay_spec(raw: &str) -> std::result::Result<String, String> {
 
 #[derive(Debug, Args)]
 pub struct RelayServerOpts {
-    /// Fixed Relay UDP listener; repeat for the other native address family.
+    /// Fixed UDP listener forwarding end-to-end encrypted QUIC; repeat for the other native family.
     #[arg(long, value_name = "ADDR")]
     pub relay_listen: Vec<SocketAddr>,
     #[arg(long, default_value_t = crate::relay::server::DEFAULT_TICKET_TTL)]

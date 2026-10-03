@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 #
 # 端到端验证：在一台机器上跑起「家里那台」和「本机」两个进程，
-# 用真实的信令服务器牵线、真实的 UDP 打洞、真实的 QUIC 隧道，
+# 用真实的信令服务器牵线、原生 IPv4/IPv6 直连或可选认证 UDP Relay、真实的 QUIC 隧道，
 # 验证「隧道端口转发」和「文件直推」两条路都能通。
 #
 # 用法：
 #   ./scripts/e2e.sh              # 用 target/debug
 #   ./scripts/e2e.sh --release    # 用 target/release
 #
-# 注意：两个进程用的是同一个 IP，所以打洞一定会命中局域网候选地址。
+# 注意：Direct fixture 的两个进程使用同一个 IP，可命中局域网候选地址；
+# Relay fixture 使用受控直连黑洞，UDP Relay 只转发设备间端到端加密的 QUIC datagram。
 # 这个脚本验证的是**整条链路的接线**（信令、令牌、打洞、QUIC、隧道分发、
 # 文件落盘校验），验证不了真实 NAT 穿透——那需要两台在不同网络里的机器。
 # NAT 穿透的关键逻辑由 src/nat/punch.rs 的单元测试覆盖（含地址相关映射场景）。

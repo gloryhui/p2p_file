@@ -4,8 +4,10 @@
 
 ## 1. 总体目标
 
-两台设备跨公网直接传输文件。中心服务器只做**信令 / 发现**，数据尽量走 P2P 直连；
-配置 Relay 后，直连竞速无 authenticated winner 时延迟回退到认证 UDP Relay，保证「能连上」优先于「一定直连」。
+两台设备跨公网优先通过原生 IPv6 / IPv4 P2P 直连传输文件。Direct 成功时服务器只负责
+**信令 / 发现**，不承载业务数据；用户配置 Relay 且 Direct 无法及时建立 authenticated
+transport 时，延迟回退到认证 UDP Relay。Relay UDP 服务只转发端到端加密的 QUIC
+datagram，看不到业务明文；QUIC / Ed25519 身份认证仍然是设备间端到端。
 
 ## 2. 分层结构
 
@@ -23,6 +25,7 @@ src/
     punch.rs       打洞状态机（同时开启 + 令牌鉴权）
     portmap.rs     UPnP IGD / NAT-PMP 主动端口映射（空壳）
   net/            把上面这些串起来：STUN → 候选收集 → 信令 → 打洞 → QUIC 端点
+  relay/          可选认证 UDP Relay：pairing admission、原样 datagram 转发与客户端兜底
   tunnel/         通用 TCP 端口转发 + 文件直推 + 测速分发 + 空闲重打洞
   speedtest.rs    P2P / QUIC 内存到内存测速
   transport/      数据通道（QUIC）
@@ -32,14 +35,14 @@ src/
   storage/        临时文件与续传状态持久化
 ```
 
-数据流：
+Direct 成功时的数据流：
 
 ```
    serve（家里那台）                  tunnel / push（外面那台）
         │                                    │
         └──── TCP 信令（只交换地址和令牌）────┘
                      │
-              公网信令服务器（不碰业务数据）
+              公网 TCP 信令服务（登记/候选/令牌）
                      │
         ┌────────────┴────────────┐
         │   UDP 同时打洞（同一 socket）
@@ -50,6 +53,10 @@ src/
         ┌────────────┴────────────┐
    文件流（Manifest）        隧道流（TunnelOpen → 转发到白名单目标）
 ```
+
+用户配置 Relay 且 Direct 无法及时建立 authenticated transport 时，数据路径改为
+`设备 A ↔ Relay UDP 服务 ↔ 设备 B`，中间只转发端到端加密的 QUIC datagram；
+设备间 QUIC / Ed25519 / TLS session binding 与业务授权不变。详见 §4.9。
 
 ## 3. 关键技术决策
 
@@ -243,7 +250,7 @@ RST（`Err`），提前返回，节点就永远留在「在线」表里——服
 - **信令专用帧上限。** 信令用 `MAX_SIGNAL_FRAME_LEN = 64 KiB`，而不是业务分片那
   16 MiB 的通用上限——长度头必须在分配前检查。
 - **超时。** 首帧、注册应答、登记后的空闲、单帧写入各有超时；未认证连接的窗口短，
-  已登记的宽松（业务数据走 P2P，长时间不碰信令是正常的）。
+  已登记的宽松（业务数据走已认证 QUIC，可直连或经 Relay；长时间没有信令业务请求是正常的）。
 
 客户端候选地址超过上限时会先截断再签名，否则会被服务器按超限拒绝。
 

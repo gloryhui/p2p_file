@@ -5,9 +5,9 @@
 - **传文件** —— 分片、BLAKE3 逐片校验、断点续传。
 - **通用 TCP 隧道** —— 把本机一个端口转发到对端的任意服务（`ssh`、`rdp`、`http`……）。
 
-直连成功时服务器只交换地址，不承载业务数据。用户配置 Relay 且直连尚未认证成功时，
-Relay UDP 服务延迟转发**加密 QUIC datagram**；QUIC / Ed25519 仍是两台设备端到端，
-服务器看不到业务明文。
+Direct 成功时服务器只负责信令，不承载业务数据。用户配置 Relay 且 Direct 无法
+及时建立 authenticated transport 时，Relay UDP 服务延迟转发**端到端加密的 QUIC
+datagram**。Relay 看不到业务明文，QUIC / Ed25519 身份认证仍然是设备间端到端。
 
 ## 快速开始
 
@@ -46,7 +46,9 @@ $BIN signal-server --listen $SIGNAL
 
 直连模式在**云厂商的安全组**里放通 TCP 7000；启用 Relay 时还需放通对应 UDP 端口。
 
-它只做牵线，1 核 1M 带宽都绰绰有余。开机自启见[部署](#部署为-systemd-服务)。
+以上命令仅启用 TCP 信令；Direct 成功时云主机不承载业务数据。若启用可选 Relay UDP
+服务，则需按实际转发流量准备带宽；Relay 只转发端到端加密的 QUIC datagram，
+看不到业务明文。开机自启见[部署](#部署为-systemd-服务)。
 
 ### 第 2 步：两台机器各拿一次身份
 
@@ -216,7 +218,7 @@ $BIN speedtest \
 ```ini
 # /etc/systemd/system/p2p-signal.service
 [Unit]
-Description=p2p_file 信令服务器（只牵线，不过数据）
+Description=p2p_file 信令服务（可选端到端加密 UDP Relay 兜底）
 After=network-online.target
 
 [Service]
@@ -228,6 +230,9 @@ StandardOutput=journal
 [Install]
 WantedBy=multi-user.target
 ```
+
+该示例默认只启用 TCP 信令。启用 Relay 时按下文“可选认证 UDP Relay 兜底”添加
+`--relay-listen` 并放通对应 UDP 端口；Direct 优先，Relay 按需转发加密 QUIC datagram。
 
 ```bash
 sudo systemctl daemon-reload

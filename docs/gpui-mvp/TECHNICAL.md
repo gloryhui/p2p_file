@@ -178,7 +178,9 @@ T004 必须用 ADR 和测试说明：
 - 不能仅 clone socket 发几个包就宣称完成旧版同等的打洞确认；
 - 闲置重建、信令重连和活跃文件传输如何互不破坏。
 
-允许最小必要重构 net/discovery/tunnel；不做中继或全新 NAT 算法。真实双 NAT 验证放在 T011/T012。
+此 GPUI MVP 阶段允许最小必要重构 net/discovery/tunnel，不包含中继或全新 NAT 算法；
+真实双 NAT 验证放在 T011/T012。后续可选认证 UDP Relay 的当前实现见
+[架构 §4.9](../ARCHITECTURE.md#49-认证-udp-relay-fallbackissue-59)。
 
 ## 6. 桌面协议扩展
 

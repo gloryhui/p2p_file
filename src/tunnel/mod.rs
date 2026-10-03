@@ -1986,7 +1986,7 @@ mod tests {
         serve_task.abort();
     }
 
-    /// 全链路：信令牵线 → 打洞 → 直接推文件（不经过任何服务器）。
+    /// 本用例验证 Direct 路径：信令牵线 → 打洞 → 推文件，业务数据不经过服务器。
     #[tokio::test]
     async fn 打洞后能直接推文件() {
         let signal_addr = spawn_signal_server().await;

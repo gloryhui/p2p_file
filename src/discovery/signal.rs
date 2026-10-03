@@ -1,10 +1,13 @@
 //! 公网信令：让两个素不相识的节点交换各自的候选地址。
 //!
-//! 信令服务器只做「牵线」，**不碰业务数据**。职责是：
+//! Direct 成功时服务器只负责信令，不承载业务数据。信令职责是：
 //!
 //! 1. 节点上线时登记自己的节点 ID 和候选地址；
 //! 2. 一方查询另一方时，把双方候选互相推送；
-//! 3. 之后双方自行直连；可选独立 Relay UDP task 只转发加密 datagram。
+//! 3. 之后双方优先自行直连；用户配置 Relay 且 Direct 未及时建立 authenticated
+//!    transport 时，可选独立 Relay UDP task 延迟转发端到端加密的 QUIC datagram。
+//!
+//! Relay 看不到业务明文，QUIC / Ed25519 身份认证仍是设备间端到端。
 //!
 //! 信令走 TCP + 长度前缀 postcard；启用 Relay 还需放通配置的 UDP 端口。
 //!
@@ -131,7 +134,7 @@ pub struct SignalServerConfig {
     pub register_timeout: Duration,
     /// 登记成功后，两次收到帧之间的最大空闲时间。
     ///
-    /// 这是一条兜底：真正的业务数据走 P2P 直连，长时间不碰信令是正常的，
+    /// 这是一条兜底：业务数据走已认证 QUIC（Direct 或 Relay），长时间没有信令业务请求是正常的，
     /// 所以给得比较宽松，只用来回收半死连接。
     pub idle_timeout: Duration,
     /// 单帧写入超时。
@@ -185,7 +188,7 @@ impl SignalServerConfig {
 pub enum CandidateKind {
     /// 服务器反射地址（STUN 看到的公网映射）。
     ServerReflexive,
-    /// 中继地址（TURN / relay），成功率最高但绕远路。
+    /// Relay 兜底候选；实际使用须经过认证 UDP admission，不代表实现完整 TURN。
     Relay,
     /// 用端口预测猜出来的地址，只在对称型 NAT 下才用。
     Predicted,
@@ -196,8 +199,8 @@ pub enum CandidateKind {
 impl CandidateKind {
     /// 数字越小越优先尝试。
     ///
-    /// 顺序是刻意排的：先试公网映射（直连、延迟低），再试局域网和 IPv6
-    /// 直连（同网段时最快），打洞不成才用中继，最后才是猜出来的地址。
+    /// 顺序是刻意排的：先公网映射，再 Host（局域网或原生 IPv6）和端口预测地址，
+    /// 最后 Relay 候选；运行时原生 IPv6/IPv4 直连竞速优先，认证 Relay 只做延迟兜底。
     pub fn priority(self) -> u32 {
         match self {
             Self::ServerReflexive => 0,
