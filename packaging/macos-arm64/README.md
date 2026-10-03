@@ -7,7 +7,7 @@
 - 构建机：Apple Silicon arm64，原生 arm64 终端环境
 - 最低系统：macOS 13
 - Rust target：`aarch64-apple-darwin`
-- 不支持 Intel Mac、Rosetta 进程或 universal2 候选构建
+- 此入口不接受 Intel Mac、Rosetta 进程或 universal2 候选构建；Intel 使用 [macos-x86_64 入口](../macos-x86_64/README.md)。
 
 Rosetta 下的 `x86_64` 进程不能作为正式候选构建环境，即使主机本身是 Apple Silicon。请在 Finder 的终端应用信息中关闭“使用 Rosetta 打开”，再启动原生终端。
 
@@ -52,7 +52,7 @@ Rosetta 下的 `x86_64` 进程不能作为正式候选构建环境，即使主�
 
 ## 常见问题
 
-- **doctor 报 Rosetta 或 x86_64**：使用原生 arm64 Terminal/iTerm 进程；Intel Mac 不支持。
+- **doctor 报 Rosetta 或 x86_64**：使用原生 arm64 Terminal/iTerm 进程；Intel Mac 使用 `packaging/macos-x86_64/build.sh`。
 - **缺少 Xcode Command Line Tools / SDK**：按 doctor 提示手动执行 `xcode-select --install`，并确认 `xcode-select -p` 指向有效开发者目录。
 - **Rust target 缺失**：运行 `rustup target add aarch64-apple-darwin`。
 - **Python 太旧或没有 `tomllib`**：安装 Python 3.11+，推荐 3.12，并确认 `python3 -c 'import tomllib'` 成功。

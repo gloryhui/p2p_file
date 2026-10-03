@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Diagnose a native Apple Silicon macOS packaging environment. This script never installs software.
+# Diagnose a native Intel macOS packaging environment. This script never installs software.
 
 set -o pipefail
 
@@ -7,7 +7,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 REPO_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd -P)
 FAILURES=0
 WARNINGS=0
-TARGET=aarch64-apple-darwin
+TARGET=x86_64-apple-darwin
 
 report() {
     local state=$1 name=$2 detected=$3 required=$4 remediation=$5
@@ -111,22 +111,13 @@ else
 fi
 
 PROCESS_ARCH=$(uname -m 2>/dev/null || true)
-if [[ "$PROCESS_ARCH" == arm64 ]]; then
-    report PASS "native architecture" "$PROCESS_ARCH" "Apple Silicon arm64; $TARGET" "none"
+TRANSLATED=$(sysctl -in sysctl.proc_translated 2>/dev/null || echo 0)
+HARDWARE_ARM=$(sysctl -in hw.optional.arm64 2>/dev/null || echo 0)
+if [[ "$PROCESS_ARCH" == x86_64 && "$TRANSLATED" != 1 && "$HARDWARE_ARM" != 1 ]]; then
+    report PASS "native architecture" "$PROCESS_ARCH" "Intel x86_64; $TARGET" "none"
 else
-    TRANSLATED=$(sysctl -in sysctl.proc_translated 2>/dev/null || echo 0)
-    HARDWARE_ARM=$(sysctl -in hw.optional.arm64 2>/dev/null || echo 0)
-    if [[ "$TRANSLATED" == 1 ]]; then
-        DETECTED="$PROCESS_ARCH process running under Rosetta on arm64 hardware"
-        FIX="Use a native arm64 terminal; do not launch it with Rosetta."
-    elif [[ "$HARDWARE_ARM" == 1 ]]; then
-        DETECTED="$PROCESS_ARCH process on Apple Silicon (likely translated)"
-        FIX="Use a native arm64 terminal outside Rosetta."
-    else
-        DETECTED="${PROCESS_ARCH:-unknown}; Intel/unrecognized host"
-        FIX="Use a native Apple Silicon Mac for this entrypoint. Intel users should use packaging/macos-x86_64/build.sh."
-    fi
-    report FAIL "native architecture" "$DETECTED" "arm64 process; $TARGET" "$FIX"
+    DETECTED="${PROCESS_ARCH:-unknown}; arm64 hardware=$HARDWARE_ARM; Rosetta=$TRANSLATED"
+    report FAIL "native architecture" "$DETECTED" "native Intel x86_64; $TARGET" "Use an Intel Mac for this entrypoint. Apple Silicon users should use packaging/macos-arm64/build.sh in a native arm64 terminal."
 fi
 
 if path=$(command -v xcode-select 2>/dev/null); then

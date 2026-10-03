@@ -21,6 +21,11 @@ TARGETS = {
     'x86_64-unknown-linux-gnu': ('Linux', 'Ubuntu 24.04 x86_64'),
     'x86_64-pc-windows-msvc': ('Windows', 'Windows 10 22H2 / Windows 11 x64'),
     'aarch64-apple-darwin': ('Darwin', 'macOS 13+ Apple Silicon arm64'),
+    'x86_64-apple-darwin': ('Darwin', 'macOS 13+ Intel x86_64'),
+}
+MACOS_ARCHES = {
+    'aarch64-apple-darwin': ('arm64', 0x0100000c),
+    'x86_64-apple-darwin': ('x86_64', 0x01000007),
 }
 REPO = Path(__file__).resolve().parent.parent
 
@@ -38,8 +43,12 @@ def digest(path):
 
 
 def architecture(path, target):
+    if target not in TARGETS:
+        raise ValueError('unsupported package target')
     with path.open('rb') as stream:
         header = stream.read(64)
+        if len(header) < 64:
+            raise ValueError('truncated executable header')
         if target.endswith('linux-gnu'):
             if header[:6] != b'\x7fELF\x02\x01' or struct.unpack_from('<H', header, 18)[0] != 62:
                 raise ValueError('expected ELF64 little-endian x86_64')
@@ -49,8 +58,22 @@ def architecture(path, target):
             stream.seek(struct.unpack_from('<I', header, 60)[0])
             if stream.read(6) != b'PE\0\0\x64\x86':
                 raise ValueError('expected native PE x64')
-        elif header[:4] != b'\xcf\xfa\xed\xfe' or struct.unpack_from('<I', header, 4)[0] != 0x0100000c:
-            raise ValueError('expected thin Mach-O arm64; Intel/fat artifacts are not supported')
+        else:
+            machine, cpu = MACOS_ARCHES[target]
+            if header[:4] != b'\xcf\xfa\xed\xfe' or struct.unpack_from('<I', header, 4)[0] != cpu:
+                raise ValueError(f'expected thin Mach-O {machine}; wrong-architecture/fat artifacts are not supported')
+
+
+def native_host(target):
+    if platform.system() != TARGETS[target][0]:
+        raise ValueError('packaging must execute on the actual native platform')
+    if target in MACOS_ARCHES:
+        machine, _ = MACOS_ARCHES[target]
+        if platform.machine() != machine:
+            raise ValueError(f'packaging {target} requires a native {machine} Mac')
+        translated = subprocess.run(['sysctl', '-in', 'sysctl.proc_translated'], capture_output=True, text=True)
+        if translated.stdout.strip() == '1':
+            raise ValueError('Rosetta cannot supply native Mac packaging/validation evidence')
 
 
 def dependency_bundle(destination):
@@ -218,10 +241,12 @@ def main():
     if output.exists() and any(output.iterdir()):
         parser.error('output must be new or empty; evidence is never overwritten')
     output.mkdir(parents=True, exist_ok=True)
-    if platform.system() != TARGETS[args.target][0]:
-        parser.error('packaging must execute on the actual native platform')
-    if args.app_only and args.target != 'aarch64-apple-darwin':
-        parser.error('--app-only is supported only for native Apple Silicon macOS packages')
+    try:
+        native_host(args.target)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.app_only and args.target not in MACOS_ARCHES:
+        parser.error('--app-only is supported only for native macOS packages')
     head = run(['git', 'rev-parse', 'HEAD'])
     dirty = bool(run(['git', 'status', '--porcelain']))
     if dirty and not args.allow_dirty:
