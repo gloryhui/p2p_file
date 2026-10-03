@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const APP_DIR_NAME: &str = "p2p_file";
-const CONFIG_SCHEMA_VERSION: u32 = 7;
+const CONFIG_SCHEMA_VERSION: u32 = 8;
 static CONFIG_MUTATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const LEGACY_CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -101,6 +101,7 @@ impl SpeedtestDirection {
 pub struct SettingsDraft {
     pub background: super::background::BackgroundOptions,
     pub file_limits: super::bandwidth::FileLimits,
+    pub notifications: bool,
     pub relay_server: Option<String>,
     pub signal_host: String,
     pub signal_port: String,
@@ -194,6 +195,7 @@ impl SettingsDraft {
         Self {
             background: Default::default(),
             file_limits: Default::default(),
+            notifications: false,
             relay_server: None,
             signal_host: String::new(),
             signal_port: String::new(),
@@ -218,6 +220,7 @@ impl SettingsDraft {
         Self {
             background: config.background,
             file_limits: config.file_limits,
+            notifications: config.notifications,
             relay_server: config.relay_server,
             signal_host: config
                 .signal
@@ -264,6 +267,7 @@ impl SettingsDraft {
         let config = DesktopConfig {
             background: self.background,
             file_limits: self.file_limits,
+            notifications: self.notifications,
             relay_server: self.relay_server.clone(),
             schema_version: CONFIG_SCHEMA_VERSION,
             signal: Some(SignalConfig {
@@ -290,6 +294,7 @@ impl SettingsDraft {
             // A settings draft predating a trust/password mutation must not undo it.
             config.background = saved.background;
             config.file_limits = saved.file_limits;
+            config.notifications = saved.notifications;
             config.trusted_devices = saved.trusted_devices;
             config.remote_auth = saved.remote_auth;
         }
@@ -340,6 +345,8 @@ pub struct DesktopConfig {
     background: super::background::BackgroundOptions,
     #[serde(default)]
     file_limits: super::bandwidth::FileLimits,
+    #[serde(default)]
+    notifications: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     relay_server: Option<String>,
     schema_version: u32,
@@ -390,6 +397,7 @@ impl DesktopConfig {
             None => Self {
                 background: Default::default(),
                 file_limits: Default::default(),
+                notifications: false,
                 relay_server: None,
                 schema_version: CONFIG_SCHEMA_VERSION,
                 signal: None,
@@ -414,6 +422,13 @@ impl DesktopConfig {
         let mut config = Self::load(path)?
             .ok_or_else(|| ConfigError::Invalid("请先完成本机身份初始化".into()))?;
         config.background = options;
+        config.write_atomic(path)
+    }
+    pub fn save_notifications(path: &Path, enabled: bool) -> Result<(), ConfigError> {
+        let _guard = config_mutation_lock()?;
+        let mut config = Self::load(path)?
+            .ok_or_else(|| ConfigError::Invalid("请先完成本机身份初始化".into()))?;
+        config.notifications = enabled;
         config.write_atomic(path)
     }
     pub fn save_file_limits(
@@ -508,6 +523,7 @@ impl DesktopConfig {
                 Self {
                     background: Default::default(),
                     file_limits: Default::default(),
+                    notifications: false,
                     relay_server: None,
                     schema_version: CONFIG_SCHEMA_VERSION,
                     signal: Some(legacy.signal),
@@ -521,7 +537,7 @@ impl DesktopConfig {
                     trusted_devices: Vec::new(),
                 }
             }
-            2 | 3 | 4 | 5 | 6 | CONFIG_SCHEMA_VERSION => {
+            2 | 3 | 4 | 5 | 6 | 7 | CONFIG_SCHEMA_VERSION => {
                 let mut config = serde_json::from_slice::<Self>(&bytes)
                     .map_err(|error| ConfigError::Corrupt(error.to_string()))?;
                 if version < 4 && (config.signal.is_none() || config.receive_directory.is_none()) {
@@ -539,6 +555,9 @@ impl DesktopConfig {
                 }
                 if version < 7 && config.file_limits != Default::default() {
                     return Err(ConfigError::Corrupt("旧配置版本不能声明文件限速".into()));
+                }
+                if version < 8 && config.notifications {
+                    return Err(ConfigError::Corrupt("旧配置版本不能启用系统通知".into()));
                 }
                 // v2 had target-only grants. Preserve rows, but require explicit peer authorization.
                 if version == 2 {
@@ -996,6 +1015,7 @@ mod tests {
         SettingsDraft {
             background: Default::default(),
             file_limits: Default::default(),
+            notifications: false,
             relay_server: None,
             signal_host: "relay.example.test".into(),
             signal_port: "7000".into(),
@@ -1075,6 +1095,7 @@ mod tests {
         let upgraded = SettingsDraft::from_config(DesktopConfig {
             background: Default::default(),
             file_limits: Default::default(),
+            notifications: false,
             relay_server: None,
             schema_version: CONFIG_SCHEMA_VERSION,
             signal: Some(SignalConfig {
@@ -1842,6 +1863,26 @@ mod tests {
         old["file_limits"] = serde_json::to_value(limits).unwrap();
         fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
         assert!(DesktopConfig::load(&path).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn notification_migration_is_opt_in_and_stale_drafts_keep_live_preference() {
+        let root = temp_dir("notification-preference");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("settings.json");
+        let draft = valid_draft(root.clone());
+        let mut old = serde_json::to_value(draft.to_config().unwrap()).unwrap();
+        old["schema_version"] = 7.into();
+        old.as_object_mut().unwrap().remove("notifications");
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        assert!(!DesktopConfig::load(&path).unwrap().unwrap().notifications);
+        DesktopConfig::save_notifications(&path, true).unwrap();
+        draft.save_atomic(&path).unwrap();
+        assert!(DesktopConfig::load(&path).unwrap().unwrap().notifications);
+        old["notifications"] = true.into();
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        assert!(DesktopConfig::load(&path).is_err());
+        assert!(DesktopConfig::save_notifications(&path, true).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }

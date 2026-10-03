@@ -26,7 +26,7 @@ Required tools:
 
 1. Git for Windows.
 2. Python 3.11+ with `tomllib` (3.12 recommended). Install from [python.org](https://www.python.org/downloads/windows/); if you use `winget`, `winget install Python.Python.3.12` is an optional manual command. Do not select Microsoft Store execution aliases in **Manage app execution aliases**.
-3. Rust stable from [rustup.rs](https://rustup.rs/), with minimum rustc/Cargo version **1.85.0**. The doctor parses both version outputs and rejects older or unparseable versions before Cargo build. For an existing installation, run rustup update stable and add the target:
+3. Rust stable from [rustup.rs](https://rustup.rs/), with minimum rustc/Cargo version **1.90.0**. The doctor parses both version outputs and rejects older or unparseable versions before Cargo build. For an existing installation, run rustup update stable and add the target:
 
    ```powershell
    rustup update stable

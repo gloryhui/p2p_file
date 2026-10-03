@@ -65,7 +65,7 @@ function ConvertTo-RustBaseVersion {
 function Test-RustToolVersion {
     param([Parameter(Mandatory = $true)][string]$Name)
     $displayName = $Name -replace '\.exe$', ''
-    $required = '>= 1.85.0'
+    $required = '>= 1.90.0'
     $remediation = 'Run: rustup update stable'
     $tool = Get-Command -Name $Name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -eq $tool) {
@@ -86,7 +86,7 @@ function Test-RustToolVersion {
     if ($null -eq $parsedVersion) {
         Write-DoctorCheck FAIL ($displayName + ' version') ($tool.Source + ' (unrecognized version output: ' + $versionLine + ')') $required $remediation
     }
-    elseif ($parsedVersion -ge [Version]'1.85.0') {
+    elseif ($parsedVersion -ge [Version]'1.90.0') {
         Write-DoctorCheck PASS ($displayName + ' version') ($tool.Source + ' (' + $parsedVersion.ToString() + ')') $required 'none'
     }
     else {

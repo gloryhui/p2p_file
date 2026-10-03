@@ -20,7 +20,7 @@ class IntelPrerequisites(unittest.TestCase):
         self.env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH'],
                         P2P_FAKE_ROOT=str(self.root), P2P_FAKE_ARCH='x86_64',
                         P2P_FAKE_TRANSLATED='0', P2P_FAKE_HARDWARE_ARM='0',
-                        P2P_FAKE_RUST_VERSION='1.85.0', P2P_FAKE_CARGO_VERSION='1.85.0')
+                        P2P_FAKE_RUST_VERSION='1.90.0', P2P_FAKE_CARGO_VERSION='1.90.0')
         commands = {
             'uname': 'if [ "$1" = -s ]; then echo Darwin; else echo "$P2P_FAKE_ARCH"; fi',
             'sw_vers': 'echo 15.0',
@@ -71,12 +71,12 @@ class IntelPrerequisites(unittest.TestCase):
 
     def test_old_or_malformed_rust_and_cargo_never_reach_build(self):
         for variable in ['P2P_FAKE_RUST_VERSION', 'P2P_FAKE_CARGO_VERSION']:
-            for version in ['1.84.1', 'unknown']:
+            for version in ['1.85.0', '1.89.9', 'unknown']:
                 with self.subTest(variable=variable, version=version):
                     self.env[variable] = version
                     result = self.assert_build_blocked()
-                    self.assertIn('>= 1.85.0', result.stdout)
-                    self.env[variable] = '1.85.0'
+                    self.assertIn('>= 1.90.0', result.stdout)
+                    self.env[variable] = '1.90.0'
 
 
 if __name__ == '__main__':

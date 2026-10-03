@@ -73,6 +73,12 @@ jobs:
         run: sudo ifconfig lo0 alias 127.0.0.2 up
       - name: Run full GUI library regressions
         run: "cargo test --locked --features gui --lib --target ${{ matrix.target }}"
+      - name: Verify native XDG notification delivery and activation in isolated D-Bus
+        if: runner.os == 'Linux'
+        run: >-
+          dbus-run-session -- /usr/bin/python3 scripts/desktop-notifications-smoke.py
+          --target ${{ matrix.target }}
+          --output "${{ runner.temp }}/p2p-notifications-smoke.json"
       - name: Run native IPv6 loopback regressions with capability diagnostics
         run: "cargo test --locked --features gui ipv6 --lib --target ${{ matrix.target }} -- --nocapture"
       - name: Run local authenticated Relay regressions (native IPv4/IPv6, no public network)

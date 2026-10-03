@@ -2,6 +2,7 @@
 name = "p2p_file"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.90"
 description = "点对点直连：IPv4/IPv6 NAT 穿透 + QUIC，支持文件传输、TCP 隧道与端到端加密 UDP Relay 兜底"
 repository = "https://github.com/gloryhui/p2p_file"
 readme = "README.md"
@@ -32,9 +33,11 @@ gui = [
     "dep:objc2",
     "dep:objc2-app-kit",
     "dep:windows-sys",
+    "dep:notify-rust",
 ]
 
 [dependencies]
+notify-rust = { version = "=4.18.1", features = ["preview-macos-un"], optional = true }
 socket2 = "0.6.5"
 rusqlite = { version = "=0.37.0", features = ["bundled"] }
 argon2 = { version = "=0.5.3", optional = true }
@@ -85,7 +88,7 @@ objc2 = { version = "=0.6.4", optional = true }
 objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSScreen"], optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "=0.59.0", features = ["Win32_UI_WindowsAndMessaging", "Win32_System_Registry", "Win32_Security"], optional = true }
+windows-sys = { version = "=0.59.0", features = ["Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_System_Registry", "Win32_Security"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "=0.3.2", features = ["blocking"], optional = true }

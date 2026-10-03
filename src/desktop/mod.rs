@@ -19,6 +19,7 @@ mod files;
 mod frame_budget;
 pub(in crate::desktop) mod instance_lock;
 mod network_state;
+mod notifications;
 #[allow(dead_code)] // T005 wire guards are consumed by transfer/speed business in T006-T009.
 mod protocol;
 mod publish;
@@ -1020,6 +1021,10 @@ struct DesktopShell {
     tunnel_states: HashMap<String, session::TunnelRuntimeState>,
     tunnel_last_errors: HashMap<String, String>,
     task_rows: Vec<ui_model::ListRow>,
+    task_snapshot: Vec<ui_model::TaskRow>,
+    outcome_alerts: notifications::OutcomeAlerts,
+    native_alerts: notifications::NativeAlerts,
+    notification_note: SharedString,
     expanded_groups: HashSet<task_model::TaskId>,
     selected_task: Option<task_model::TaskId>,
     queue_status: SharedString,
@@ -1215,7 +1220,31 @@ impl DesktopShell {
                                         .map(|task| task.rate.max(0.) as u64)
                                         .sum(),
                                 );
+                                if let Some(notice) = shell.outcome_alerts.observe(
+                                    &snapshot.tasks,
+                                    shell.settings.notifications,
+                                    Instant::now(),
+                                ) {
+                                    shell.native_alerts.show(notice);
+                                }
                                 shell.task_rows = snapshot.list(&shell.expanded_groups);
+                                shell.task_snapshot = snapshot.tasks.clone();
+                                for event in shell.native_alerts.poll() {
+                                    match event {
+                                        notifications::AlertEvent::Open(id) => {
+                                            shell.focus_notified_task(id, cx);
+                                            cx.defer(background::reopen);
+                                        }
+                                        notifications::AlertEvent::Ready => {
+                                            shell.notification_note = "系统通知已就绪".into()
+                                        }
+                                        notifications::AlertEvent::Unavailable => {
+                                            shell.notification_note =
+                                                "系统通知暂不可用；请检查系统权限，传输继续运行"
+                                                    .into()
+                                        }
+                                    }
+                                }
                                 shell.speed_views.update(snapshot.speeds, Instant::now());
                                 if shell
                                     .speed_request_until
@@ -3381,8 +3410,105 @@ impl DesktopShell {
             .child(self.remote_password_card(window, cx))
             .child(self.trusted_devices_card(window, cx))
             .child(self.background_card(cx))
+            .child(self.notifications_card(cx))
             .child(self.file_limits_card(window, cx))
             .child(self.advanced_network_card(window, cx))
+    }
+
+    fn notifications_card(&self, cx: &mut Context<Self>) -> gpui::Div {
+        ui_components::card()
+            .child(ui_components::section_header(
+                "◉",
+                "系统通知",
+                "后台传输完成、失败或中断时提醒",
+            ))
+            .child("默认关闭；通知只显示结果数量，点击查看任务。目录与短时间内的多项结果合并提醒。")
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                    .child(self.notification_note.clone()),
+            )
+            .child(
+                ui_components::secondary_button(
+                    if self.settings.notifications {
+                        "关闭系统通知"
+                    } else {
+                        "开启系统通知"
+                    },
+                    self.can_save_settings && !self.is_saving_settings,
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|shell, _, _, cx| shell.toggle_notifications(cx)),
+                ),
+            )
+    }
+    fn toggle_notifications(&mut self, cx: &mut Context<Self>) {
+        if !self.can_save_settings || self.is_saving_settings {
+            return;
+        }
+        let enabled = !self.settings.notifications;
+        let config_file = self.config_file.clone();
+        let background = cx.background_executor().clone();
+        self.is_saving_settings = true;
+        cx.spawn(async move |shell, cx| {
+            let result = background
+                .spawn(async move { DesktopConfig::save_notifications(&config_file, enabled) })
+                .await;
+            let _ = shell.update(cx, |shell, cx| {
+                shell.is_saving_settings = false;
+                match result {
+                    Ok(()) => {
+                        shell.settings.notifications = enabled;
+                        shell.outcome_alerts.clear_pending();
+                        shell.native_alerts.set_enabled(enabled);
+                        shell.notification_note = if enabled {
+                            "正在检查系统通知权限…"
+                        } else {
+                            "系统通知已关闭"
+                        }
+                        .into();
+                        shell.set_status(
+                            if enabled {
+                                "通知偏好已保存；系统权限由操作系统控制"
+                            } else {
+                                "系统通知已关闭并保存"
+                            },
+                            cx,
+                        );
+                    }
+                    Err(error) => shell.set_status(format!("通知偏好未保存：{error}"), cx),
+                }
+            });
+        })
+        .detach();
+    }
+    fn focus_notified_task(&mut self, id: task_model::TaskId, cx: &mut Context<Self>) {
+        self.close_settings_home(cx);
+        if let Some(task) = self.task_snapshot.iter().find(|task| task.id == id)
+            && let Some(group) = &task.group
+        {
+            self.expanded_groups.insert(group.clone());
+        }
+        let snapshot = ui_model::Snapshot {
+            tasks: self.task_snapshot.clone(),
+            queue: queue::TaskQueue::default().metrics(),
+            speeds: HashMap::new(),
+        };
+        self.task_rows = snapshot.list(&self.expanded_groups);
+        if let Some(index) = self
+            .task_rows
+            .iter()
+            .position(|row| matches!(row, ui_model::ListRow::Task(task) if task.id == id))
+        {
+            self.selected_task = Some(id);
+            self.task_scroll
+                .scroll_to_item(index, gpui::ScrollStrategy::Center);
+            self.set_status("已定位通知对应的任务", cx);
+        } else {
+            self.set_status("通知对应的历史记录已移除", cx);
+        }
     }
 
     fn file_limits_card(&self, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
@@ -4926,6 +5052,7 @@ pub fn run(background_start: bool) {
                 .expect("validated file limits");
         }
         let initial_file_limits = settings.file_limits;
+        let initial_notifications = settings.notifications;
         let initial_receive_root = settings.receive_directory.clone();
         let initial_concurrency = settings.send_concurrency;
         let initial_host = settings.signal_host.clone();
@@ -5086,6 +5213,15 @@ pub fn run(background_start: bool) {
                         tunnel_states: HashMap::new(),
                         tunnel_last_errors: HashMap::new(),
                         task_rows: Vec::new(),
+                        task_snapshot: Vec::new(),
+                        outcome_alerts: Default::default(),
+                        native_alerts: notifications::NativeAlerts::new(initial_notifications),
+                        notification_note: if initial_notifications {
+                            "正在检查系统通知权限…"
+                        } else {
+                            "系统通知已关闭"
+                        }
+                        .into(),
                         expanded_groups: HashSet::new(),
                         selected_task: None,
                         queue_status: "正在载入任务…".into(),

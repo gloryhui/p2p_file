@@ -33,7 +33,7 @@ sudo apt install -y \
   binutils
 ```
 
-Rust 和 Cargo 最低版本均为 1.85.0。建议使用 [rustup](https://rustup.rs/) stable；旧版本运行 rustup update stable 后重新执行 doctor，然后安装目标：
+Rust 和 Cargo 最低版本均为 1.90.0。建议使用 [rustup](https://rustup.rs/) stable；旧版本运行 rustup update stable 后重新执行 doctor，然后安装目标：
 
 ```bash
 rustup update stable
