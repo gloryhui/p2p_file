@@ -183,12 +183,12 @@ impl NativeAlerts {
                             struct Release(Arc<AtomicUsize>);
                             impl Drop for Release { fn drop(&mut self) { self.0.fetch_sub(1, Ordering::AcqRel); } }
                             let _release = Release(counter);
-                            let _ = handle.wait_for_response(move |response: &notify_rust::NotificationResponse| {
+                            handle(Box::new(move |response: &notify_rust::NotificationResponse| {
                                 if matches!(response, notify_rust::NotificationResponse::Default)
                                     || matches!(response, notify_rust::NotificationResponse::Action(action) if action == "open" || action == "default") {
                                     let _ = action_events.try_send(Envelope { generation: epoch, event: AlertEvent::Open(notice.focus.clone()) });
                                 }
-                            });
+                            }));
                         });
                         if result.is_err() {
                             failed_counter.fetch_sub(1, Ordering::AcqRel);
@@ -252,7 +252,10 @@ impl NativeAlerts {
         events
     }
 }
-fn native_show(notice: &Notice) -> Result<notify_rust::NotificationHandle, ()> {
+type NativeResponse = Box<dyn FnOnce(&notify_rust::NotificationResponse) + Send>;
+// The Windows backend returns a public handle from a private module without
+// re-exporting its name. Keep the inferred native type inside an owned closure.
+fn native_show(notice: &Notice) -> Result<impl FnOnce(NativeResponse) + Send + use<>, ()> {
     let mut notification = notify_rust::Notification::new();
     notification
         .appname("P2P File")
@@ -264,7 +267,10 @@ fn native_show(notice: &Notice) -> Result<notify_rust::NotificationHandle, ()> {
     notification.action("default", "查看任务");
     #[cfg(target_os = "windows")]
     notification.app_id(APP_ID);
-    notification.show().map_err(|_| ())
+    let handle = notification.show().map_err(|_| ())?;
+    Ok(move |response: NativeResponse| {
+        let _ = handle.wait_for_response(response);
+    })
 }
 fn native_prepare() -> Result<(), ()> {
     #[cfg(target_os = "linux")]
