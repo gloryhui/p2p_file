@@ -516,6 +516,30 @@ impl TransferService {
             .send_modify(|version| *version = version.wrapping_add(1));
         Ok(())
     }
+    pub(super) fn remove_completed_history(
+        &self,
+        mut ids: std::collections::BTreeSet<TaskId>,
+    ) -> Result<Vec<TaskId>> {
+        {
+            let active = self.active.lock().unwrap();
+            ids.retain(|id| !active.contains_key(id));
+        }
+        let removed = self
+            .store
+            .lock()
+            .map_err(|_| disk::failure("任务库锁不可用"))?
+            .remove_completed_batch(&ids)
+            .map_err(disk::local_error)?;
+        if !removed.is_empty() {
+            let mut rates = self.rates.lock().unwrap();
+            for id in &removed {
+                rates.remove(id);
+            }
+            self.changed
+                .send_modify(|version| *version = version.wrapping_add(1));
+        }
+        Ok(removed)
+    }
     pub(super) fn delete_completed_receive_file(&self, id: &TaskId) -> Result<()> {
         if self.active.lock().unwrap().contains_key(id) {
             return Err(disk::failure("传输任务仍在活动，不能删除文件"));

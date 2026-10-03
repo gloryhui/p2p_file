@@ -183,6 +183,47 @@ impl TaskStore {
         Ok(())
     }
 
+    /// A group is retained unless every member is completed and selected.
+    /// One durable replacement precedes all removal events; files are untouched.
+    pub(crate) fn remove_completed_batch(
+        &mut self,
+        requested: &BTreeSet<TaskId>,
+    ) -> Result<Vec<TaskId>, TaskStoreError> {
+        self.ensure_healthy()?;
+        let blocked: BTreeSet<_> = self
+            .tasks
+            .iter()
+            .filter(|t| t.state() != TaskState::Completed || !requested.contains(t.task_id()))
+            .filter_map(|t| t.group_id().cloned())
+            .collect();
+        let removed: BTreeSet<_> = self
+            .tasks
+            .iter()
+            .filter(|t| {
+                t.state() == TaskState::Completed
+                    && requested.contains(t.task_id())
+                    && t.group_id().is_none_or(|g| !blocked.contains(g))
+            })
+            .map(|t| t.task_id().clone())
+            .collect();
+        if removed.is_empty() {
+            return Ok(Vec::new());
+        }
+        let candidate = self
+            .tasks
+            .iter()
+            .filter(|t| !removed.contains(t.task_id()))
+            .cloned()
+            .collect();
+        let timestamp = system_time_unix_ms()?;
+        self.commit_tasks(candidate)?;
+        for id in &removed {
+            self.events
+                .record(id.clone(), timestamp, TaskEventKind::Removed);
+        }
+        Ok(removed.into_iter().collect())
+    }
+
     /// Make a task visible only after its complete snapshot is durable.
     pub(crate) fn create(&mut self, task: TaskRecord) -> Result<TaskId, TaskStoreError> {
         self.ensure_healthy()?;
@@ -701,6 +742,78 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(store.task(task_id).unwrap().state(), target);
+    }
+
+    #[test]
+    fn batch_history_cleanup_is_atomic_preserves_files_and_keeps_partial_groups() {
+        let dir = temp_dir();
+        let path = dir.join("tasks.json");
+        let file = dir.join("finished.bin");
+        fs::write(&file, b"keep-content").unwrap();
+        let (mut store, _) = TaskStore::open(&path).unwrap();
+        let complete_group = TaskId::generate();
+        let partial_group = TaskId::generate();
+        let mut ids = Vec::new();
+        for (group, state) in [
+            (Some(complete_group.clone()), TaskState::Completed),
+            (Some(complete_group.clone()), TaskState::Completed),
+            (Some(partial_group.clone()), TaskState::Completed),
+            (Some(partial_group), TaskState::Paused),
+            (None, TaskState::Completed),
+            (None, TaskState::Failed),
+        ] {
+            let mut record = TaskRecord::new_sender(
+                PeerId::from_node_id(Identity::generate().node_id()),
+                file.clone(),
+                ManifestIdentity::blake3([9; 32], 12, 4).unwrap(),
+            )
+            .unwrap();
+            record.set_selection_binding(group, None).unwrap();
+            let id = store.create(record).unwrap();
+            transition_to_state(&mut store, &id, state, false);
+            ids.push(id);
+        }
+        store.drain_events();
+        let snapshot = fs::read(&path).unwrap();
+        let generation = store.generation;
+        store.fail_before_replace = true;
+        assert!(matches!(
+            store.remove_completed_batch(&ids.iter().cloned().collect()),
+            Err(TaskStoreError::InjectedFailure)
+        ));
+        assert_eq!(store.list().len(), 6);
+        assert_eq!(store.generation, generation);
+        assert!(store.drain_events().is_empty());
+        assert_eq!(fs::read(&path).unwrap(), snapshot);
+        // A name filter matching only one completed group member cannot split it.
+        assert!(
+            store
+                .remove_completed_batch(&BTreeSet::from([ids[0].clone()]))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.generation, generation);
+        let removed = store
+            .remove_completed_batch(&ids.iter().cloned().collect())
+            .unwrap();
+        assert_eq!(
+            removed.into_iter().collect::<BTreeSet<_>>(),
+            BTreeSet::from([ids[0].clone(), ids[1].clone(), ids[4].clone()])
+        );
+        assert_eq!(store.generation, generation + 1);
+        let events = store.drain_events();
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().all(|e| e.kind() == TaskEventKind::Removed));
+        assert_eq!(fs::read(&file).unwrap(), b"keep-content");
+        drop(store);
+        let (reopened, _) = TaskStore::open(&path).unwrap();
+        assert_eq!(reopened.list().len(), 3);
+        for id in &ids[2..4] {
+            assert!(reopened.task(id).is_ok());
+        }
+        assert!(reopened.task(&ids[5]).is_ok());
+        drop(reopened);
+        cleanup(&dir);
     }
 
     fn cleanup(dir: &Path) {
