@@ -171,6 +171,7 @@ $BIN push --signal $SIGNAL --peer $HOME_ID ./大文件.mkv
 提供托盘入口。后台保留同一会话，未完成文件重启后仍需手动继续。平台差异和登录项
 说明见 [后台运行](docs/DESKTOP_BACKGROUND.md)。设置页还可开启默认关闭的
 [断网自动恢复](docs/DESKTOP_AUTO_RESUME.md)，仅恢复本次进程中的网络中断任务。
+- [桌面接收空间预检查与共享预算](docs/DESKTOP_RECEIVE_SPACE.md)
 
 
 ```bash

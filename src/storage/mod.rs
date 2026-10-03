@@ -93,6 +93,26 @@ impl DownloadDirectory {
             .truncate(false)
             .open(path)?)
     }
+    fn open_existing_part(&self, path: &Path) -> Result<Option<File>> {
+        #[cfg(feature = "gui")]
+        if let Some(dir) = &self.capability {
+            return match crate::desktop::secure_fs::open(
+                dir,
+                path.file_name().unwrap().to_str().unwrap(),
+                true,
+                false,
+            ) {
+                Ok(file) => Ok(Some(file)),
+                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+            };
+        }
+        match OpenOptions::new().read(true).write(true).open(path) {
+            Ok(file) => Ok(Some(file)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
     fn load(&self, path: &Path, chunks: u32) -> Result<(ChunkBitmap, bool)> {
         #[cfg(feature = "gui")]
         if let Some(dir) = &self.capability {
@@ -186,7 +206,7 @@ impl PartialDownload {
         )
     }
 
-    #[cfg(feature = "gui")]
+    #[cfg(all(feature = "gui", test))]
     pub(crate) fn create_desktop(
         path: &Path,
         dir: std::sync::Arc<cap_std::fs::Dir>,
@@ -202,11 +222,37 @@ impl PartialDownload {
         )
     }
 
+    #[cfg(feature = "gui")]
+    pub(crate) fn create_desktop_with_admission<T>(
+        path: &Path,
+        dir: std::sync::Arc<cap_std::fs::Dir>,
+        manifest: FileManifest,
+        admit: impl FnOnce(u64) -> Result<T>,
+    ) -> Result<(Self, T)> {
+        Self::create_in_with_admission(
+            DownloadDirectory {
+                path: path.to_path_buf(),
+                capability: Some(dir),
+            },
+            manifest,
+            CheckpointPolicy::default(),
+            admit,
+        )
+    }
     fn create_in(
         directory: DownloadDirectory,
         manifest: FileManifest,
         checkpoint_policy: CheckpointPolicy,
     ) -> Result<Self> {
+        Self::create_in_with_admission(directory, manifest, checkpoint_policy, |_| Ok(()))
+            .map(|(download, ())| download)
+    }
+    fn create_in_with_admission<T>(
+        directory: DownloadDirectory,
+        manifest: FileManifest,
+        checkpoint_policy: CheckpointPolicy,
+        admit: impl FnOnce(u64) -> Result<T>,
+    ) -> Result<(Self, T)> {
         manifest.validate()?;
         let dir = &directory.path;
         let target_path = Self::target_path_for(dir, &manifest);
@@ -235,22 +281,15 @@ impl PartialDownload {
         let (mut bitmap, bitmap_needs_repair) =
             directory.load(&state_path, manifest.chunk_count())?;
 
-        // 已有的临时文件长度对不上就整个作废，从头来。
-        let mut file = directory.open_part(&temp_path)?;
-
-        let existing_len = file.metadata()?.len();
-        if existing_len != manifest.total_len {
-            file.set_len(0)?;
-            file.set_len(manifest.total_len)?;
-            // 不允许空位图在文件长度尚未安全落盘时成为恢复状态。
-            file.sync_all()?;
+        let mut existing = directory.open_existing_part(&temp_path)?;
+        let reset = match existing.as_ref() {
+            Some(file) => file.metadata()?.len() != manifest.total_len,
+            None => true,
+        };
+        let mut bitmap_changed = bitmap_needs_repair;
+        if reset {
             bitmap = ChunkBitmap::new(manifest.chunk_count());
-            directory.save(&state_path, &bitmap)?;
-        } else {
-            // bitmap 只说明“上次曾经认为这些片完成”，不能跳过磁盘数据校验。
-            // 每次只分配一个受 manifest 限制的 chunk 缓冲区，避免恢复路径被状态文件
-            // 放大成不受控的内存分配。
-            let mut bitmap_changed = bitmap_needs_repair;
+        } else if let Some(file) = existing.as_mut() {
             for index in bitmap.present() {
                 let (offset, len) = manifest
                     .chunk_range(index)
@@ -270,25 +309,47 @@ impl PartialDownload {
                     Err(err) => return Err(err.into()),
                 }
             }
-            if bitmap_changed {
-                directory.save(&state_path, &bitmap)?;
-            }
+        }
+        let verified = bitmap.present().into_iter().try_fold(0u64, |sum, index| {
+            let (_, length) = manifest
+                .chunk_range(index)
+                .ok_or_else(|| Error::Protocol("位图分片越界".into()))?;
+            sum.checked_add(u64::from(length))
+                .ok_or_else(|| Error::Protocol("持久进度溢出".into()))
+        })?;
+        // No creation, resizing, bitmap repair or truncation before the caller
+        // has admitted the remaining demand. Reuse the same verified handle.
+        let admission = admit(manifest.total_len.saturating_sub(verified))?;
+        let file = match existing {
+            Some(file) => file,
+            None => directory.open_part(&temp_path)?,
+        };
+        if reset {
+            file.set_len(0)?;
+            file.set_len(manifest.total_len)?;
+            file.sync_all()?;
+            directory.save(&state_path, &bitmap)?;
+        } else if bitmap_changed {
+            directory.save(&state_path, &bitmap)?;
         }
 
         let durable_bitmap = bitmap.clone();
-        Ok(Self {
-            manifest,
-            directory,
-            target_path,
-            temp_path,
-            state_path,
-            file: Some(file),
-            written_bitmap: bitmap,
-            durable_bitmap,
-            dirty_bytes: 0,
-            last_checkpoint: Instant::now(),
-            checkpoint_policy,
-        })
+        Ok((
+            Self {
+                manifest,
+                directory,
+                target_path,
+                temp_path,
+                state_path,
+                file: Some(file),
+                written_bitmap: bitmap,
+                durable_bitmap,
+                dirty_bytes: 0,
+                last_checkpoint: Instant::now(),
+                checkpoint_policy,
+            },
+            admission,
+        ))
     }
 
     pub fn manifest(&self) -> &FileManifest {
