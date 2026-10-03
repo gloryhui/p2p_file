@@ -169,7 +169,8 @@ $BIN push --signal $SIGNAL --peer $HOME_ID ./大文件.mkv
 设置页可启用「关闭窗口后后台运行」与「登录系统时启动」（默认关闭）。macOS 菜单栏
 图标实时显示核心状态，点击展开设备、信令、传输、测速与隧道状态面板；Windows/Linux
 提供托盘入口。后台保留同一会话，未完成文件重启后仍需手动继续。平台差异和登录项
-说明见 [后台运行](docs/DESKTOP_BACKGROUND.md)。
+说明见 [后台运行](docs/DESKTOP_BACKGROUND.md)。设置页还可开启默认关闭的
+[断网自动恢复](docs/DESKTOP_AUTO_RESUME.md)，仅恢复本次进程中的网络中断任务。
 
 
 ```bash
@@ -178,7 +179,7 @@ cargo run --locked --features gui --bin p2p-desktop
 
 首次打开设置，填写自己的信令主机/IP 和端口、选择本机接收目录并保存。接收端上线后可以等待；发送端粘贴接收端完整 ID，身份认证成功后选择文件或目录直接入队。并发数 1/2/3 保存后应用，任务可暂停并按原 TaskID 继续。测速支持发送/接收、30 秒或 1–10 分钟；有文件活动时先暂停，不会自动暂停用户任务。
 
-设置说明可信设备 MVP 的接收边界：知道 ID 的节点可发送文件。接收目录修改只影响新任务，对端输入框修改不改变旧任务绑定。Linux 系统文件选择器需要可用的 desktop portal。原生窗口操作与截图见 [T010 验证证据](docs/gpui-mvp/evidence/t010-ui-validation.md)；跨物理平台、Wayland、中文 IME、双 NAT 和安装包验收仍在后续流水线中记录。
+接收边界由当前会话的身份和远程访问授权控制。接收目录修改只影响新任务，对端输入框修改不改变旧任务绑定。Linux 系统文件选择器需要可用的 desktop portal。原生窗口操作与截图见 [T010 验证证据](docs/gpui-mvp/evidence/t010-ui-validation.md)；跨物理平台、Wayland、中文 IME、双 NAT 和安装包验收仍在后续流水线中记录。
 
 桌面进程恢复与故障验证：`python3 scripts/desktop-e2e.py --output /tmp/desktop-e2e-new-evidence`；支持 Linux/Windows/macOS 的测试二进制，输出可审计矩阵。它验证真实 Session/OS 进程与 loopback，不代表物理设备或双 NAT；细节见 [T011 矩阵](docs/gpui-mvp/evidence/t011-process-matrix.md)。端点重启后显式连接、再继续原任务，不自动恢复文件。
 

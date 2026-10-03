@@ -69,6 +69,7 @@ impl OutcomeAlerts {
                 grouped.entry(group.clone()).or_default().push(row);
             } else if self.initialized
                 && self.tasks.get(&row.id) != Some(&row.state)
+                && !row.auto_waiting
                 && (row.state == TaskState::Completed || failed(row.state))
             {
                 outcomes.push(Notice {
@@ -81,12 +82,15 @@ impl OutcomeAlerts {
         let mut current_groups = HashMap::new();
         for (id, children) in grouped {
             let complete = children.iter().all(|r| r.state == TaskState::Completed);
-            let errors = children.iter().filter(|r| failed(r.state)).count();
+            let errors = children
+                .iter()
+                .filter(|r| !r.auto_waiting && failed(r.state))
+                .count();
             let previous = self.groups.get(&id).copied().unwrap_or((false, false));
             if self.initialized && ((complete && !previous.0) || (errors > 0 && !previous.1)) {
                 let focus = children
                     .iter()
-                    .find(|r| failed(r.state))
+                    .find(|r| !r.auto_waiting && failed(r.state))
                     .unwrap_or(&children[0])
                     .id
                     .clone();
@@ -98,7 +102,19 @@ impl OutcomeAlerts {
             }
             current_groups.insert(id, (complete, errors > 0));
         }
-        self.tasks = rows.iter().map(|r| (r.id.clone(), r.state)).collect();
+        self.tasks = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.id.clone(),
+                    if r.auto_waiting {
+                        TaskState::Connecting
+                    } else {
+                        r.state
+                    },
+                )
+            })
+            .collect();
         self.groups = current_groups;
         self.initialized = true;
         if !enabled {
@@ -349,7 +365,41 @@ mod tests {
             rate: 0.,
             diagnostic: None,
             retryable: true,
+            auto_waiting: false,
             can_delete_file: false,
+        }
+    }
+    #[test]
+    fn automatic_wait_does_not_alert_until_recovery_expires_for_files_and_groups() {
+        for grouped in [false, true] {
+            let now = Instant::now();
+            let mut engine = OutcomeAlerts::default();
+            let mut task = row(TaskState::Transferring);
+            if grouped {
+                task.group = Some(TaskId::generate());
+            }
+            assert!(engine.observe(&[task.clone()], true, now).is_none());
+            task.state = TaskState::Interrupted;
+            task.auto_waiting = true;
+            assert!(
+                engine
+                    .observe(&[task.clone()], true, now + COALESCE)
+                    .is_none()
+            );
+            assert!(
+                engine
+                    .observe(&[task.clone()], true, now + COALESCE * 2)
+                    .is_none()
+            );
+            task.auto_waiting = false;
+            assert!(
+                engine
+                    .observe(&[task.clone()], true, now + COALESCE * 3)
+                    .is_none()
+            );
+            let notice = engine.observe(&[task], true, now + COALESCE * 4).unwrap();
+            assert_eq!(notice.failed, 1);
+            assert_eq!(notice.completed, 0);
         }
     }
     #[test]

@@ -57,6 +57,8 @@ pub(crate) struct TransferService {
     rate_origin: Instant,
     rates: Arc<Mutex<HashMap<TaskId, super::queue::RateSampler>>>,
     sender_queue: Arc<Mutex<super::queue::TaskQueue>>,
+    recovery: Arc<Mutex<super::auto_resume::Recovery>>,
+    automatic_sends: Arc<Mutex<HashMap<TaskId, super::auto_resume::Ticket>>>,
     pub(super) activity: super::activity::Activity,
     speed_peers: Arc<Mutex<HashMap<NodeId, super::speed::SpeedPeer>>>,
     #[cfg(test)]
@@ -70,6 +72,8 @@ pub(crate) struct TransferService {
     #[cfg(test)]
     source_cleanup_gate: TestGate,
     #[cfg(test)]
+    resume_admission_gate: TestGate,
+    #[cfg(test)]
     pub(super) publication_error: Arc<Mutex<Option<std::io::ErrorKind>>>,
 }
 #[allow(dead_code)] // T010 consumes these safe domain fields in its task list.
@@ -81,8 +85,13 @@ pub(crate) struct TransferPresentation {
     pub groups: HashMap<TaskId, super::queue::GroupProgress>,
     pub queue: super::queue::QueueMetrics,
 }
+struct SendMode {
+    automatic: bool,
+    ticket: Option<super::auto_resume::Ticket>,
+}
 struct Active {
     peer: NodeId,
+    transport: usize,
     direction: TaskDirection,
     metadata: bool,
     pause: watch::Sender<bool>,
@@ -155,6 +164,8 @@ impl TransferService {
             rate_origin: Instant::now(),
             rates: Arc::new(Mutex::new(HashMap::new())),
             sender_queue: Arc::new(Mutex::new(super::queue::TaskQueue::default())),
+            recovery: Default::default(),
+            automatic_sends: Default::default(),
             #[cfg(test)]
             drop_completion: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
@@ -165,6 +176,8 @@ impl TransferService {
             admission_gate: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             source_cleanup_gate: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            resume_admission_gate: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             publication_error: Arc::new(Mutex::new(None)),
         }
@@ -196,6 +209,183 @@ impl TransferService {
     ) -> Result<T> {
         let store = self.store.clone();
         blocking(move || work(&*store.lock().map_err(|_| disk::failure("任务库锁不可用"))?)).await
+    }
+    pub fn set_auto_resume(&self, enabled: bool) {
+        self.recovery.lock().unwrap().enable(enabled);
+        self.changed.send_modify(|v| *v = v.wrapping_add(1));
+    }
+    pub fn cancel_peer_recovery(&self, peer: NodeId) -> bool {
+        let pending = self.recovery.lock().unwrap().cancel_peer(peer);
+        self.changed.send_modify(|v| *v = v.wrapping_add(1));
+        pending
+    }
+    pub fn network_lost(&self, peer: NodeId) {
+        let active = self.active.lock().unwrap();
+        let mut recovery = self.recovery.lock().unwrap();
+        for (id, _) in active
+            .iter()
+            .filter(|(_, a)| a.peer == peer && *a.pause.borrow())
+        {
+            recovery.cancel(id);
+        }
+        recovery.lost(peer, Instant::now());
+        self.changed.send_modify(|v| *v = v.wrapping_add(1));
+    }
+    pub async fn settle_network_loss(&self, peer: NodeId) -> Result<()> {
+        let tickets = self.recovery.lock().unwrap().network_tasks(peer);
+        for ticket in tickets {
+            self.wait_previous_attempt(&ticket.id).await?;
+            let recovery = self.recovery.clone();
+            self.store(move |store| {
+                let mut recovery = recovery.lock().unwrap();
+                if !recovery.same_attempt(&ticket) {
+                    return Ok(());
+                }
+                let record = disk::bound_task(store, peer, &ticket.id)?;
+                if record.state().needs_startup_recovery() && record.state() != TaskState::Pausing {
+                    store
+                        .transition(
+                            &ticket.id,
+                            TaskState::Interrupted,
+                            Some(TaskDiagnostic::new(
+                                TaskErrorCode::NetworkInterrupted,
+                                false,
+                            )),
+                            system_time_unix_ms().map_err(disk::local_error)?,
+                        )
+                        .map_err(disk::local_error)?;
+                } else if record.state() != TaskState::Interrupted
+                    || !automatic_record_allowed(&record)
+                {
+                    recovery.cancel(&ticket.id);
+                }
+                Ok(())
+            })
+            .await?;
+        }
+        Ok(())
+    }
+    pub fn auto_due(
+        &self,
+        ready: impl FnMut(NodeId, TaskDirection) -> bool,
+        busy: impl FnMut(NodeId) -> bool,
+    ) -> (Vec<NodeId>, Vec<super::auto_resume::Ticket>) {
+        self.recovery
+            .lock()
+            .unwrap()
+            .due(Instant::now(), ready, busy)
+    }
+    /// Recheck the original binding and current-run intention in the same store
+    /// writer as queue admission. Old workers must release their slots first.
+    pub async fn auto_recover(
+        &self,
+        connection: &Connection,
+        ticket: super::auto_resume::Ticket,
+    ) -> Result<()> {
+        let mut changed = self.changed.subscribe();
+        let cancellation = async {
+            loop {
+                if ticket.cancelled() && !self.recovery.lock().unwrap().started(&ticket) {
+                    return;
+                }
+                if changed.changed().await.is_err() {
+                    return;
+                }
+            }
+        };
+        let work = async {
+            self.wait_previous_attempt(&ticket.id).await?;
+            let request_id = ticket.id.clone();
+            let request_peer = ticket.peer;
+            let ticket = ticket.clone();
+            let recovery = self.recovery.clone();
+            let automatic_sends = self.automatic_sends.clone();
+            let queue = self.sender_queue.clone();
+            let epoch = self.epoch.clone();
+            let generation = epoch.load(std::sync::atomic::Ordering::Acquire);
+            let direction = self
+                .store(move |store| {
+                    let mut recovery = recovery.lock().unwrap();
+                    if !recovery.valid(&ticket) {
+                        return Err(disk::failure("自动恢复已取消"));
+                    }
+                    let record = disk::bound_task(store, ticket.peer, &ticket.id)?;
+                    if record.state() == TaskState::Completed || !automatic_record_allowed(&record)
+                    {
+                        recovery.cancel(&ticket.id);
+                        return Err(disk::failure("任务需要手动继续"));
+                    }
+                    if record.state() != TaskState::Interrupted {
+                        store
+                            .transition(
+                                &ticket.id,
+                                TaskState::Interrupted,
+                                Some(TaskDiagnostic::new(
+                                    TaskErrorCode::NetworkInterrupted,
+                                    false,
+                                )),
+                                system_time_unix_ms().map_err(disk::local_error)?,
+                            )
+                            .map_err(disk::local_error)?;
+                    }
+                    if record.direction() == TaskDirection::Send {
+                        automatic_sends
+                            .lock()
+                            .unwrap()
+                            .insert(ticket.id.clone(), ticket.clone());
+                        Self::admit_locked(
+                            store,
+                            &queue,
+                            ticket.peer,
+                            vec![ticket.id.clone()],
+                            &epoch,
+                            generation,
+                        )?;
+                        recovery.admitted(&ticket.id);
+                    } else {
+                        disk::transition(store, &ticket.id, TaskState::Queued)?;
+                    }
+                    Ok(record.direction())
+                })
+                .await?;
+            if direction == TaskDirection::Receive {
+                self.request_resume(connection, request_peer, request_id, true)
+                    .await?;
+            }
+            Ok(())
+        };
+        let deadline = tokio::time::sleep_until(
+            ticket
+                .deadline
+                .unwrap_or_else(|| Instant::now() + Duration::from_secs(300))
+                .into(),
+        );
+        let (result, stopped) = tokio::select! {
+            biased;
+            _ = cancellation => (Ok(()), true),
+            _ = deadline => {
+                self.recovery.lock().unwrap().stop_ticket(&ticket);
+                (Ok(()), true)
+            },
+            result = work => (result, false),
+        };
+        if stopped && ticket.direction == TaskDirection::Receive {
+            let lookup = ticket.clone();
+            let recovery = self.recovery.clone();
+            let _ = self
+                .store(move |store| {
+                    if recovery.lock().unwrap().same_attempt(&lookup) {
+                        let record = disk::bound_task(store, lookup.peer, &lookup.id)?;
+                        if record.state() == TaskState::Queued {
+                            disk::transition(store, &lookup.id, TaskState::Interrupted)?;
+                        }
+                    }
+                    Ok(())
+                })
+                .await;
+        }
+        self.recovery.lock().unwrap().finished(&ticket);
+        result
     }
     pub fn set_send_limit(&self, value: u8) -> Result<()> {
         self.sender_queue
@@ -263,6 +453,11 @@ impl TransferService {
     /// Only explicitly queued tasks enter the current-run executor. Restored
     /// Interrupted/Paused records require a new user continuation command.
     pub async fn enqueue_tasks(&self, peer: NodeId, ids: Vec<TaskId>) -> Result<()> {
+        for id in &ids {
+            self.recovery.lock().unwrap().cancel(id);
+            self.automatic_sends.lock().unwrap().remove(id);
+        }
+        self.changed.send_modify(|v| *v = v.wrapping_add(1));
         let generation = self.epoch.load(std::sync::atomic::Ordering::Acquire);
         let lookup = ids.clone();
         let previous = self
@@ -405,6 +600,8 @@ impl TransferService {
         })
     }
     pub async fn pause_task(&self, id: TaskId) -> Result<()> {
+        let waiting = self.recovery.lock().unwrap().cancel(&id);
+        self.changed.send_modify(|v| *v = v.wrapping_add(1));
         let active = self.active.clone();
         let queue = self.sender_queue.clone();
         self.store(move |store| {
@@ -425,6 +622,20 @@ impl TransferService {
             let mut queue = queue.lock().unwrap();
             let queued = queue.is_queued(&id);
             let generation = queue.slot_generation(&id);
+            if waiting && !queued && generation.is_none() {
+                let mut state = store.task(&id).map_err(disk::local_error)?.state();
+                if state.needs_startup_recovery() && state != TaskState::Pausing {
+                    disk::transition(store, &id, TaskState::Interrupted)?;
+                    state = TaskState::Interrupted;
+                }
+                if state == TaskState::Interrupted {
+                    disk::transition(store, &id, TaskState::Queued)?;
+                }
+                if matches!(state, TaskState::Interrupted | TaskState::Queued) {
+                    disk::transition(store, &id, TaskState::Pausing)?;
+                    return disk::transition(store, &id, TaskState::Paused);
+                }
+            }
             if !queued && generation.is_none() {
                 return Err(disk::failure("任务当前未传输或排队"));
             }
@@ -446,6 +657,11 @@ impl TransferService {
         peer: NodeId,
         authorization: super::remote_auth::RemoteAuthorization,
     ) -> Result<()> {
+        self.recovery
+            .lock()
+            .unwrap()
+            .cancel_denied(peer, authorization);
+        self.changed.send_modify(|v| *v = v.wrapping_add(1));
         if let Some(speed) = self.speed_peers.lock().unwrap().get(&peer) {
             speed.revoke_authorization(authorization);
         }
@@ -479,6 +695,8 @@ impl TransferService {
         .await
     }
     pub async fn interrupt_all(&self) -> Result<()> {
+        self.recovery.lock().unwrap().clear();
+        self.automatic_sends.lock().unwrap().clear();
         self.epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.sender_queue.lock().unwrap().clear();
         self.flow_peers.lock().unwrap().clear();
@@ -559,6 +777,8 @@ impl TransferService {
         Ok(())
     }
     pub fn set_receive_root(&self, root: PathBuf) {
+        self.recovery.lock().unwrap().clear();
+        self.changed.send_modify(|v| *v = v.wrapping_add(1));
         *self.receive_root.lock().unwrap() = root;
     }
     pub async fn select_file(&self, peer: NodeId, source: PathBuf) -> Result<TaskId> {
@@ -652,10 +872,52 @@ impl TransferService {
         self.read_store(move |store| store.task(&id).map_err(disk::local_error))
             .await
     }
+    /// Simultaneous recovery requests share a fresh attempt. Never reuse an
+    /// old connection's ending worker, or a cancelled local queue intention.
+    fn automatic_attempt_exists(&self, id: &TaskId, peer: NodeId, transport: usize) -> bool {
+        let queued = self
+            .automatic_sends
+            .lock()
+            .unwrap()
+            .get(id)
+            .is_some_and(|ticket| ticket.peer == peer && !ticket.cancelled());
+        let fresh = self.active.lock().unwrap().get(id).is_some_and(|active| {
+            active.peer == peer
+                && active.direction == TaskDirection::Send
+                && active.transport == transport
+                && !*active.pause.borrow()
+        });
+        (queued || fresh) && self.recovery.lock().unwrap().automatic_allowed(id)
+    }
+    async fn acknowledge_automatic_resume(send: &mut SendStream, id: TaskId) -> Result<()> {
+        protocol::write(
+            send,
+            &Frame {
+                request_id: 1,
+                message: Message::AutomaticResumeTask { task_id: id },
+            },
+        )
+        .await?;
+        send.finish()
+            .map_err(|_| disk::failure("自动恢复回执发送失败"))?;
+        Ok(())
+    }
     async fn wait_previous_attempt(&self, id: &TaskId) -> Result<()> {
+        self.wait_attempt_or_reuse(id, None).await.map(|_| ())
+    }
+    async fn wait_attempt_or_reuse(
+        &self,
+        id: &TaskId,
+        automatic: Option<(NodeId, usize)>,
+    ) -> Result<bool> {
         let mut changed = self.subscribe();
         tokio::time::timeout(PAUSE_TIMEOUT, async {
             loop {
+                if automatic.is_some_and(|(peer, transport)| {
+                    self.automatic_attempt_exists(id, peer, transport)
+                }) {
+                    return Ok(true);
+                }
                 if !self.active.lock().unwrap().contains_key(id)
                     && self
                         .sender_queue
@@ -664,7 +926,7 @@ impl TransferService {
                         .slot_generation(id)
                         .is_none()
                 {
-                    return Ok(());
+                    return Ok(false);
                 }
                 changed
                     .changed()
@@ -682,6 +944,7 @@ impl TransferService {
         direction: TaskDirection,
         metadata: bool,
         send_generation: Option<u64>,
+        transport: usize,
     ) -> Result<(ActiveGuard, watch::Receiver<bool>)> {
         let mut activity = self.activity.lock();
         let mut active = self.active.lock().unwrap();
@@ -727,11 +990,16 @@ impl TransferService {
             id.clone(),
             Active {
                 peer,
+                transport,
                 direction,
                 metadata,
                 pause,
             },
         );
+        self.recovery
+            .lock()
+            .unwrap()
+            .enroll(id.clone(), peer, direction);
         Ok((
             ActiveGuard {
                 _activity: file_permit,
@@ -747,8 +1015,9 @@ impl TransferService {
         peer: NodeId,
         id: &TaskId,
         metadata: bool,
+        transport: usize,
     ) -> Result<(ActiveGuard, watch::Receiver<bool>)> {
-        match self.claim(peer, id, TaskDirection::Receive, metadata, None) {
+        match self.claim(peer, id, TaskDirection::Receive, metadata, None, transport) {
             Ok(claim) => Ok(claim),
             Err(error) => {
                 tokio::time::timeout(
@@ -784,11 +1053,17 @@ impl TransferService {
         pause.send(true).map_err(|_| disk::failure("任务已结束"))
     }
     async fn state(&self, id: &TaskId, state: TaskState) -> Result<()> {
+        if matches!(
+            state,
+            TaskState::Pausing | TaskState::Paused | TaskState::Completed | TaskState::Failed
+        ) {
+            self.recovery.lock().unwrap().cancel(id);
+        }
         let id = id.clone();
         self.store(move |store| disk::transition(store, &id, state))
             .await
     }
-    async fn finish_error(&self, id: &TaskId, error: &Error) {
+    async fn finish_error(&self, id: &TaskId, error: &Error, connection: &Connection) {
         let id = id.clone();
         let text = error.to_string();
         let (state, code, retryable) = if text.contains("源文件内容已变化") {
@@ -806,6 +1081,25 @@ impl TransferService {
                 false,
             )
         };
+        let reason = connection.close_reason();
+        let network = matches!(
+            reason,
+            Some(quinn::ConnectionError::TimedOut | quinn::ConnectionError::Reset)
+        ) || self.recovery.lock().unwrap().automatic_allowed(&id);
+        let transport_error = matches!(error, Error::Io(_))
+            || reason
+                .as_ref()
+                .is_some_and(|r| matches!(error, Error::Protocol(t) if t == &r.to_string()))
+            || matches!(error, Error::Protocol(t) if t == "文件流已关闭" || t == "文件流中断");
+        if network && transport_error && state != TaskState::Failed {
+            let peer = self.active.lock().unwrap().get(&id).map(|a| a.peer);
+            if let Some(peer) = peer {
+                self.network_lost(peer);
+            }
+        }
+        if state == TaskState::Failed || !network || !transport_error {
+            self.recovery.lock().unwrap().cancel(&id);
+        }
         let _ = self
             .store(move |store| {
                 let record = store.task(&id).map_err(disk::local_error)?;
@@ -919,10 +1213,11 @@ impl TransferService {
                     let rate = rates.get(record.task_id()).map_or(0.0, |r| {
                         r.bytes_per_second(now, record.state() == TaskState::Transferring)
                     });
-                    (
-                        record.created_at_unix_ms(),
-                        super::ui_model::TaskRow::from_record(record, rate),
-                    )
+                    (record.created_at_unix_ms(), {
+                        let mut row = super::ui_model::TaskRow::from_record(record, rate);
+                        row.auto_waiting = self.recovery.lock().unwrap().pending(record.task_id());
+                        row
+                    })
                 })
                 .collect::<Vec<_>>()
         };
@@ -934,6 +1229,7 @@ impl TransferService {
         })
     }
     async fn receipt(&self, id: &TaskId) -> Result<()> {
+        self.recovery.lock().unwrap().forget(id);
         self.state(id, TaskState::Finalizing).await?;
         let id = id.clone();
         self.store(move |store| {
@@ -975,10 +1271,18 @@ impl TransferService {
             TaskDirection::Send,
             current.directory_details().is_some(),
             Some(generation),
+            connection.stable_id(),
         )?;
-        let result = self.send_inner(connection, peer, &id, pause, None).await;
+        let ticket = self.automatic_sends.lock().unwrap().remove(&id);
+        let mode = SendMode {
+            automatic: ticket.is_some(),
+            ticket,
+        };
+        let result = self
+            .send_inner(connection, peer, &id, pause, None, mode)
+            .await;
         if let Err(error) = &result {
-            self.finish_error(&id, error).await;
+            self.finish_error(&id, error, connection).await;
         }
         #[cfg(test)]
         {
@@ -997,11 +1301,27 @@ impl TransferService {
         id: &TaskId,
         pause: watch::Receiver<bool>,
         continue_reply: Option<&mut SendStream>,
+        mode: SendMode,
     ) -> Result<()> {
+        let automatic = mode.automatic;
         let lookup = id.clone();
+        let recovery = self.recovery.clone();
         let record = self
             .store(move |store| {
-                disk::bound_task(store, peer, &lookup)?;
+                let record = disk::bound_task(store, peer, &lookup)?;
+                if mode
+                    .ticket
+                    .as_ref()
+                    .is_some_and(super::auto_resume::Ticket::cancelled)
+                {
+                    if record.state() == TaskState::Queued {
+                        disk::transition(store, &lookup, TaskState::Interrupted)?;
+                    }
+                    return Err(disk::failure("自动恢复已取消"));
+                }
+                if automatic {
+                    check_automatic(store, &recovery, peer, &lookup)?;
+                }
                 disk::begin_attempt(store, &lookup)
             })
             .await?;
@@ -1013,7 +1333,7 @@ impl TransferService {
         }
         if record.directory_details().is_some() {
             return self
-                .send_directory_entry(connection, peer, &record, continue_reply)
+                .send_directory_entry(connection, peer, &record, continue_reply, automatic)
                 .await;
         }
         self.check_flow_support(peer, self.upload_limit.enabled())?;
@@ -1025,20 +1345,27 @@ impl TransferService {
             .map_err(|_| disk::failure("文件流打开超时"))?
             .map_err(disk::local_error)?;
         let mut io = TaskIo::new(send, recv, peer, id.clone(), self.frame_budget.clone());
-        io.send(Message::Offer {
+        let offer = Message::Offer {
             task_id: id.clone(),
             group_id: record.group_id().cloned(),
             relative_path: details.relative_path.clone(),
             entry: Entry::File(Box::new(details.manifest.clone())),
-        })
-        .await?;
+        };
+        io.send(if automatic { offer.automatic() } else { offer })
+            .await?;
         if let Some(reply) = continue_reply {
             protocol::write(
                 reply,
                 &Frame {
                     request_id: 1,
-                    message: Message::ResumeTask {
-                        task_id: id.clone(),
+                    message: if automatic {
+                        Message::AutomaticResumeTask {
+                            task_id: id.clone(),
+                        }
+                    } else {
+                        Message::ResumeTask {
+                            task_id: id.clone(),
+                        }
                     },
                 },
             )
@@ -1060,6 +1387,7 @@ impl TransferService {
         peer: NodeId,
         record: &TaskRecord,
         continue_reply: Option<&mut SendStream>,
+        automatic: bool,
     ) -> Result<()> {
         let path = record.local_path().to_path_buf();
         blocking(move || {
@@ -1074,20 +1402,27 @@ impl TransferService {
             .map_err(disk::local_error)?;
         let id = record.task_id();
         let mut io = TaskIo::new(send, recv, peer, id.clone(), self.frame_budget.clone());
-        io.send(Message::Offer {
+        let offer = Message::Offer {
             task_id: id.clone(),
             group_id: record.group_id().cloned(),
             relative_path: record.relative_path().unwrap().to_owned(),
             entry: Entry::Directory,
-        })
-        .await?;
+        };
+        io.send(if automatic { offer.automatic() } else { offer })
+            .await?;
         if let Some(reply) = continue_reply {
             protocol::write(
                 reply,
                 &Frame {
                     request_id: 1,
-                    message: Message::ResumeTask {
-                        task_id: id.clone(),
+                    message: if automatic {
+                        Message::AutomaticResumeTask {
+                            task_id: id.clone(),
+                        }
+                    } else {
+                        Message::ResumeTask {
+                            task_id: id.clone(),
+                        }
                     },
                 },
             )
@@ -1412,7 +1747,9 @@ impl TransferService {
                     streams.spawn(async move {
                         authorization.guard(true, async {
                         let buffered=tokio::time::timeout(Duration::from_secs(5),service.frame_budget.read(&mut recv,None)).await.map_err(|_|disk::failure("文件流首帧超时"))??;
-                        let super::frame_budget::BufferedFrame {frame:first,_lease}=buffered;
+                        let super::frame_budget::BufferedFrame {frame:mut first,_lease}=buffered;
+                        let automatic=first.message.manual().is_some();
+                        if let Some(message)=first.message.manual() {first.message=message;}
                         match &first.message {
                             Message::TunnelOpen{target}=> {
                                 drop(_lease);
@@ -1420,14 +1757,14 @@ impl TransferService {
                                 super::tunnel::serve_open(send,recv,*target,peer,&allowed).await
                             },
                             Message::Speed(_)=> { let speed=speed.ok_or_else(||disk::failure("对端不支持测速执行"))?;drop(_lease);speed.serve_control(send,recv,first).await },
-                            Message::Offer{..} => service.receive_offer(send,recv,peer,super::frame_budget::BufferedFrame{frame:first,_lease}).await,
+                            Message::Offer{..} => service.receive_offer(send,recv,&connection,peer,super::frame_budget::BufferedFrame{frame:first,_lease},automatic).await,
                             Message::ResumeTask{task_id} if first.request_id==1 => {
                                 // This recovery path initiates a new Offer stream, so it also
                                 // needs the local outgoing right; it is not a stream reply.
                                 if !authorization.current().outbound_authorized() { let _=send.reset(3u32.into()); let _=recv.stop(3u32.into()); return Err(disk::failure("出站文件访问尚未授权")); }
                                 let id=task_id.clone();let lookup=id.clone();
                                 let checked=service.read_store(move|store|disk::bound_task(store,peer,&lookup)).await;
-                                if !matches!(checked, Ok(ref record) if record.direction()==TaskDirection::Send && can_continue(record)) {
+                                if !matches!(checked, Ok(ref record) if record.direction()==TaskDirection::Send && record.state()!=TaskState::Completed && (if automatic { service.recovery.lock().unwrap().automatic_allowed(&id) && automatic_record_allowed(record) } else { can_continue(record) })) {
                                     let code = match &checked {
                                         Ok(record) if record.direction()==TaskDirection::Send => match record.diagnostic().map(TaskDiagnostic::code) {
                                             Some(TaskErrorCode::SourceChanged) => ErrorCode::SourceChanged,
@@ -1439,23 +1776,41 @@ impl TransferService {
                                     protocol::write(&mut send,&Frame{request_id:1,message:Message::Error{task_id:id.clone(),code}}).await?;
                                     let _=send.finish();return Err(remote_error(code));
                                 }
-                                service.wait_previous_attempt(&id).await?;
+                                if service.wait_attempt_or_reuse(&id, automatic.then_some((peer,connection.stable_id()))).await? {
+                                    return Self::acknowledge_automatic_resume(&mut send,id).await;
+                                }
+                                #[cfg(test)]
+                                if automatic {
+                                    let gate = service.resume_admission_gate.lock().unwrap().take();
+                                    if let Some((reached, release)) = gate {
+                                        let _ = reached.send(());
+                                        let _ = release.await;
+                                    }
+                                }
                                 let slot=match service.reserve_send(peer,id.clone()).await {
                                     Ok(slot)=>slot,
-                                    Err(error)=> {protocol::write(&mut send,&Frame{request_id:1,message:Message::Error{task_id:id.clone(),code:ErrorCode::Busy}}).await?;let _=send.finish();return Err(error);}
+                                    Err(error)=> {
+                                        // An executor may claim its fair-queue slot while the
+                                        // store read for reserve_send yields. Recheck that race.
+                                        if automatic && service.automatic_attempt_exists(&id,peer,connection.stable_id()) {
+                                            return Self::acknowledge_automatic_resume(&mut send,id).await;
+                                        }
+                                        protocol::write(&mut send,&Frame{request_id:1,message:Message::Error{task_id:id.clone(),code:ErrorCode::Busy}}).await?;let _=send.finish();return Err(error);
+                                    }
                                 };
                                 let metadata=checked.as_ref().unwrap().directory_details().is_some();
-                                let (_guard,pause)=match service.claim(peer,&id,TaskDirection::Send,metadata,Some(slot.generation)) {
+                                let (_guard,pause)=match service.claim(peer,&id,TaskDirection::Send,metadata,Some(slot.generation),connection.stable_id()) {
                                     Ok(claim)=>claim,
                                     Err(error)=> {
                                         protocol::write(&mut send,&Frame{request_id:1,message:Message::Error{task_id:id.clone(),code:ErrorCode::Busy}}).await?;
                                         let _=send.finish();return Err(error);
                                     }
                                 };
-                                let result=authorization.guard(false, service.send_inner(&connection,peer,&id,pause,Some(&mut send))).await;
+                                let ticket = service.automatic_sends.lock().unwrap().remove(&id);
+                                let result=authorization.guard(false, service.send_inner(&connection,peer,&id,pause,Some(&mut send),SendMode {automatic,ticket})).await;
                                 if let Err(error)=&result {
                                     let _=protocol::write(&mut send,&Frame{request_id:1,message:Message::Error{task_id:id.clone(),code:error_code(error)}}).await;
-                                    let _=send.finish();service.finish_error(&id,error).await;
+                                    let _=send.finish();service.finish_error(&id,error,&connection).await;
                                 }
                                 result
                             }
@@ -1487,14 +1842,29 @@ impl TransferService {
         }
         self.wait_previous_attempt(&id).await?;
         self.state(&id, TaskState::Queued).await?;
+        self.request_resume(connection, peer, id, false).await
+    }
+    async fn request_resume(
+        &self,
+        connection: &Connection,
+        _peer: NodeId,
+        id: TaskId,
+        automatic: bool,
+    ) -> Result<()> {
         let result = tokio::time::timeout(IDLE_TIMEOUT, async {
             let (mut send, mut recv) = connection.open_bi().await.map_err(disk::local_error)?;
             protocol::write(
                 &mut send,
                 &Frame {
                     request_id: 1,
-                    message: Message::ResumeTask {
-                        task_id: id.clone(),
+                    message: if automatic {
+                        Message::AutomaticResumeTask {
+                            task_id: id.clone(),
+                        }
+                    } else {
+                        Message::ResumeTask {
+                            task_id: id.clone(),
+                        }
                     },
                 },
             )
@@ -1502,7 +1872,9 @@ impl TransferService {
             let response = protocol::read(&mut recv).await?;
             let _ = send.finish();
             match response.message {
-                Message::ResumeTask { task_id } if task_id == id && response.request_id == 1 => {
+                Message::ResumeTask { task_id } | Message::AutomaticResumeTask { task_id }
+                    if task_id == id && response.request_id == 1 =>
+                {
                     Ok(())
                 }
                 Message::Error { task_id, code } if task_id == id => Err(remote_error(code)),
@@ -1512,7 +1884,7 @@ impl TransferService {
         .await
         .unwrap_or_else(|_| Err(disk::failure("继续请求超时")));
         if let Err(error) = &result {
-            self.finish_error(&id, error).await;
+            self.finish_error(&id, error, connection).await;
         }
         result
     }
@@ -1520,8 +1892,10 @@ impl TransferService {
         &self,
         mut send: SendStream,
         recv: RecvStream,
+        connection: &Connection,
         peer: NodeId,
         buffered: super::frame_budget::BufferedFrame,
+        automatic: bool,
     ) -> Result<()> {
         let super::frame_budget::BufferedFrame {
             frame: first,
@@ -1541,11 +1915,13 @@ impl TransferService {
                 .receive_directory(
                     send,
                     recv,
+                    connection,
                     peer,
                     super::frame_budget::BufferedFrame {
                         frame: first,
                         _lease,
                     },
+                    automatic,
                 )
                 .await;
         }
@@ -1567,14 +1943,20 @@ impl TransferService {
             let _ = send.finish();
             return Err(error);
         }
-        let (_guard, pause) = self.claim_receive(&mut send, peer, &task_id, false).await?;
+        let (_guard, pause) = self
+            .claim_receive(&mut send, peer, &task_id, false, connection.stable_id())
+            .await?;
         let mut io = TaskIo::new(send, recv, peer, task_id.clone(), self.frame_budget.clone());
         io.observe(&first)?;
         drop(first);
         let root = self.receive_root.lock().unwrap().clone();
         let id = task_id.clone();
+        let recovery = self.recovery.clone();
         let record = self
             .store(move |store| {
+                if automatic {
+                    check_automatic(store, &recovery, peer, &id)?;
+                }
                 disk::accept_entry(store, peer, &id, &root, relative_path, *manifest, group_id)
             })
             .await?;
@@ -1602,7 +1984,7 @@ impl TransferService {
             Ok(download) => download,
             Err(error) => {
                 io.report_error(&error).await;
-                self.finish_error(&task_id, &error).await;
+                self.finish_error(&task_id, &error, connection).await;
                 return Err(error);
             }
         };
@@ -1610,6 +1992,9 @@ impl TransferService {
         let result = self
             .receiver_loop(&mut io, &record, download.clone(), pause)
             .await;
+        if result.is_ok() {
+            self.recovery.lock().unwrap().forget(&task_id);
+        }
         if let Err(error) = &result {
             let checkpoint = download.clone();
             let _ = blocking(move || {
@@ -1620,7 +2005,7 @@ impl TransferService {
             })
             .await;
             io.report_error(error).await;
-            self.finish_error(&task_id, error).await;
+            self.finish_error(&task_id, error, connection).await;
         }
         result
     }
@@ -1628,8 +2013,10 @@ impl TransferService {
         &self,
         mut send: SendStream,
         recv: RecvStream,
+        connection: &Connection,
         peer: NodeId,
         buffered: super::frame_budget::BufferedFrame,
+        automatic: bool,
     ) -> Result<()> {
         let super::frame_budget::BufferedFrame {
             frame: first,
@@ -1644,14 +2031,20 @@ impl TransferService {
         else {
             return Err(disk::failure("目录 Offer 非法"));
         };
-        let (_guard, _pause) = self.claim_receive(&mut send, peer, &task_id, true).await?;
+        let (_guard, _pause) = self
+            .claim_receive(&mut send, peer, &task_id, true, connection.stable_id())
+            .await?;
         let mut io = TaskIo::new(send, recv, peer, task_id.clone(), self.frame_budget.clone());
         io.observe(&first)?;
         drop(first);
         let root = self.receive_root.lock().unwrap().clone();
         let id = task_id.clone();
+        let recovery = self.recovery.clone();
         let record = self
             .store(move |store| {
+                if automatic {
+                    check_automatic(store, &recovery, peer, &id)?;
+                }
                 disk::accept_directory(store, peer, &id, &root, relative_path, group_id)
             })
             .await?;
@@ -1676,9 +2069,12 @@ impl TransferService {
             Ok(())
         }
         .await;
+        if result.is_ok() {
+            self.recovery.lock().unwrap().forget(&task_id);
+        }
         if let Err(error) = &result {
             io.report_error(error).await;
-            self.finish_error(&task_id, error).await;
+            self.finish_error(&task_id, error, connection).await;
         }
         result
     }
@@ -1871,6 +2267,39 @@ impl TransferService {
     }
 }
 
+fn automatic_record_allowed(record: &TaskRecord) -> bool {
+    matches!(
+        record.state(),
+        TaskState::Queued
+            | TaskState::Connecting
+            | TaskState::Negotiating
+            | TaskState::Transferring
+            | TaskState::Finalizing
+    ) || (record.state() == TaskState::Interrupted
+        && record
+            .diagnostic()
+            .is_none_or(|d| d.code() == TaskErrorCode::NetworkInterrupted))
+        || record.state() == TaskState::Completed
+}
+fn check_automatic(
+    store: &TaskStore,
+    recovery: &Mutex<super::auto_resume::Recovery>,
+    peer: NodeId,
+    id: &TaskId,
+) -> Result<()> {
+    // An Offer lost before receiver admission is still a new authenticated
+    // delivery. Known IDs must retain their current-run recovery fence.
+    if !store.list().iter().any(|record| record.task_id() == id) {
+        return Ok(());
+    }
+    let record = disk::bound_task(store, peer, id)?;
+    if record.state() != TaskState::Completed
+        && (!recovery.lock().unwrap().automatic_allowed(id) || !automatic_record_allowed(&record))
+    {
+        return Err(disk::failure("任务需要手动继续"));
+    }
+    Ok(())
+}
 fn can_continue(record: &TaskRecord) -> bool {
     matches!(record.state(), TaskState::Paused | TaskState::Interrupted)
         || (record.state() == TaskState::Failed
@@ -2198,6 +2627,8 @@ mod tests {
         cb: Connection,
         ia: NodeId,
         ib: NodeId,
+        key_a: Identity,
+        key_b: Identity,
         ea: quinn::Endpoint,
         eb: quinn::Endpoint,
         tasks: JoinSet<Result<()>>,
@@ -2219,6 +2650,8 @@ mod tests {
             let b = TransferService::new(store_b, root.join("b-receive"));
             let identity_a = Identity::generate();
             let identity_b = Identity::generate();
+            let key_a = identity_a.clone();
+            let key_b = identity_b.clone();
             let ia = identity_a.node_id();
             let ib = identity_b.node_id();
             a.set_peer_flow_support(ib, true);
@@ -2293,9 +2726,58 @@ mod tests {
                 cb,
                 ia,
                 ib,
+                key_a,
+                key_b,
                 ea,
                 eb,
                 tasks,
+            }
+        }
+        async fn reconnect(&mut self) {
+            self.ca.close(0u32.into(), b"fixture loss");
+            self.ca.closed().await;
+            self.cb.closed().await;
+            while self.tasks.join_next().await.is_some() {}
+            let server = self.eb.clone();
+            let identity = self.key_b.clone();
+            let peer = self.ia;
+            let accept = tokio::spawn(async move {
+                let connection = server.accept().await.unwrap().await.unwrap();
+                let binding = ChannelBinding::from_connection(&connection).unwrap();
+                let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+                assert_eq!(
+                    handshake_responder(&mut send, &mut recv, &identity, &binding)
+                        .await
+                        .unwrap()
+                        .peer_node_id,
+                    peer
+                );
+                send.finish().unwrap();
+                protocol::negotiate(&connection, false).await.unwrap();
+                connection
+            });
+            self.ca =
+                crate::transport::quic::connect(&self.ea, self.eb.local_addr().unwrap(), "p2pfile")
+                    .await
+                    .unwrap();
+            let binding = ChannelBinding::from_connection(&self.ca).unwrap();
+            let (mut send, mut recv) = self.ca.open_bi().await.unwrap();
+            assert_eq!(
+                handshake_initiator(&mut send, &mut recv, &self.key_a, &binding)
+                    .await
+                    .unwrap()
+                    .peer_node_id,
+                self.ib
+            );
+            send.finish().unwrap();
+            protocol::negotiate(&self.ca, true).await.unwrap();
+            self.cb = accept.await.unwrap();
+            for (service, connection, peer) in [
+                (self.a.clone(), self.ca.clone(), self.ib),
+                (self.b.clone(), self.cb.clone(), self.ia),
+            ] {
+                self.tasks
+                    .spawn(async move { service.serve_peer(connection, peer).await });
             }
         }
         async fn select(&self, length: usize) -> (TaskId, Vec<u8>) {
@@ -2333,6 +2815,352 @@ mod tests {
             let (release, release_rx) = tokio::sync::oneshot::channel();
             *self.b.first_chunk_gate.lock().unwrap() = Some((reached_tx, release_rx));
             (reached, release)
+        }
+    }
+    #[tokio::test]
+    async fn simultaneous_automatic_resume_reuses_the_fresh_sender_attempt() {
+        let mut pair = Pair::new().await;
+        pair.a.set_auto_resume(true);
+        pair.b.set_auto_resume(true);
+        let (id, bytes) = pair.select(4 * 1024 * 1024).await;
+        let (reached, _release) = pair.gate();
+        let sender = pair.sender(id.clone());
+        reached.await.unwrap();
+        pair.a.network_lost(pair.ib);
+        pair.b.network_lost(pair.ia);
+        pair.ca.close(0u32.into(), b"fixture loss");
+        assert!(sender.await.unwrap().is_err());
+        pair.cb.closed().await;
+        while pair.tasks.join_next().await.is_some() {}
+        pair.a.settle_network_loss(pair.ib).await.unwrap();
+        pair.b.settle_network_loss(pair.ia).await.unwrap();
+        let lost_transport = pair.ca.stable_id();
+        pair.reconnect().await;
+        let (admitted_tx, admitted) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        *pair.a.resume_admission_gate.lock().unwrap() = Some((admitted_tx, release_rx));
+        let ticket = pair
+            .b
+            .recovery
+            .lock()
+            .unwrap()
+            .due(
+                Instant::now() + Duration::from_secs(5),
+                |_, _| true,
+                |_| false,
+            )
+            .1
+            .pop()
+            .unwrap();
+        let service = pair.b.clone();
+        let connection = pair.cb.clone();
+        let request = tokio::spawn(async move { service.auto_recover(&connection, ticket).await });
+        tokio::time::timeout(Duration::from_secs(5), admitted)
+            .await
+            .unwrap()
+            .unwrap();
+        let ticket = pair
+            .a
+            .recovery
+            .lock()
+            .unwrap()
+            .due(
+                Instant::now() + Duration::from_secs(5),
+                |_, _| true,
+                |_| false,
+            )
+            .1
+            .pop()
+            .unwrap();
+        pair.a.auto_recover(&pair.ca, ticket).await.unwrap();
+        let (reached, finish) = pair.gate();
+        let scheduled = pair
+            .a
+            .dispatch_ready(&HashMap::from([(pair.ib, pair.ca.clone())]))
+            .pop()
+            .unwrap();
+        let service = pair.a.clone();
+        let connection = pair.ca.clone();
+        let sender =
+            tokio::spawn(async move { service.execute_queued(scheduled, connection).await });
+        tokio::time::timeout(Duration::from_secs(5), reached)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            pair.a
+                .automatic_attempt_exists(&id, pair.ib, pair.ca.stable_id())
+        );
+        assert!(
+            !pair
+                .a
+                .automatic_attempt_exists(&id, pair.ib, lost_transport)
+        );
+        assert!(
+            !pair
+                .a
+                .automatic_attempt_exists(&id, pair.ia, pair.ca.stable_id())
+        );
+        release.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_ok(),
+            "fresh active sender must be reused: {result:?}"
+        );
+        assert_eq!(
+            pair.b.task(id.clone()).await.unwrap().state(),
+            TaskState::Transferring
+        );
+        finish.send(()).unwrap();
+        sender.await.unwrap().unwrap();
+        wait_state(&pair.b, &id, TaskState::Completed).await;
+        assert_eq!(
+            pair.a.task(id.clone()).await.unwrap().state(),
+            TaskState::Completed
+        );
+        assert_eq!(
+            fs::read(pair.root.join("b-receive/文件.bin")).unwrap(),
+            bytes
+        );
+        assert!(pair.a.automatic_sends.lock().unwrap().is_empty());
+        pair.shutdown().await;
+    }
+    #[tokio::test]
+    async fn cancelled_or_expired_receive_rpc_leaves_a_manually_recoverable_task() {
+        for control in 0..3 {
+            let mut pair = Pair::new().await;
+            pair.a.set_auto_resume(true);
+            pair.b.set_auto_resume(true);
+            let (id, _) = pair.select(4 * 1024 * 1024).await;
+            let (reached, _release) = pair.gate();
+            let sender = pair.sender(id.clone());
+            reached.await.unwrap();
+            pair.a.network_lost(pair.ib);
+            pair.b.network_lost(pair.ia);
+            pair.ca.close(0u32.into(), b"fixture loss");
+            assert!(sender.await.unwrap().is_err());
+            pair.cb.closed().await;
+            while pair.tasks.join_next().await.is_some() {}
+            pair.a.settle_network_loss(pair.ib).await.unwrap();
+            pair.b.settle_network_loss(pair.ia).await.unwrap();
+            pair.reconnect().await;
+            // Keep a real authenticated connection while the RPC responder is
+            // stalled. Cancellation must work without an Offer or network error.
+            pair.tasks.abort_all();
+            while pair.tasks.join_next().await.is_some() {}
+            let mut ticket = pair
+                .b
+                .recovery
+                .lock()
+                .unwrap()
+                .due(
+                    Instant::now() + Duration::from_secs(5),
+                    |_, _| true,
+                    |_| false,
+                )
+                .1
+                .pop()
+                .unwrap();
+            if control == 2 {
+                ticket.deadline = Some(Instant::now() + Duration::from_secs(2));
+            }
+            let service = pair.b.clone();
+            let connection = pair.cb.clone();
+            let request =
+                tokio::spawn(async move { service.auto_recover(&connection, ticket).await });
+            wait_state(&pair.b, &id, TaskState::Queued).await;
+            match control {
+                0 => pair.b.set_auto_resume(false),
+                1 => pair.b.pause_task(id.clone()).await.unwrap(),
+                _ => {}
+            }
+            tokio::time::timeout(Duration::from_secs(5), request)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                pair.b.task(id.clone()).await.unwrap().state(),
+                if control == 1 {
+                    TaskState::Paused
+                } else {
+                    TaskState::Interrupted
+                }
+            );
+            assert!(pair.b.ui_snapshot().unwrap().tasks[0].can_continue());
+            assert!(!pair.root.join("b-receive/文件.bin").exists());
+            pair.shutdown().await;
+        }
+    }
+    #[tokio::test]
+    async fn automatic_offer_can_deliver_when_the_first_offer_never_reached_receiver() {
+        let pair = Pair::new().await;
+        pair.a.set_auto_resume(true);
+        let (id, bytes) = pair.select(4096).await;
+        pair.a
+            .recovery
+            .lock()
+            .unwrap()
+            .enroll(id.clone(), pair.ib, TaskDirection::Send);
+        pair.a.network_lost(pair.ib);
+        pair.a
+            .store({
+                let id = id.clone();
+                move |store| disk::transition(store, &id, TaskState::Interrupted)
+            })
+            .await
+            .unwrap();
+        let ticket = pair
+            .a
+            .recovery
+            .lock()
+            .unwrap()
+            .due(
+                Instant::now() + Duration::from_secs(2),
+                |_, _| true,
+                |_| false,
+            )
+            .1
+            .pop()
+            .unwrap();
+        pair.a.auto_recover(&pair.ca, ticket).await.unwrap();
+        let scheduled = pair
+            .a
+            .dispatch_ready(&HashMap::from([(pair.ib, pair.ca.clone())]))
+            .pop()
+            .unwrap();
+        pair.a
+            .execute_queued(scheduled, pair.ca.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read(pair.root.join("b-receive/文件.bin")).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            pair.a.task(id.clone()).await.unwrap().state(),
+            TaskState::Completed
+        );
+        assert_eq!(pair.b.task(id).await.unwrap().state(), TaskState::Completed);
+        pair.shutdown().await;
+    }
+    #[tokio::test]
+    async fn automatic_recovery_cannot_override_pause_restart_disabled_preference_or_changed_source()
+     {
+        for scenario in 0..9 {
+            let mut pair = Pair::new().await;
+            pair.a.set_auto_resume(true);
+            pair.b.set_auto_resume(true);
+            let (id, _) = pair.select(4 * 1024 * 1024).await;
+            let (reached, _release) = pair.gate();
+            let sender = pair.sender(id.clone());
+            tokio::time::timeout(Duration::from_secs(5), reached)
+                .await
+                .unwrap()
+                .unwrap();
+            pair.a.network_lost(pair.ib);
+            pair.b.network_lost(pair.ia);
+            pair.ca.close(0u32.into(), b"fixture loss");
+            assert!(sender.await.unwrap().is_err());
+            pair.cb.closed().await;
+            while pair.tasks.join_next().await.is_some() {}
+            pair.a.settle_network_loss(pair.ib).await.unwrap();
+            pair.b.settle_network_loss(pair.ia).await.unwrap();
+            let ticket = pair
+                .a
+                .recovery
+                .lock()
+                .unwrap()
+                .due(
+                    Instant::now() + Duration::from_secs(2),
+                    |_, _| true,
+                    |_| false,
+                )
+                .1
+                .pop()
+                .unwrap();
+            match scenario {
+                0 => pair.b.pause_task(id.clone()).await.unwrap(),
+                1 => {
+                    let replacement = TransferService::new(
+                        TaskStore::open(&pair.root.join("dummy/tasks.json"))
+                            .unwrap()
+                            .0,
+                        pair.root.join("b-receive"),
+                    );
+                    drop(std::mem::replace(&mut pair.b, replacement));
+                    let store = TaskStore::open(&pair.root.join("b-state/tasks.json"))
+                        .unwrap()
+                        .0;
+                    pair.b = TransferService::new(store, pair.root.join("b-receive"));
+                    pair.b.set_auto_resume(true);
+                }
+                2 => pair.a.set_auto_resume(false),
+                3 => pair.a.pause_task(id.clone()).await.unwrap(),
+                4 => fs::write(pair.root.join("文件.bin"), b"source changed").unwrap(),
+                6 => pair
+                    .a
+                    .revoke_authorization(
+                        pair.ib,
+                        super::super::remote_auth::RemoteAuthorization::default(),
+                    )
+                    .await
+                    .unwrap(),
+                7 => fs::remove_file(pair.root.join("文件.bin")).unwrap(),
+                8 => fs::create_dir(pair.root.join("b-receive/文件.bin")).unwrap(),
+                _ => {}
+            }
+            pair.reconnect().await;
+            pair.a.auto_recover(&pair.ca, ticket).await.unwrap();
+            if scenario == 5 {
+                pair.a.set_auto_resume(false);
+            }
+            let connections = HashMap::from([(pair.ib, pair.ca.clone())]);
+            let scheduled = pair.a.dispatch_ready(&connections);
+            if scenario == 2 || scenario == 3 || scenario == 6 {
+                assert!(scheduled.is_empty());
+            }
+            for send in scheduled {
+                assert!(pair.a.execute_queued(send, pair.ca.clone()).await.is_err());
+            }
+            if scenario == 8 {
+                assert!(pair.root.join("b-receive/文件.bin").is_dir());
+            } else {
+                assert!(!pair.root.join("b-receive/文件.bin").exists());
+            }
+            assert_ne!(
+                pair.a.task(id.clone()).await.unwrap().state(),
+                TaskState::Completed
+            );
+            assert_ne!(
+                pair.b.task(id.clone()).await.unwrap().state(),
+                TaskState::Completed
+            );
+            if scenario == 0 {
+                assert_eq!(
+                    pair.b.task(id.clone()).await.unwrap().state(),
+                    TaskState::Paused
+                );
+            }
+            if scenario == 3 {
+                assert_eq!(
+                    pair.a.task(id.clone()).await.unwrap().state(),
+                    TaskState::Paused
+                );
+            }
+            if scenario == 4 {
+                let record = pair.a.task(id.clone()).await.unwrap();
+                assert_eq!(record.state(), TaskState::Failed);
+                assert_eq!(
+                    record.diagnostic().unwrap().code(),
+                    TaskErrorCode::SourceChanged
+                );
+            }
+            assert!(pair.a.auto_due(|_, _| true, |_| false).1.is_empty());
+            pair.shutdown().await;
         }
     }
     #[tokio::test]
@@ -3277,6 +4105,7 @@ mod tests {
                         TaskDirection::Receive,
                         false,
                         None,
+                        pair.cb.stable_id(),
                     )
                     .unwrap(),
             );
@@ -3290,6 +4119,7 @@ mod tests {
                 TaskDirection::Receive,
                 true,
                 None,
+                pair.cb.stable_id(),
             )
             .unwrap();
         assert!(
@@ -3299,7 +4129,8 @@ mod tests {
                     &TaskId::generate(),
                     TaskDirection::Receive,
                     false,
-                    None
+                    None,
+                    pair.cb.stable_id(),
                 )
                 .is_err()
         );
