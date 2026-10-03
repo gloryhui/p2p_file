@@ -50,6 +50,9 @@ pub(crate) struct TransferService {
     changed: watch::Sender<u64>,
     epoch: Arc<std::sync::atomic::AtomicU64>,
     fair_writes: super::queue::FairWrites,
+    upload_limit: super::bandwidth::ByteLimit,
+    download_limit: super::bandwidth::ByteLimit,
+    flow_peers: Arc<Mutex<HashSet<NodeId>>>,
     frame_budget: super::frame_budget::FrameBudget,
     rate_origin: Instant,
     rates: Arc<Mutex<HashMap<TaskId, super::queue::RateSampler>>>,
@@ -145,6 +148,9 @@ impl TransferService {
             changed,
             epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fair_writes: super::queue::FairWrites::default(),
+            upload_limit: Default::default(),
+            download_limit: Default::default(),
+            flow_peers: Default::default(),
             frame_budget: super::frame_budget::FrameBudget::default(),
             rate_origin: Instant::now(),
             rates: Arc::new(Mutex::new(HashMap::new())),
@@ -199,6 +205,29 @@ impl TransferService {
             .map_err(disk::failure)?;
         self.changed.send_modify(|v| *v = v.wrapping_add(1));
         Ok(())
+    }
+    pub fn set_file_limits(&self, limits: super::bandwidth::FileLimits) -> Result<()> {
+        limits.validate().map_err(disk::failure)?;
+        self.upload_limit.set_kib(limits.upload_kib);
+        self.download_limit.set_kib(limits.download_kib);
+        Ok(())
+    }
+    pub fn set_peer_flow_support(&self, peer: NodeId, supported: bool) {
+        let mut peers = self.flow_peers.lock().unwrap();
+        if supported {
+            peers.insert(peer);
+        } else {
+            peers.remove(&peer);
+        }
+    }
+    fn check_flow_support(&self, peer: NodeId, limited: bool) -> Result<()> {
+        if limited && !self.flow_peers.lock().unwrap().contains(&peer) {
+            Err(disk::failure(
+                "对端不支持文件限速保活，请更新对端软件或关闭文件限速",
+            ))
+        } else {
+            Ok(())
+        }
     }
     pub fn queue_metrics(&self) -> super::queue::QueueMetrics {
         self.sender_queue.lock().unwrap().metrics()
@@ -452,6 +481,7 @@ impl TransferService {
     pub async fn interrupt_all(&self) -> Result<()> {
         self.epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.sender_queue.lock().unwrap().clear();
+        self.flow_peers.lock().unwrap().clear();
         self.store(|store| {
             let ids = store
                 .list()
@@ -962,6 +992,7 @@ impl TransferService {
                 .send_directory_entry(connection, peer, &record, continue_reply)
                 .await;
         }
+        self.check_flow_support(peer, self.upload_limit.enabled())?;
         let source = record.clone();
         let file = blocking(move || disk::verify_source(&source)).await?;
         let details = record.file_details().unwrap();
@@ -1139,8 +1170,13 @@ impl TransferService {
                         )
                     })
                     .await?;
+                    self.check_flow_support(io.peer, self.upload_limit.enabled())?;
+                    let flow_supported = self.flow_peers.lock().unwrap().contains(&io.peer);
                     io.send_chunk(
                         &writer_ticket,
+                        &self.upload_limit,
+                        flow_supported,
+                        &mut pause,
                         Message::Chunk {
                             task_id: id.clone(),
                             index,
@@ -1149,6 +1185,7 @@ impl TransferService {
                     )
                     .await?;
                 }
+                Message::FlowWait { .. } => {}
                 Message::ChunkAck { index, .. } => {
                     if !sent.remove(&index) || !acknowledged.insert(index) {
                         return Err(disk::failure("重复或未知分片确认"));
@@ -1491,6 +1528,21 @@ impl TransferService {
         let Entry::File(manifest) = entry else {
             unreachable!()
         };
+        if let Err(error) = self.check_flow_support(peer, self.download_limit.enabled()) {
+            let _ = protocol::write(
+                &mut send,
+                &Frame {
+                    request_id: 1,
+                    message: Message::Error {
+                        task_id,
+                        code: ErrorCode::UnsupportedCapability,
+                    },
+                },
+            )
+            .await;
+            let _ = send.finish();
+            return Err(error);
+        }
         let (_guard, pause) = self.claim_receive(&mut send, peer, &task_id, false).await?;
         let mut io = TaskIo::new(send, recv, peer, task_id.clone(), self.frame_budget.clone());
         io.observe(&first)?;
@@ -1740,6 +1792,9 @@ impl TransferService {
                     if !outstanding.remove(&index) {
                         return Err(disk::failure("收到未请求或重复的分片"));
                     }
+                    self.check_flow_support(io.peer, self.download_limit.enabled())?;
+                    io.wait_download(&self.download_limit, data.len(), &mut pause)
+                        .await?;
                     let output = download.clone();
                     let length = data.len() as u64;
                     blocking(move || {
@@ -1831,6 +1886,8 @@ fn error_code(error: &Error) -> ErrorCode {
         ErrorCode::SourceChanged
     } else if text.contains("源文件不可用") {
         ErrorCode::SourceMissing
+    } else if text.contains("对端不支持文件限速") {
+        ErrorCode::UnsupportedCapability
     } else if is_storage_error(error) {
         ErrorCode::Storage
     } else {
@@ -1843,8 +1900,30 @@ fn remote_error(code: ErrorCode) -> Error {
         ErrorCode::SourceMissing => "源文件不可用",
         ErrorCode::Storage => "对端存储不可用",
         ErrorCode::Busy => "对端资源忙，请稍后继续",
+        ErrorCode::UnsupportedCapability => "对端不支持文件限速保活，请更新软件或关闭文件限速",
         _ => "对端传输中断",
     })
+}
+
+struct ProgressReader<R> {
+    inner: R,
+    progress: watch::Sender<u64>,
+}
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ProgressReader<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buffer.filled().len();
+        let result = std::pin::Pin::new(&mut self.inner).poll_read(cx, buffer);
+        let bytes = buffer.filled().len() - before;
+        if bytes != 0 {
+            self.progress
+                .send_modify(|v| *v = v.wrapping_add(bytes as u64));
+        }
+        result
+    }
 }
 
 struct TaskIo {
@@ -1852,6 +1931,9 @@ struct TaskIo {
     incoming: mpsc::Receiver<Result<super::frame_budget::BufferedFrame>>,
     reader: JoinHandle<()>,
     gate: TaskProtocol,
+    read_progress: watch::Receiver<u64>,
+    pending: VecDeque<super::frame_budget::BufferedFrame>,
+    flow_pause: watch::Receiver<bool>,
     peer: NodeId,
     id: TaskId,
 }
@@ -1863,17 +1945,27 @@ impl Drop for TaskIo {
 impl TaskIo {
     fn new(
         send: SendStream,
-        mut recv: RecvStream,
+        recv: RecvStream,
         peer: NodeId,
         id: TaskId,
         budget: super::frame_budget::FrameBudget,
     ) -> Self {
         let (tx, incoming) = mpsc::channel(2);
         let task_limit = super::frame_budget::FrameBudget::task_limit();
+        let (progress, read_progress) = watch::channel(0);
+        let (pause_notice, flow_pause) = watch::channel(false);
+        let mut recv = ProgressReader {
+            inner: recv,
+            progress,
+        };
         let reader = tokio::spawn(async move {
             loop {
                 let frame = budget.read(&mut recv, Some(task_limit.clone())).await;
                 let failed = frame.is_err();
+                if matches!(&frame, Ok(buffered) if matches!(buffered.frame.message, Message::Pause { .. }))
+                {
+                    pause_notice.send_replace(true);
+                }
                 if tx.send(frame).await.is_err() || failed {
                     break;
                 }
@@ -1884,6 +1976,9 @@ impl TaskIo {
             incoming,
             reader,
             gate: TaskProtocol::new(peer),
+            read_progress,
+            pending: VecDeque::new(),
+            flow_pause,
             peer,
             id,
         }
@@ -1904,6 +1999,9 @@ impl TaskIo {
     async fn send_chunk(
         &mut self,
         ticket: &super::queue::WriteTicket,
+        limit: &super::bandwidth::ByteLimit,
+        flow_supported: bool,
+        pause: &mut watch::Receiver<bool>,
         message: Message,
     ) -> Result<()> {
         use tokio::io::AsyncWriteExt;
@@ -1923,21 +2021,93 @@ impl TaskIo {
         }
         let prefix = encoded.len() - data.len();
         drop(frame);
+        // Framing is small and unthrottled. Payload I/O has a stall timeout
+        // per bounded quantum; intentional budget waits do not consume it.
         tokio::time::timeout(IDLE_TIMEOUT, async {
             self.send
                 .write_all(&(encoded.len() as u32).to_le_bytes())
-                .await
-                .map_err(disk::local_error)?;
-            self.send
-                .write_all(&encoded[..prefix])
-                .await
-                .map_err(disk::local_error)?;
-            ticket.write_all(&mut self.send, &encoded[prefix..]).await?;
-            self.send.flush().await.map_err(disk::local_error)?;
-            Ok::<(), Error>(())
+                .await?;
+            self.send.write_all(&encoded[..prefix]).await?;
+            Ok::<(), std::io::Error>(())
         })
         .await
-        .map_err(|_| disk::failure("文件数据帧发送超时"))?
+        .map_err(|_| disk::failure("文件帧头发送超时"))??;
+        let mut offset = prefix;
+        while offset < encoded.len() {
+            if limit.enabled() && !flow_supported {
+                return Err(disk::failure(
+                    "对端不支持文件限速保活，请更新对端软件或关闭文件限速",
+                ));
+            }
+            ticket.park();
+            let maximum = encoded.len() - offset;
+            let amount = if *self.flow_pause.borrow() {
+                maximum
+            } else {
+                let acquire = limit.acquire(maximum, pause);
+                tokio::pin!(acquire);
+                loop {
+                    tokio::select! {
+                        amount = &mut acquire => break amount,
+                        _ = self.flow_pause.changed() => break maximum,
+                        frame = self.incoming.recv() => {
+                            let frame = frame.ok_or_else(|| disk::failure("文件流已关闭"))??;
+                            self.observe(&frame.frame)?;
+                            let remote_pause = matches!(frame.frame.message, Message::Pause { .. });
+                            if !matches!(frame.frame.message, Message::FlowWait { .. }) {
+                                if self.pending.len() >= WINDOW * 2 + 4 {
+                                    return Err(disk::failure("文件控制消息积压超限"));
+                                }
+                                self.pending.push_back(frame);
+                            }
+                            if remote_pause { break maximum; }
+                        }
+                    }
+                }
+            };
+            tokio::time::timeout(
+                IDLE_TIMEOUT,
+                ticket.write_all(&mut self.send, &encoded[offset..offset + amount]),
+            )
+            .await
+            .map_err(|_| disk::failure("文件数据写入停滞超时"))??;
+            offset += amount;
+        }
+        tokio::time::timeout(IDLE_TIMEOUT, self.send.flush())
+            .await
+            .map_err(|_| disk::failure("文件数据刷新超时"))??;
+        Ok(())
+    }
+    async fn wait_download(
+        &mut self,
+        limit: &super::bandwidth::ByteLimit,
+        bytes: usize,
+        pause: &mut watch::Receiver<bool>,
+    ) -> Result<()> {
+        if !limit.enabled() {
+            return Ok(());
+        }
+        let mut remaining = bytes;
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
+        heartbeat.tick().await;
+        while remaining > 0 {
+            if *self.flow_pause.borrow() || *pause.borrow() {
+                break;
+            }
+            let acquire = limit.acquire(remaining, pause);
+            tokio::pin!(acquire);
+            let amount = loop {
+                tokio::select! {
+                    amount = &mut acquire => break amount,
+                    _ = self.flow_pause.changed() => break remaining,
+                    _ = heartbeat.tick() => {
+                        self.send(Message::FlowWait { task_id: self.id.clone() }).await?;
+                    }
+                }
+            };
+            remaining -= amount;
+        }
+        Ok(())
     }
     fn finish(&mut self) {
         let _ = self.send.finish();
@@ -1961,17 +2131,27 @@ async fn next_input(
     pause: &mut watch::Receiver<bool>,
     pausing: Option<Instant>,
 ) -> Result<Input> {
+    if let Some(frame) = io.pending.pop_front() {
+        return Ok(Input::Frame(frame));
+    }
     let timeout = pausing.map_or(IDLE_TIMEOUT, |started| {
         PAUSE_TIMEOUT.saturating_sub(started.elapsed())
     });
     if timeout.is_zero() {
         return Err(disk::failure("暂停确认超时"));
     }
-    tokio::select! {
-        biased;
-        changed=pause.changed()=> {changed.map_err(|_|disk::failure("暂停控制已关闭"))?;Ok(Input::Pause)}
-        frame=io.incoming.recv()=> {let frame=frame.ok_or_else(||disk::failure("文件流已关闭"))??;io.observe(&frame.frame)?;Ok(Input::Frame(frame))}
-        _=tokio::time::sleep(timeout)=>Err(disk::failure(if pausing.is_some(){"暂停确认超时"}else{"文件传输超时"})),
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            biased;
+            changed=pause.changed()=> {changed.map_err(|_|disk::failure("暂停控制已关闭"))?;return Ok(Input::Pause)}
+            frame=io.incoming.recv()=> {let frame=frame.ok_or_else(||disk::failure("文件流已关闭"))??;io.observe(&frame.frame)?;return Ok(Input::Frame(frame))}
+            changed=io.read_progress.changed(), if pausing.is_none()=> {
+                if changed.is_ok() { deadline.as_mut().reset(tokio::time::Instant::now() + IDLE_TIMEOUT); }
+            }
+            _=&mut deadline=>return Err(disk::failure(if pausing.is_some(){"暂停确认超时"}else{"文件传输超时"})),
+        }
     }
 }
 
@@ -2017,6 +2197,8 @@ mod tests {
             let identity_b = Identity::generate();
             let ia = identity_a.node_id();
             let ib = identity_b.node_id();
+            a.set_peer_flow_support(ib, true);
+            b.set_peer_flow_support(ia, true);
             let ea = client_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
             let eb = server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
             let server = eb.clone();
@@ -2129,6 +2311,151 @@ mod tests {
             (reached, release)
         }
     }
+    #[tokio::test]
+    async fn file_limits_bound_real_upload_and_download_without_affecting_receipts() {
+        let pair = Pair::new().await;
+        let (id, bytes) = pair.select(64 * 1024).await;
+        pair.a
+            .set_file_limits(super::super::bandwidth::FileLimits {
+                upload_kib: 64,
+                download_kib: 0,
+            })
+            .unwrap();
+        let start = Instant::now();
+        pair.sender(id.clone()).await.unwrap().unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(850));
+        assert_eq!(pair.a.task(id).await.unwrap().state(), TaskState::Completed);
+        assert_eq!(
+            fs::read(pair.root.join("b-receive/文件.bin")).unwrap(),
+            bytes
+        );
+        pair.a.set_file_limits(Default::default()).unwrap();
+        pair.b
+            .set_file_limits(super::super::bandwidth::FileLimits {
+                upload_kib: 0,
+                download_kib: 64,
+            })
+            .unwrap();
+        let (id, _) = pair.select(64 * 1024).await;
+        let start = Instant::now();
+        pair.sender(id.clone()).await.unwrap().unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(850));
+        assert_eq!(pair.b.task(id).await.unwrap().state(), TaskState::Completed);
+        pair.shutdown().await;
+    }
+    #[tokio::test]
+    async fn file_limits_heartbeat_keeps_slow_receiver_alive_past_frame_timeout() {
+        let pair = Pair::new().await;
+        pair.b
+            .set_file_limits(super::super::bandwidth::FileLimits {
+                upload_kib: 0,
+                download_kib: 1,
+            })
+            .unwrap();
+        let (id, _) = pair.select(32 * 1024).await;
+        let start = Instant::now();
+        pair.sender(id.clone()).await.unwrap().unwrap();
+        assert!(start.elapsed() > IDLE_TIMEOUT);
+        assert_eq!(pair.a.task(id).await.unwrap().state(), TaskState::Completed);
+        pair.shutdown().await;
+    }
+    #[tokio::test]
+    async fn file_limits_slow_upload_uses_byte_progress_instead_of_whole_frame_timeout() {
+        let pair = Pair::new().await;
+        pair.a
+            .set_file_limits(super::super::bandwidth::FileLimits {
+                upload_kib: 1,
+                download_kib: 0,
+            })
+            .unwrap();
+        let (id, _) = pair.select(32 * 1024).await;
+        let start = Instant::now();
+        pair.sender(id.clone()).await.unwrap().unwrap();
+        assert!(start.elapsed() > IDLE_TIMEOUT);
+        assert_eq!(pair.a.task(id).await.unwrap().state(), TaskState::Completed);
+        pair.shutdown().await;
+    }
+    #[tokio::test]
+    async fn file_limits_runtime_disable_releases_upload_and_download_waits() {
+        for download in [false, true] {
+            let pair = Pair::new().await;
+            let service = if download { &pair.b } else { &pair.a };
+            service
+                .set_file_limits(super::super::bandwidth::FileLimits {
+                    upload_kib: if download { 0 } else { 1 },
+                    download_kib: if download { 1 } else { 0 },
+                })
+                .unwrap();
+            let (id, _) = pair.select(64 * 1024).await;
+            let sender = pair.sender(id.clone());
+            wait_state(&pair.b, &id, TaskState::Transferring).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!sender.is_finished());
+            service.set_file_limits(Default::default()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), sender)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(pair.a.task(id).await.unwrap().state(), TaskState::Completed);
+            pair.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn file_limits_pause_and_runtime_unlimit_wake_in_flight_tasks() {
+        for receiver_pause in [false, true] {
+            let pair = Pair::new().await;
+            pair.a
+                .set_file_limits(super::super::bandwidth::FileLimits {
+                    upload_kib: 1,
+                    download_kib: 0,
+                })
+                .unwrap();
+            let (id, _) = pair.select(8 * 1024 * 1024).await;
+            let sender = pair.sender(id.clone());
+            wait_state(&pair.b, &id, TaskState::Transferring).await;
+            if receiver_pause {
+                pair.b.pause(&id).unwrap();
+            } else {
+                pair.a.pause(&id).unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(5), sender)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                pair.a.task(id.clone()).await.unwrap().state(),
+                TaskState::Paused
+            );
+            pair.a.set_file_limits(Default::default()).unwrap();
+            pair.a
+                .send_file(&pair.ca, pair.ib, id.clone())
+                .await
+                .unwrap();
+            assert_eq!(pair.a.task(id).await.unwrap().state(), TaskState::Completed);
+            pair.shutdown().await;
+        }
+    }
+    #[tokio::test]
+    async fn file_limits_reject_legacy_peer_without_silent_protocol_change() {
+        let pair = Pair::new().await;
+        pair.a.set_peer_flow_support(pair.ib, false);
+        pair.a
+            .set_file_limits(super::super::bandwidth::FileLimits {
+                upload_kib: 1,
+                download_kib: 0,
+            })
+            .unwrap();
+        let (id, _) = pair.select(64 * 1024).await;
+        let error = pair.sender(id.clone()).await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("对端不支持"));
+        pair.a.set_file_limits(Default::default()).unwrap();
+        pair.a.send_file(&pair.ca, pair.ib, id).await.unwrap();
+        pair.shutdown().await;
+    }
+
     async fn wait_state(service: &TransferService, id: &TaskId, state: TaskState) {
         let result = tokio::time::timeout(Duration::from_secs(10), async {
             let mut events = service.subscribe();
