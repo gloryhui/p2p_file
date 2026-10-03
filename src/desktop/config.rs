@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const APP_DIR_NAME: &str = "p2p_file";
-const CONFIG_SCHEMA_VERSION: u32 = 6;
+const CONFIG_SCHEMA_VERSION: u32 = 7;
 static CONFIG_MUTATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const LEGACY_CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -100,6 +100,7 @@ impl SpeedtestDirection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SettingsDraft {
     pub background: super::background::BackgroundOptions,
+    pub file_limits: super::bandwidth::FileLimits,
     pub relay_server: Option<String>,
     pub signal_host: String,
     pub signal_port: String,
@@ -192,6 +193,7 @@ impl SettingsDraft {
     pub fn defaults(downloads_dir: Option<PathBuf>) -> Self {
         Self {
             background: Default::default(),
+            file_limits: Default::default(),
             relay_server: None,
             signal_host: String::new(),
             signal_port: String::new(),
@@ -215,6 +217,7 @@ impl SettingsDraft {
         };
         Self {
             background: config.background,
+            file_limits: config.file_limits,
             relay_server: config.relay_server,
             signal_host: config
                 .signal
@@ -242,6 +245,9 @@ impl SettingsDraft {
         validate_signal_host(host)?;
         let port = parse_signal_port(&self.signal_port)?;
         validate_send_concurrency(self.send_concurrency)?;
+        self.file_limits
+            .validate()
+            .map_err(|message| ConfigError::Invalid(message.into()))?;
         validate_speedtest_seconds(self.speedtest_seconds)?;
 
         let receive_directory = self
@@ -257,6 +263,7 @@ impl SettingsDraft {
 
         let config = DesktopConfig {
             background: self.background,
+            file_limits: self.file_limits,
             relay_server: self.relay_server.clone(),
             schema_version: CONFIG_SCHEMA_VERSION,
             signal: Some(SignalConfig {
@@ -282,6 +289,7 @@ impl SettingsDraft {
         if let Some(saved) = DesktopConfig::load(path)? {
             // A settings draft predating a trust/password mutation must not undo it.
             config.background = saved.background;
+            config.file_limits = saved.file_limits;
             config.trusted_devices = saved.trusted_devices;
             config.remote_auth = saved.remote_auth;
         }
@@ -330,6 +338,8 @@ impl DesktopConfig {
 pub struct DesktopConfig {
     #[serde(default)]
     background: super::background::BackgroundOptions,
+    #[serde(default)]
+    file_limits: super::bandwidth::FileLimits,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     relay_server: Option<String>,
     schema_version: u32,
@@ -379,6 +389,7 @@ impl DesktopConfig {
             Some(config) => config,
             None => Self {
                 background: Default::default(),
+                file_limits: Default::default(),
                 relay_server: None,
                 schema_version: CONFIG_SCHEMA_VERSION,
                 signal: None,
@@ -403,6 +414,19 @@ impl DesktopConfig {
         let mut config = Self::load(path)?
             .ok_or_else(|| ConfigError::Invalid("请先完成本机身份初始化".into()))?;
         config.background = options;
+        config.write_atomic(path)
+    }
+    pub fn save_file_limits(
+        path: &Path,
+        limits: super::bandwidth::FileLimits,
+    ) -> Result<(), ConfigError> {
+        let _guard = config_mutation_lock()?;
+        limits
+            .validate()
+            .map_err(|message| ConfigError::Invalid(message.into()))?;
+        let mut config = Self::load(path)?
+            .ok_or_else(|| ConfigError::Invalid("请先完成本机身份初始化".into()))?;
+        config.file_limits = limits;
         config.write_atomic(path)
     }
     pub fn save_trusted_devices(
@@ -483,6 +507,7 @@ impl DesktopConfig {
                 }
                 Self {
                     background: Default::default(),
+                    file_limits: Default::default(),
                     relay_server: None,
                     schema_version: CONFIG_SCHEMA_VERSION,
                     signal: Some(legacy.signal),
@@ -496,7 +521,7 @@ impl DesktopConfig {
                     trusted_devices: Vec::new(),
                 }
             }
-            2 | 3 | 4 | 5 | CONFIG_SCHEMA_VERSION => {
+            2 | 3 | 4 | 5 | 6 | CONFIG_SCHEMA_VERSION => {
                 let mut config = serde_json::from_slice::<Self>(&bytes)
                     .map_err(|error| ConfigError::Corrupt(error.to_string()))?;
                 if version < 4 && (config.signal.is_none() || config.receive_directory.is_none()) {
@@ -511,6 +536,9 @@ impl DesktopConfig {
                     return Err(ConfigError::Corrupt(
                         "旧配置版本不能启用后台运行或登录启动".into(),
                     ));
+                }
+                if version < 7 && config.file_limits != Default::default() {
+                    return Err(ConfigError::Corrupt("旧配置版本不能声明文件限速".into()));
                 }
                 // v2 had target-only grants. Preserve rows, but require explicit peer authorization.
                 if version == 2 {
@@ -551,6 +579,9 @@ impl DesktopConfig {
                 .map_err(|e| ConfigError::Invalid(e.to_string()))?;
         }
         validate_send_concurrency(self.send_concurrency)?;
+        self.file_limits
+            .validate()
+            .map_err(|message| ConfigError::Invalid(message.into()))?;
         validate_speedtest_seconds(self.speedtest_seconds)?;
         if let Some(directory) = &self.receive_directory {
             if !directory.is_absolute() {
@@ -964,6 +995,7 @@ mod tests {
     fn valid_draft(receive_directory: PathBuf) -> SettingsDraft {
         SettingsDraft {
             background: Default::default(),
+            file_limits: Default::default(),
             relay_server: None,
             signal_host: "relay.example.test".into(),
             signal_port: "7000".into(),
@@ -1042,6 +1074,7 @@ mod tests {
         );
         let upgraded = SettingsDraft::from_config(DesktopConfig {
             background: Default::default(),
+            file_limits: Default::default(),
             relay_server: None,
             schema_version: CONFIG_SCHEMA_VERSION,
             signal: Some(SignalConfig {
@@ -1769,6 +1802,46 @@ mod tests {
         let corrupt = fs::read(&path).unwrap();
         assert!(DesktopConfig::save_background_options(&path, enabled).is_err());
         assert_eq!(fs::read(&path).unwrap(), corrupt);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn file_limit_migration_and_stale_draft_preserve_live_preferences() {
+        let root = temp_dir("file-limits");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("settings.json");
+        let draft = valid_draft(root.clone());
+        let mut old = serde_json::to_value(draft.to_config().unwrap()).unwrap();
+        old["schema_version"] = 6.into();
+        old.as_object_mut().unwrap().remove("file_limits");
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        assert_eq!(
+            DesktopConfig::load(&path).unwrap().unwrap().file_limits,
+            Default::default()
+        );
+        let limits = super::super::bandwidth::FileLimits {
+            upload_kib: 64,
+            download_kib: 1024,
+        };
+        DesktopConfig::save_file_limits(&path, limits).unwrap();
+        draft.save_atomic(&path).unwrap();
+        let loaded = DesktopConfig::load(&path).unwrap().unwrap();
+        assert_eq!(loaded.file_limits, limits);
+        assert_eq!(loaded.signal.as_ref().unwrap().host, draft.signal_host);
+        let unchanged = fs::read(&path).unwrap();
+        assert!(
+            DesktopConfig::save_file_limits(
+                &path,
+                super::super::bandwidth::FileLimits {
+                    upload_kib: u32::MAX,
+                    download_kib: 0
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), unchanged);
+        old["file_limits"] = serde_json::to_value(limits).unwrap();
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        assert!(DesktopConfig::load(&path).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }

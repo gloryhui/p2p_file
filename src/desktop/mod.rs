@@ -11,6 +11,7 @@
 mod activity;
 mod autostart;
 mod background;
+mod bandwidth;
 pub(in crate::desktop) mod config;
 #[cfg(test)]
 mod e2e;
@@ -979,6 +980,8 @@ struct DesktopShell {
     local_short_id: Option<ShortId>,
     resolved_peer: Option<(String, NodeId)>,
     concurrency_input: Entity<TextField>,
+    upload_limit_input: Entity<TextField>,
+    download_limit_input: Entity<TextField>,
     signal_host: Entity<TextField>,
     signal_port: Entity<TextField>,
     relay_server: Entity<TextField>,
@@ -3378,7 +3381,61 @@ impl DesktopShell {
             .child(self.remote_password_card(window, cx))
             .child(self.trusted_devices_card(window, cx))
             .child(self.background_card(cx))
+            .child(self.file_limits_card(window, cx))
             .child(self.advanced_network_card(window, cx))
+    }
+
+    fn file_limits_card(&self, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
+        ui_components::card()
+            .child(ui_components::section_header("⇅", "文件传输限速", "各设备共享总额度；0 表示不限速"))
+            .child(div().flex().gap_3()
+                .child(div().flex_1().flex().flex_col().gap_2()
+                    .child(ui_components::field_label("上传上限（KiB/s）"))
+                    .child(Self::text_field_frame(&self.upload_limit_input, window, cx)))
+                .child(div().flex_1().flex().flex_col().gap_2()
+                    .child(ui_components::field_label("下载上限（KiB/s）"))
+                    .child(Self::text_field_frame(&self.download_limit_input, window, cx))))
+            .child(div().text_xs().text_color(rgb(ui_theme::TEXT_SECONDARY))
+                .child("1 MiB/s = 1024 KiB/s。直连与 Relay 文件共用额度；隧道与测速独立。下载允许有限的在途缓冲。"))
+            .child(ui_components::secondary_button("保存并应用限速", self.can_save_settings && !self.is_saving_settings)
+                .on_mouse_up(MouseButton::Left, cx.listener(|shell, _, _, cx| shell.apply_file_limits(cx))))
+    }
+    fn apply_file_limits(&mut self, cx: &mut Context<Self>) {
+        if !self.can_save_settings || self.is_saving_settings {
+            return;
+        }
+        let limits = match bandwidth::FileLimits::parse(
+            &self.upload_limit_input.read(cx).content,
+            &self.download_limit_input.read(cx).content,
+        ) {
+            Ok(limits) => limits,
+            Err(error) => {
+                self.set_status(error, cx);
+                return;
+            }
+        };
+        let config_file = self.config_file.clone();
+        let background = cx.background_executor().clone();
+        self.is_saving_settings = true;
+        cx.spawn(async move |shell, cx| {
+            let result = background
+                .spawn(async move { DesktopConfig::save_file_limits(&config_file, limits) })
+                .await;
+            let _ = shell.update(cx, |shell, cx| {
+                shell.is_saving_settings = false;
+                match result {
+                    Ok(()) => {
+                        shell.settings.file_limits = limits;
+                        if let Some(service) = &shell.transfer_service {
+                            let _ = service.set_file_limits(limits);
+                        }
+                        shell.set_status("文件限速已保存并应用到当前传输", cx);
+                    }
+                    Err(error) => shell.set_status(format!("文件限速未保存：{error}"), cx),
+                }
+            });
+        })
+        .detach();
     }
 
     fn connection_card(&self, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
@@ -4863,6 +4920,12 @@ pub fn run(background_start: bool) {
                 .expect("validated concurrency");
             service
         });
+        if let Some(service) = &transfer_service {
+            service
+                .set_file_limits(settings.file_limits)
+                .expect("validated file limits");
+        }
+        let initial_file_limits = settings.file_limits;
         let initial_receive_root = settings.receive_directory.clone();
         let initial_concurrency = settings.send_concurrency;
         let initial_host = settings.signal_host.clone();
@@ -4918,6 +4981,16 @@ pub fn run(background_start: bool) {
                 });
                 let concurrency_input =
                     cx.new(|cx| TextField::new_concurrency_value(cx, initial_concurrency));
+                let upload_limit_input = cx.new(|cx| {
+                    let mut field = TextField::new(cx, "0 表示不限速");
+                    field.content = initial_file_limits.upload_kib.to_string().into();
+                    field
+                });
+                let download_limit_input = cx.new(|cx| {
+                    let mut field = TextField::new(cx, "0 表示不限速");
+                    field.content = initial_file_limits.download_kib.to_string().into();
+                    field
+                });
                 let signal_host = cx.new(|cx| {
                     let mut field = TextField::new(cx, "输入 IPv4、IPv6 或主机名");
                     field.content = initial_host.into();
@@ -4969,6 +5042,8 @@ pub fn run(background_start: bool) {
                         local_short_id: None,
                         resolved_peer: None,
                         concurrency_input,
+                        upload_limit_input,
+                        download_limit_input,
                         signal_host,
                         signal_port,
                         relay_server,

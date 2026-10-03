@@ -26,10 +26,14 @@ pub const CAP_SPEED_EXECUTION: u64 = 64;
 pub const CAP_TCP_TUNNEL: u64 = 128;
 pub const CAP_REMOTE_AUTH: u64 = 256;
 pub const CAP_TRUSTED_DEVICE_AUTH: u64 = 1 << 9;
+pub const CAP_FILE_FLOW: u64 = 1 << 10;
 pub const REQUIRED_CAPABILITIES: u64 =
     15 | CAP_FILE_TRANSFER | CAP_DIRECTORY_TRANSFER | CAP_SPEED_EXECUTION;
-pub const LOCAL_CAPABILITIES: u64 =
-    REQUIRED_CAPABILITIES | CAP_TCP_TUNNEL | CAP_REMOTE_AUTH | CAP_TRUSTED_DEVICE_AUTH;
+pub const LOCAL_CAPABILITIES: u64 = REQUIRED_CAPABILITIES
+    | CAP_TCP_TUNNEL
+    | CAP_REMOTE_AUTH
+    | CAP_TRUSTED_DEVICE_AUTH
+    | CAP_FILE_FLOW;
 pub const MAX_FRAME_BYTES: u32 = 4 * 1024 * 1024;
 pub const MAX_CHUNKS: usize = 65_536;
 pub const MAX_TASKS_PER_PEER: usize = 128;
@@ -184,6 +188,10 @@ pub enum Message {
     TunnelError {
         reason: String,
     },
+    /// Negotiated task-bound keepalive while a receiver waits for its byte budget.
+    FlowWait {
+        task_id: TaskId,
+    },
 }
 
 impl Message {
@@ -200,7 +208,8 @@ impl Message {
             | Self::Error { task_id, .. }
             | Self::RequestChunk { task_id, .. }
             | Self::Chunk { task_id, .. }
-            | Self::ChunkAck { task_id, .. } => Some(task_id),
+            | Self::ChunkAck { task_id, .. }
+            | Self::FlowWait { task_id } => Some(task_id),
             Self::TunnelError { .. } => None,
         }
     }
@@ -551,6 +560,16 @@ impl TaskProtocol {
                 }
                 binding.state = WireTaskState::Transferring;
             }
+            Message::FlowWait { .. } => {
+                if actor == binding.sender
+                    || !matches!(
+                        binding.state,
+                        WireTaskState::Transferring | WireTaskState::Pausing
+                    )
+                {
+                    return Err(invalid("限速保活任务状态不符"));
+                }
+            }
             Message::Pause { .. } => {
                 if !matches!(
                     binding.state,
@@ -834,6 +853,60 @@ mod tests {
         )
         .unwrap();
         (peer, gate, root)
+    }
+
+    #[test]
+    fn file_flow_wait_requires_bound_receiver_active_state_and_monotonic_sequence() {
+        let (peer, mut gate, root) = transferring();
+        let pulse = Frame {
+            request_id: 2,
+            message: Message::FlowWait { task_id: task() },
+        };
+        assert!(gate.observe(peer, Actor::Local, &pulse).is_err());
+        assert!(
+            gate.observe(Identity::generate().node_id(), Actor::Remote, &pulse)
+                .is_err()
+        );
+        assert!(
+            gate.observe(
+                peer,
+                Actor::Remote,
+                &Frame {
+                    request_id: 2,
+                    message: Message::FlowWait {
+                        task_id: TaskId::generate()
+                    }
+                }
+            )
+            .is_err()
+        );
+        gate.observe(peer, Actor::Remote, &pulse).unwrap();
+        assert!(gate.observe(peer, Actor::Remote, &pulse).is_err());
+        assert_eq!(gate.state(&task()), Some(WireTaskState::Transferring));
+        gate.observe(
+            peer,
+            Actor::Remote,
+            &Frame {
+                request_id: 3,
+                message: Message::Completed {
+                    task_id: task(),
+                    root_hash: root,
+                    receipt_version: 1,
+                },
+            },
+        )
+        .unwrap();
+        assert!(
+            gate.observe(
+                peer,
+                Actor::Remote,
+                &Frame {
+                    request_id: 4,
+                    ..pulse
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -1384,6 +1384,9 @@ async fn run_session(
                         );
                         connection.close(0u32.into(), b"new explicit remote credential");
                         peer_capabilities.remove(&peer);
+                        if let Some(service) = config.transfer.as_ref() {
+                            service.set_peer_flow_support(peer, false);
+                        }
                         if let Some(updates) = peer_connection_updates.get(&peer) {
                             updates.send_replace(None);
                         }
@@ -1854,6 +1857,9 @@ async fn run_session(
                             );
                             connection.close(0u32.into(), b"peer mapping changed");
                             peer_capabilities.remove(&node_id);
+                            if let Some(service) = config.transfer.as_ref() {
+                                service.set_peer_flow_support(node_id, false);
+                            }
                             if let Some(updates) = peer_connection_updates.get(&node_id) {
                                 updates.send_replace(None);
                             }
@@ -2218,6 +2224,12 @@ async fn run_session(
                 reconnect_probes.remove(&peer);
                 connections.insert(peer, (generation, connection.clone()));
                 peer_capabilities.insert(peer, capabilities);
+                if let Some(service) = config.transfer.as_ref() {
+                    service.set_peer_flow_support(
+                        peer,
+                        capabilities & super::protocol::CAP_FILE_FLOW != 0,
+                    );
+                }
                 if capabilities & super::protocol::CAP_TCP_TUNNEL == 0 {
                     let incompatible_rules = running_tunnels
                         .iter()
@@ -2380,6 +2392,9 @@ async fn run_session(
                         rights.send_replace(RemoteAuthorization::default());
                     }
                     peer_capabilities.remove(&peer);
+                    if let Some(service) = config.transfer.as_ref() {
+                        service.set_peer_flow_support(peer, false);
+                    }
                     if let Some(updates) = peer_connection_updates.get(&peer) {
                         updates.send_replace(None);
                     }
@@ -2472,6 +2487,9 @@ async fn run_session(
                     );
                     old.close(0u32.into(), b"peer requested fresh authenticated transport");
                     peer_capabilities.remove(&peer);
+                    if let Some(service) = config.transfer.as_ref() {
+                        service.set_peer_flow_support(peer, false);
+                    }
                     if let Some(updates) = peer_connection_updates.get(&peer) {
                         updates.send_replace(None);
                     }
@@ -4951,7 +4969,7 @@ mod tests {
         }
         // Reject forged peer requests despite an authenticated, live QUIC transport.
         let (mut send, mut recv) = conn_b.open_bi().await.unwrap();
-        protocol::write(
+        let forged_request = protocol::write(
             &mut send,
             &Frame {
                 request_id: 0,
@@ -4960,8 +4978,21 @@ mod tests {
                 },
             },
         )
-        .await
-        .unwrap();
+        .await;
+        // The unauthorized stream can be rejected before the request's final
+        // bytes are written. Accept only the exact authorization STOP code;
+        // other transport errors still fail this business-boundary test.
+        if let Err(error) = forged_request {
+            let crate::error::Error::Io(error) = error else {
+                panic!("unexpected forged-request error: {error}");
+            };
+            assert_eq!(
+                error
+                    .get_ref()
+                    .and_then(|error| error.downcast_ref::<quinn::WriteError>()),
+                Some(&quinn::WriteError::Stopped(4u32.into())),
+            );
+        }
         assert!(
             time::timeout(Duration::from_secs(5), protocol::read(&mut recv))
                 .await
