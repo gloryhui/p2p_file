@@ -5867,12 +5867,10 @@ impl Render for DesktopShell {
             })
             .child(self.connection_receive_row(window, cx))
             .when_some(speed_card, |page, speed_card| page.child(speed_card))
-            .child(
-                self.transfer_card(window, cx)
-                    .when(self.show_diagnostics, |card| {
-                        card.min_h(px(320.)).flex_shrink_0()
-                    }),
-            )
+            .child(self.transfer_card(window, cx).when(
+                self.show_diagnostics || self.detail_selection.is_some(),
+                |card| card.min_h(px(320.)).flex_shrink_0(),
+            ))
             .when(self.detail_selection.is_some(), |page| {
                 page.child(self.task_details_card(cx))
             })
