@@ -98,6 +98,23 @@ pub enum TunnelRuntimeState {
 #[derive(Clone, Debug)]
 pub enum SessionEvent {
     NetworkPaths(String),
+    NetworkFamilies {
+        ipv4: bool,
+        ipv6: bool,
+        relay_configured: bool,
+    },
+    PeerCandidates {
+        peer: NodeId,
+        generation: u64,
+        ipv4: usize,
+        ipv6: usize,
+    },
+    PeerTransport {
+        peer: NodeId,
+        generation: u64,
+        relay: bool,
+        family: AddressFamily,
+    },
     PeerPath {
         peer: NodeId,
         generation: u64,
@@ -757,6 +774,13 @@ async fn run_session(
     let mut session_tasks = JoinSet::new();
     let _ = events
         .send(SessionEvent::NetworkPaths(network.diagnostics.join("; ")))
+        .await;
+    let _ = events
+        .send(SessionEvent::NetworkFamilies {
+            ipv4: network.path(AddressFamily::Ipv4).is_some(),
+            ipv6: network.path(AddressFamily::Ipv6).is_some(),
+            relay_configured: network.relay.is_some(),
+        })
         .await;
     for path in &network.paths {
         let endpoint = path.endpoint.clone();
@@ -2109,6 +2133,17 @@ async fn run_session(
                     continue;
                 }
                 let _ = events
+                    .send(SessionEvent::PeerTransport {
+                        peer,
+                        generation,
+                        relay: network
+                            .relay
+                            .as_ref()
+                            .is_some_and(|r| r.endpoints.is_relay(&connection)),
+                        family: AddressFamily::of(connection.remote_address()),
+                    })
+                    .await;
+                let _ = events
                     .send(SessionEvent::PeerPath {
                         peer,
                         generation,
@@ -3148,6 +3183,14 @@ async fn start_peer_attempt(
         .collect::<Vec<_>>();
     let reachable = network.reachable_candidates(&filtered);
     let _ = events
+        .send(SessionEvent::PeerCandidates {
+            peer,
+            generation,
+            ipv4: filtered.iter().filter(|c| c.addr.is_ipv4()).count(),
+            ipv6: filtered.iter().filter(|c| c.addr.is_ipv6()).count(),
+        })
+        .await;
+    let _ = events
         .send(SessionEvent::PeerPath {
             peer,
             generation,
@@ -3884,8 +3927,19 @@ mod tests {
         for (events, peer) in [(&mut ea, b.node_id()), (&mut eb, a.node_id())] {
             let count = time::timeout(Duration::from_secs(20), async {
                 let mut committed = 0;
+                let mut typed_transport = 0;
                 loop {
                     match events.recv().await.expect("session alive") {
+                        SessionEvent::PeerTransport {
+                            peer: id,
+                            relay,
+                            family,
+                            ..
+                        } if id == peer => {
+                            assert!(!relay);
+                            assert_eq!(family, AddressFamily::Ipv6);
+                            typed_transport += 1;
+                        }
                         SessionEvent::PeerPath {
                             peer: id, detail, ..
                         } if id == peer && detail.contains("已认证 transport") => {
@@ -3896,7 +3950,10 @@ mod tests {
                             peer: id,
                             state: PeerLifecycle::Connected(_),
                             ..
-                        } if id == peer => break committed,
+                        } if id == peer => {
+                            assert_eq!(typed_transport, 1);
+                            break committed;
+                        }
                         SessionEvent::PeerState {
                             state: PeerLifecycle::Failed(error),
                             ..
@@ -4113,6 +4170,46 @@ mod tests {
                 .unwrap()
                 .unwrap()
         }
+        async fn with_route(
+            events: &mut mpsc::Receiver<SessionEvent>,
+            peer: NodeId,
+        ) -> RemoteAuthorization {
+            time::timeout(Duration::from_secs(20), async {
+                let mut route = false;
+                loop {
+                    match events.recv().await.expect("session active") {
+                        SessionEvent::PeerTransport {
+                            peer: id,
+                            relay,
+                            family,
+                            ..
+                        } if id == peer => {
+                            assert!(relay);
+                            assert_eq!(family, AddressFamily::Ipv4);
+                            route = true;
+                        }
+                        SessionEvent::PeerState {
+                            peer: id,
+                            state: PeerLifecycle::Connected(auth),
+                            ..
+                        } if id == peer => {
+                            assert!(
+                                route,
+                                "authenticated Relay route precedes session authorization"
+                            );
+                            return auth;
+                        }
+                        SessionEvent::PeerState {
+                            state: PeerLifecycle::Failed(error),
+                            ..
+                        } => panic!("{error}"),
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap()
+        }
         let (signal, relay, server) = crate::relay::tests::signaling_fixture().await;
         let a = Identity::generate();
         let b = Identity::generate();
@@ -4132,8 +4229,8 @@ mod tests {
         wait_signal_online(&mut eb).await;
         ha.connect_peer_with_password(b.node_id(), test_password())
             .unwrap();
-        let rights_a = wait_authorization(&mut ea, b.node_id()).await;
-        let rights_b = wait_authorization(&mut eb, a.node_id()).await;
+        let rights_a = with_route(&mut ea, b.node_id()).await;
+        let rights_b = with_route(&mut eb, a.node_id()).await;
         let (old_generation, old) = inspect(&ha).await[&b.node_id()].clone();
         let old_b = inspect(&hb).await[&a.node_id()].1.clone();
         let binding = ChannelBinding::from_connection(&old).unwrap();
@@ -4164,8 +4261,8 @@ mod tests {
         while ea.try_recv().is_ok() {}
         while eb.try_recv().is_ok() {}
         old_b.close(0u32.into(), b"force pairing-before-close ordering");
-        assert_eq!(wait_authorization(&mut ea, b.node_id()).await, rights_a);
-        assert_eq!(wait_authorization(&mut eb, a.node_id()).await, rights_b);
+        assert_eq!(with_route(&mut ea, b.node_id()).await, rights_a);
+        assert_eq!(with_route(&mut eb, a.node_id()).await, rights_b);
         let (generation, fresh) = inspect(&ha).await[&b.node_id()].clone();
         assert_ne!(generation, old_generation);
         assert_eq!(fresh.remote_address(), relay);

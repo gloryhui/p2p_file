@@ -13,6 +13,7 @@ mod autostart;
 mod background;
 mod bandwidth;
 pub(in crate::desktop) mod config;
+mod diagnostics;
 #[cfg(test)]
 mod e2e;
 mod files;
@@ -1014,6 +1015,9 @@ struct DesktopShell {
     background_files: (usize, usize, u64),
     network_path_status: SharedString,
     peer_path_status: HashMap<NodeId, (u64, String)>,
+    connection_diagnostics: diagnostics::Diagnostics,
+    show_diagnostics: bool,
+    exporting_diagnostics: bool,
     peer_status: SharedString,
     network_epoch: u64,
     peer_generations: HashMap<NodeId, u64>,
@@ -2405,6 +2409,7 @@ impl DesktopShell {
                 self.peer_generations.clear();
                 self.peer_states.clear();
                 self.peer_path_status.clear();
+                self.connection_diagnostics.reset(Instant::now());
                 self.network_path_status = "UDP 地址族正在准备".into();
                 self.tunnel_states.clear();
                 self.pending_resumes.clear();
@@ -2419,6 +2424,15 @@ impl DesktopShell {
                                     return;
                                 }
                                 match event {
+                                    session::SessionEvent::NetworkFamilies { ipv4, ipv6, relay_configured } => {
+                                        shell.connection_diagnostics.network_families(ipv4, ipv6, relay_configured); cx.notify();
+                                    }
+                                    session::SessionEvent::PeerCandidates { peer, generation, ipv4, ipv6 } => {
+                                        shell.connection_diagnostics.candidates(peer, generation, ipv4, ipv6, Instant::now()); cx.notify();
+                                    }
+                                    session::SessionEvent::PeerTransport { peer, generation, relay, family } => {
+                                        shell.connection_diagnostics.transport(peer, generation, relay, family, Instant::now()); cx.notify();
+                                    }
                                     session::SessionEvent::NetworkPaths(detail) => {
                                         shell.network_path_status = detail.into(); cx.notify();
                                     }
@@ -2426,6 +2440,7 @@ impl DesktopShell {
                                         if ui_model::project_peer_path(&mut shell.peer_path_status, &shell.peer_generations, peer, generation, detail) { cx.notify(); }
                                     }
                                     session::SessionEvent::Lifecycle(lifecycle) => {
+                                        shell.connection_diagnostics.network(&lifecycle, Instant::now());
                                         shell.signal_state.apply(&lifecycle);
                                         let label = lifecycle.label();
                                         if matches!(lifecycle,
@@ -2464,6 +2479,7 @@ impl DesktopShell {
                                             shell.peer_path_status.remove(&peer);
                                         }
                                         shell.peer_generations.insert(peer, generation);
+                                        shell.connection_diagnostics.peer(peer, generation, &state, Instant::now());
                                         shell.peer_states.insert(peer, state.clone());
                                         if state.outbound_authorized() {
                                             if let Some(ids)=shell.pending_resumes.remove(&peer) {
@@ -3355,6 +3371,15 @@ impl DesktopShell {
                     .items_center()
                     .gap_3()
                     .child(ui_components::status_badge(status, tone))
+                    .child(
+                        ui_components::secondary_button("连接诊断", true).on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|shell, _: &MouseUpEvent, _, cx| {
+                                shell.show_diagnostics = !shell.show_diagnostics;
+                                cx.notify();
+                            }),
+                        ),
+                    )
                     .child(ui_components::secondary_button("设置", true).on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|shell, _: &MouseUpEvent, _, cx| shell.open_settings_home(cx)),
@@ -3362,6 +3387,104 @@ impl DesktopShell {
             )
     }
 
+    fn diagnostics_card(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let text = self.connection_diagnostics.text(Instant::now());
+        let mut body = div()
+            .id("connection-diagnostics-body")
+            .max_h(px(260.))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_1();
+        for line in text.lines().skip(1) {
+            body = body.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(ui_theme::TEXT_SECONDARY))
+                    .child(line.to_owned()),
+            );
+        }
+        ui_components::card()
+            .flex_shrink_0()
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .items_center()
+                    .gap_3()
+                    .child(ui_components::section_header(
+                        "⌕",
+                        "连接诊断",
+                        "只显示已观察阶段；缺失数据为未知",
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                ui_components::compact_secondary_button("复制脱敏摘要", true)
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|shell, _, _, cx| {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                shell.connection_diagnostics.text(Instant::now()),
+                                            ));
+                                            shell.set_status("已复制脱敏连接诊断", cx);
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                ui_components::compact_secondary_button(
+                                    "导出新文件",
+                                    !self.exporting_diagnostics,
+                                )
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|shell, _, _, cx| shell.export_diagnostics(cx)),
+                                ),
+                            ),
+                    ),
+            )
+            .child(body)
+    }
+    fn export_diagnostics(&mut self, cx: &mut Context<Self>) {
+        if self.exporting_diagnostics {
+            return;
+        }
+        let text = self.connection_diagnostics.text(Instant::now());
+        let directory = self
+            .settings
+            .receive_directory
+            .clone()
+            .unwrap_or_else(std::env::temp_dir);
+        let picked = cx.prompt_for_new_path(&directory, Some("p2p-connection-diagnostics.txt"));
+        self.exporting_diagnostics = true;
+        cx.notify();
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |shell, cx| {
+            let result = match picked.await {
+                Ok(Ok(Some(path))) => Some(
+                    executor
+                        .spawn(async move { diagnostics::export(&path, &text) })
+                        .await,
+                ),
+                Ok(Ok(None)) => None,
+                _ => Some(Err(std::io::Error::other("file picker unavailable"))),
+            };
+            let _ = shell.update(cx, move |shell, cx| {
+                shell.exporting_diagnostics = false;
+                match result {
+                    Some(Ok(())) => shell.set_status("脱敏诊断已导出到所选新文件", cx),
+                    Some(Err(_)) => shell.set_status(
+                        "诊断导出失败；请选择新文件名或可写目录，既有文件不会被覆盖",
+                        cx,
+                    ),
+                    None => cx.notify(),
+                }
+            });
+        })
+        .detach();
+    }
     fn brand_identity(title: &'static str, subtitle: &'static str) -> gpui::Div {
         static ICON: std::sync::OnceLock<std::sync::Arc<gpui::Image>> = std::sync::OnceLock::new();
         let icon = ICON
@@ -5179,9 +5302,17 @@ impl Render for DesktopShell {
                 cx.listener(|shell, _: &ResumeSelected, _, cx| shell.selected_action(true, cx)),
             )
             .child(self.app_header(cx))
+            .when(self.show_diagnostics, |page| {
+                page.child(self.diagnostics_card(cx))
+            })
             .child(self.connection_receive_row(window, cx))
             .when_some(speed_card, |page, speed_card| page.child(speed_card))
-            .child(self.transfer_card(window, cx))
+            .child(
+                self.transfer_card(window, cx)
+                    .when(self.show_diagnostics, |card| {
+                        card.min_h(px(320.)).flex_shrink_0()
+                    }),
+            )
             .child(
                 div()
                     .w_full()
@@ -5457,6 +5588,9 @@ pub fn run(background_start: bool) {
                         background_files: (0, 0, 0),
                         network_path_status: "UDP 地址族尚未准备".into(),
                         peer_path_status: HashMap::new(),
+                        connection_diagnostics: diagnostics::Diagnostics::new(Instant::now()),
+                        show_diagnostics: false,
+                        exporting_diagnostics: false,
                         peer_status: "尚未连接对端".into(),
                         network_epoch: 0,
                         peer_generations: HashMap::new(),
