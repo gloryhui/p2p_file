@@ -61,7 +61,7 @@ dbus-run-session -- /usr/bin/python3 scripts/desktop-background-smoke.py \
 
 需要 Xvfb、openbox、xdotool、xwininfo、python3-dbus、python3-gi。使用隔离的 D-Bus、
 X11 和应用数据，不修改当前用户真实登录项。验证关闭隐藏、同窗口恢复、面板失焦与
-重开、host 消失回退、退出和无托盘登录启动；不证明真实 macOS 菜单栏、Windows
+重开、host 消失回退、退出，以及有/无托盘的后台登录启动；不证明真实 macOS 菜单栏、Windows
 Explorer、Wayland 最小化、系统登录或公网传输。
 
 macOS 人工验收：浅色/深色与高 DPI 菜单栏、点击/右键、双屏定位、面板实时状态；

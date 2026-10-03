@@ -4886,8 +4886,14 @@ pub fn run(background_start: bool) {
             "本机身份不可用；网络会话未启动".to_owned()
         };
         let show_initial_password = initial_password.is_some();
+        let start_hidden = background_start
+            && settings.background.launch_at_login
+            && has_saved_network_config
+            && !show_initial_password;
         let window = cx.open_window(
             WindowOptions {
+                show: !start_hidden,
+                focus: !start_hidden,
                 titlebar: Some(gpui::TitlebarOptions {
                     title: Some("P2P File".into()),
                     ..Default::default()
@@ -5036,14 +5042,16 @@ pub fn run(background_start: bool) {
                             &shell.peer_id
                         };
                         window.focus(&field.focus_handle(cx));
-                        cx.activate(true);
+                        if !start_hidden {
+                            cx.activate(true);
+                        }
                         shell.observe_tasks(cx);
                         if let Some(config) = startup_session_config {
                             shell.start_network_session(config, cx);
                         }
                     })
                     .expect("新建 GPUI 窗口后初始化焦点失败");
-                background::install(window, cx, background_start);
+                background::install(window, cx, start_hidden);
                 cx.on_action(|_: &Quit, cx| background::request_quit(cx));
             }
             Err(error) => {

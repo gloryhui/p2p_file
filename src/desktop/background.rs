@@ -131,7 +131,7 @@ pub(super) fn install(
         shell: shell.clone(),
         main,
         tray: None,
-        hidden: false,
+        hidden: background_start,
         panel: None,
         snapshot: StatusSnapshot::default(),
         quitting: false,
@@ -206,7 +206,7 @@ pub(super) fn install(
 fn finish_install(result: Result<tray::NativeTray, String>, background_start: bool, cx: &mut App) {
     match result {
         Ok(tray) => {
-            cx.update_global::<DesktopRuntime, _>(|runtime, cx| {
+            let restore = cx.update_global::<DesktopRuntime, _>(|runtime, cx| {
                 let available = tray.available();
                 runtime.tray = Some(tray);
                 // A login launch is background even when ordinary close-to-tray
@@ -217,12 +217,23 @@ fn finish_install(result: Result<tray::NativeTray, String>, background_start: bo
                     && !runtime.shell.read(cx).show_settings_home
                     && !runtime.shell.read(cx).show_settings
                 {
-                    runtime.hidden = runtime
+                    let hidden = runtime
                         .main
                         .update(cx, |_, window, _| hide_window(window))
                         .is_ok_and(|result| result.is_ok());
+                    if !hidden {
+                        return true;
+                    }
+                    runtime.hidden = true;
                 }
+                runtime.hidden
+                    && (!available
+                        || runtime.shell.read(cx).show_settings_home
+                        || runtime.shell.read(cx).show_settings)
             });
+            if restore {
+                show_main(cx, false);
+            }
         }
         Err(error) => {
             cx.global::<DesktopRuntime>()

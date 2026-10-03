@@ -128,8 +128,8 @@ def main():
             "receive_directory": str(receive), "send_concurrency": 1, "speedtest_seconds": 30,
             "speedtest_direction": "both", "background": {"close_to_tray": True, "launch_at_login": False}}))
         app = launch([str(binary)], "desktop")
-        def main_window():
-            result = subprocess.run(["xdotool", "search", "--onlyvisible", "--pid", str(app.pid), "--name", "P2P File"], env=env, capture_output=True, text=True)
+        def main_window(visible=True):
+            result = subprocess.run(["xdotool", "search"] + (["--onlyvisible"] if visible else []) + ["--pid", str(app.pid), "--name", "P2P File"], env=env, capture_output=True, text=True)
             return result.stdout.strip().splitlines()[0] if result.returncode == 0 else None
         window = wait_for(main_window)
         tray_name = wait_for(lambda: names() and names()[0])
@@ -189,6 +189,22 @@ def main():
         time.sleep(2)
         assert mapped(window) and app.poll() is None
         proofs.append("background_login_without_tray_stays_visible")
+        command("xdotool", "windowactivate", "--sync", window)
+        command("xdotool", "key", "ctrl+q")
+        assert app.wait(timeout=15) == 0
+        # Once a usable host is ready, a saved login launch keeps the main
+        # window hidden and exposes a live native entry point.
+        host = launch([sys.executable, str(Path(__file__).resolve()), "--watcher"], "mock-host-login")
+        wait_for(lambda: bus.name_has_owner("org.kde.StatusNotifierWatcher"))
+        app = launch([str(binary), "--background"], "desktop-login")
+        window = wait_for(lambda: main_window(False))
+        tray_name = wait_for(lambda: names() and names()[0])
+        item = bus.get_object(tray_name, "/StatusNotifierItem")
+        wait_for(lambda: any(state in str(item.Get("org.kde.StatusNotifierItem", "Title", dbus_interface="org.freedesktop.DBus.Properties")) for state in ["连接中", "需要处理", "在线"]))
+        assert not mapped(window) and app.poll() is None
+        item.Activate(0, 0, dbus_interface="org.kde.StatusNotifierItem")
+        wait_for(lambda: mapped(window))
+        proofs.append("configured_login_with_tray_starts_hidden_and_can_be_reopened")
         command("xdotool", "windowactivate", "--sync", window)
         command("xdotool", "key", "ctrl+q")
         assert app.wait(timeout=15) == 0
