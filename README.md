@@ -5,8 +5,9 @@
 - **传文件** —— 分片、BLAKE3 逐片校验、断点续传。
 - **通用 TCP 隧道** —— 把本机一个端口转发到对端的任意服务（`ssh`、`rdp`、`http`……）。
 
-两种情况下的业务数据都是**点对点**的。中间只需要一台公网机器帮忙**牵线**
-（交换双方的地址），它一个字节的业务数据都看不到。
+Direct 成功时服务器只负责信令，不承载业务数据。用户配置 Relay 且 Direct 无法
+及时建立 authenticated transport 时，Relay UDP 服务延迟转发**端到端加密的 QUIC
+datagram**。Relay 看不到业务明文，QUIC / Ed25519 身份认证仍然是设备间端到端。
 
 ## 快速开始
 
@@ -43,9 +44,11 @@ export SIGNAL=0.0.0.0:7000
 $BIN signal-server --listen $SIGNAL
 ```
 
-记得在**云厂商的安全组**里放通 TCP 7000。这是唯一需要对外开放的端口。
+直连模式在**云厂商的安全组**里放通 TCP 7000；启用 Relay 时还需放通对应 UDP 端口。
 
-它只做牵线，1 核 1M 带宽都绰绰有余。开机自启见[部署](#部署为-systemd-服务)。
+以上命令仅启用 TCP 信令；Direct 成功时云主机不承载业务数据。若启用可选 Relay UDP
+服务，则需按实际转发流量准备带宽；Relay 只转发端到端加密的 QUIC datagram，
+看不到业务明文。开机自启见[部署](#部署为-systemd-服务)。
 
 ### 第 2 步：两台机器各拿一次身份
 
@@ -215,7 +218,7 @@ $BIN speedtest \
 ```ini
 # /etc/systemd/system/p2p-signal.service
 [Unit]
-Description=p2p_file 信令服务器（只牵线，不过数据）
+Description=p2p_file 信令服务（可选端到端加密 UDP Relay 兜底）
 After=network-online.target
 
 [Service]
@@ -227,6 +230,9 @@ StandardOutput=journal
 [Install]
 WantedBy=multi-user.target
 ```
+
+该示例默认只启用 TCP 信令。启用 Relay 时按下文“可选认证 UDP Relay 兜底”添加
+`--relay-listen` 并放通对应 UDP 端口；Direct 优先，Relay 按需转发加密 QUIC datagram。
 
 ```bash
 sudo systemctl daemon-reload
@@ -302,7 +308,8 @@ $BIN --log info tunnel --signal $SIGNAL --peer $HOME_ID --listen 127.0.0.1:2222 
 
 **实测过**（`./scripts/e2e.sh`，每次改代码都会跑）：
 
-- 真起三个进程跑完整链路：信令牵线 → UDP 打洞 → QUIC 直连 → 隧道转发 → 文件落盘校验。
+- 真起进程跑完整链路：信令牵线 → 原生 IPv4/IPv6 QUIC 直连或认证 UDP Relay 兜底
+  → 隧道转发 → 文件落盘校验；Relay fixture 使用可控直连黑洞，不依赖公网服务器。
 - 隧道搬运 1MB 随机数据无损，支持多条并发连接。
 - 文件直推 2MB，sha256 一致。
 - 断开后 `serve` 重新打洞，再连一次仍然成功。
@@ -319,8 +326,64 @@ $BIN --log info tunnel --signal $SIGNAL --peer $HOME_ID --listen 127.0.0.1:2222 
 
 **没做**：
 
-- 对称型 NAT 的中继兜底（TURN / relay）。
+- 完整 TURN / ICE、TCP/TLS Relay、Multipath QUIC、自动连接迁移。
 - UPnP / NAT-PMP 自动端口映射（`nat::portmap` 是空壳，暂时用 `--advertise` 手工替代）。
+
+## 可选认证 UDP Relay 兜底（M3）
+
+双方使用同一 signaling 服务签发的 pairing，配置其 Relay UDP 地址：
+
+```bash
+# 自建服务器：TCP 信令 + 固定 UDP Relay listener
+p2p_file signal-server --listen 0.0.0.0:7000 --relay-listen 0.0.0.0:7001
+# 可再加一个原生 IPv6 listener；不用 IPv4-mapped socket
+# --relay-listen '[::]:7001'
+
+# 双方在现有 serve / tunnel / push / speedtest 命令中加：
+# --relay relay.example.com:7001
+p2p_file serve --signal signal.example.com:7000 --relay relay.example.com:7001 \
+  --allow <PEER_NODE_ID> --forward 127.0.0.1:22
+p2p_file tunnel --signal signal.example.com:7000 --relay relay.example.com:7001 \
+  --peer <SERVER_NODE_ID> --listen 127.0.0.1:2222 --to 127.0.0.1:22
+```
+
+云安全组与主机防火墙放通 **TCP 7000 + UDP 7001**（端口可自选）。
+Relay 需要实际转发带宽；直连成功时仍不走服务器。GPUI 的“高级网络设置”增加
+**Relay Server**，填写 `HOST:UDP_PORT`、`IPv4:PORT` 或 `[IPv6]:PORT`，留空保持直连。
+保存按原有安全配置写入路径进行，网络设置变更会关闭旧 transport 并重新认证。
+
+连接顺序：原生 IPv6 / IPv4 直连竞速 → 2.5 秒无 authenticated winner → 延迟解析并
+尝试 Relay。未配置时没有 Relay DNS、UDP socket 或 admission 请求。每个 peer/地址族
+attempt 使用独立 socket，challenge-response + Ed25519 admission 后，收到 RelayReady
+才将**同一个 socket**交给 Quinn。RelayReady 只是 UDP 就绪，身份仍需真实 NodeId、
+双边 Ed25519 签名、当前 TLS exporter binding 和 Ready；仅一个 winner 提交 FIN。
+
+Relay ticket 只来自真实在线节点 pairing，有 TTL、并发数量与单 IP pending 上限。
+普通 NodeId Lookup 另有固定 10 秒窗口：默认每 signaling connection 64 次、每 source IP
+256 次；IP bucket 最多 1024 项并清理过期项。超限在 pairing 前返回统一错误，不签发
+ticket、不向目标推送候选，也不新增 offline waiter；`max_pending_lookups` 仍只限制
+真实挂起的离线查询。少量重复查询、重新连接和直连模式继续使用原有协议与 CLI。
+Admission 的 outstanding ticket 默认每 unordered NodeId pair 最多 16 张、每 NodeId
+最多 64 张；小容量服务还将两者分别限制在全局 ticket 池的一半。quota 直接依据真实
+ticket map，TTL 到期自动释放；已 Ready 的转发 session 仍按原有 idle timeout 运行。
+Session 另有独立配额：每 unordered NodeId pair 最多 16 个、每 NodeId 最多 64 个，
+小容量服务将其限制为全局 session 池的一半（单槽服务至少允许一个）。每个 arm
+无论 half-bound 或 Ready 均计入，按已签名 Bound 的 node/peer 从真实 session map
+统计；创建前及签名 Register 后都检查。ticket 过期或普通 UDP 保活均不能释放
+session 配额；idle 清理自动释放。已有 half-bound arm 可在配额满时完成另一端绑定。
+第三方 source、未知 ticket、错 pair/公钥/签名与重放均拒绝。两边绑定前丢弃数据，
+不排队；绑定后的 source 不能漂移或抢占，断线重新 pairing。Relay 不解码 QUIC 或
+文件/Tunnel/Speedtest，不解密、不落盘；恶意服务器可以阻断，不能冒充设备。
+Remote Password / Trusted Device / 单向授权 / Tunnel allowlist 语义均保持原样，
+新 transport 的授权必须重新绑定，Relay 不自动建立信任，也不保存对端密码。
+
+运行时区分 `IPv6 Direct`、`IPv4 Direct`、`Relay IPv6`、`Relay IPv4`，日志包含
+`path_kind`、family、remote。GPUI 依次显示 fallback、UDP 就绪、最终认证路径。
+
+`./scripts/e2e.sh` 依次测试 IPv4、IPv6 和确定性的本地 Relay fixture；后者公布实际
+被持有且不回应的 blackhole candidates（`--advertise-only` 诊断选项），验证真实
+pairing → admission → 端到端 QUIC → 1MB Tunnel / 多连接 / 文件 hash / Speedtest / 重连。
+原生三平台 loopback 测试不依赖公网；跨 NAT 的真实部署可达性仍需实际网络验收。
 
 ## IPv6 原生直连与双栈竞速
 
@@ -356,8 +419,8 @@ Tunnel 的 peer/target allowlist。
 
 IPv6 仍需要操作系统、路由器和云安全组允许相应 UDP 端口。没有 global IPv6 的网络可
 通过 IPv4 path 工作；跨网络公网 IPv6 是否可达需要两台真实主机验证。自动化覆盖原生
-IPv6 loopback 和可控黑洞，不代表已实测公网 IPv6 穿透。未实现 Relay/TURN、UPnP、
-NAT-PMP、PCP、link-local scope-id、Multipath QUIC。
+IPv6 loopback 和可控黑洞，不代表已实测公网 IPv6 穿透。可选认证 UDP Relay 兜底见上节；
+未实现完整 TURN/ICE、TCP/TLS Relay、UPnP、NAT-PMP、PCP、link-local scope-id、Multipath QUIC。
 
 ## 局域网直连（不经过信令服务器）
 
@@ -425,7 +488,8 @@ Ed25519 握手承担。但光有握手还不够——如果签名不绑定当前
 `A ↔ M ↔ B` 两条独立连接，把 `Hello / HelloAck / Auth` 原样搬过去，让两边都验证通过。
 现在签名覆盖了当前会话绑定值，这种转发必然验不过，**中间人无法透明代理握手**。
 
-信令服务器知道**谁在跟谁说话**（节点 ID 和 IP），但看不到任何业务数据；登记内容
+信令服务器知道**谁在跟谁说话**（节点 ID 和 IP）；启用的 Relay 还能观察包大小与时序，
+但看不到业务明文。登记内容
 已由私钥签名认证，所以没人能冒充别人的节点 ID 去登记。
 
 安全边界要说准确：信令走的是**明文 TCP**，而且注册签名的保护范围只到

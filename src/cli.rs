@@ -54,11 +54,13 @@ fn parse_speedtest_block_size(raw: &str) -> std::result::Result<u32, String> {
 ///
 /// 目标是在公网上把文件直接发给对方：STUN 探出各自的公网映射，双方同时
 /// 打洞，打通后走 QUIC 加密通道传数据；IPv6 原生直连与 IPv4 并行尝试。
+/// 用户配置 Relay 且 Direct 未及时认证成功时，延迟通过 UDP Relay 转发端到端
+/// 加密的 QUIC datagram；Relay 看不到业务明文，设备间 QUIC / Ed25519 身份认证不变。
 #[derive(Debug, Parser)]
 #[command(
     name = "p2p_file",
     version,
-    about = "点对点直连：NAT 穿透 + 文件传输 + 通用 TCP 隧道",
+    about = "点对点直连：IPv4/IPv6 NAT 穿透 + QUIC，支持文件传输、TCP 隧道与端到端加密 UDP Relay 兜底",
     propagate_version = true
 )]
 pub struct Cli {
@@ -77,6 +79,12 @@ pub struct Cli {
 /// 打洞相关的公共参数。`serve` / `tunnel` / `push` 都要用。
 #[derive(Debug, Args, Clone)]
 pub struct DirectOpts {
+    /// Optional UDP Relay if Direct cannot authenticate promptly; forwards end-to-end encrypted QUIC only.
+    #[arg(long, value_name = "HOST:PORT", value_parser = parse_relay_spec)]
+    pub relay: Option<String>,
+    /// Advertise only explicit addresses (network diagnostics / deterministic fixtures).
+    #[arg(long, requires = "advertise")]
+    pub advertise_only: bool,
     /// Native UDP address families; each uses a separate socket.
     #[arg(long, value_enum, default_value = "dual-stack")]
     pub ip_family: crate::net::NetworkFamilies,
@@ -169,8 +177,10 @@ pub enum Command {
         port: u16,
     },
 
-    /// 跑信令服务器（放在有公网 IP 的机器上，只牵线，不过数据）
+    /// 跑信令服务；Direct 优先，可选 UDP Relay 只转发端到端加密的 QUIC datagram
     SignalServer {
+        #[command(flatten)]
+        relay: RelayServerOpts,
         /// 监听地址
         #[arg(long, default_value_t = SocketAddr::from(([0, 0, 0, 0], DEFAULT_SIGNAL_PORT)), value_name = "ADDR")]
         listen: SocketAddr,
@@ -190,7 +200,7 @@ pub enum Command {
 
     /// 家里那台：等对端连上来，提供端口转发和收文件
     ///
-    /// 数据走 P2P 直连，信令服务器只参与牵线。
+    /// 直连优先；可选 Relay 只转发端到端加密 UDP datagram。
     Serve {
         #[command(flatten)]
         direct: DirectOpts,
@@ -288,10 +298,110 @@ pub enum Command {
     },
 }
 
+fn parse_relay_spec(raw: &str) -> std::result::Result<String, String> {
+    crate::relay::client::validate_server_spec(raw).map_err(|e| e.to_string())?;
+    Ok(raw.to_owned())
+}
+
+#[derive(Debug, Args)]
+pub struct RelayServerOpts {
+    /// Fixed UDP listener forwarding end-to-end encrypted QUIC; repeat for the other native family.
+    #[arg(long, value_name = "ADDR")]
+    pub relay_listen: Vec<SocketAddr>,
+    #[arg(long, default_value_t = crate::relay::server::DEFAULT_TICKET_TTL)]
+    pub relay_ticket_ttl_secs: u64,
+    #[arg(long, default_value_t = crate::relay::server::DEFAULT_IDLE_TIMEOUT)]
+    pub relay_idle_secs: u64,
+    #[arg(long, default_value_t = crate::relay::server::DEFAULT_MAX_SESSIONS)]
+    pub max_relay_sessions: usize,
+    #[arg(long, default_value_t = crate::relay::server::DEFAULT_PENDING_PER_IP)]
+    pub max_relay_pending_per_ip: usize,
+}
+impl RelayServerOpts {
+    pub fn config(self) -> crate::Result<Option<crate::relay::server::RelayServerConfig>> {
+        if self.relay_listen.is_empty() {
+            return Ok(None);
+        }
+        let config = crate::relay::server::RelayServerConfig {
+            listen: self.relay_listen,
+            ticket_ttl: std::time::Duration::from_secs(self.relay_ticket_ttl_secs),
+            idle_timeout: std::time::Duration::from_secs(self.relay_idle_secs),
+            max_sessions: self.max_relay_sessions,
+            max_pending_per_ip: self.max_relay_pending_per_ip,
+        };
+        config.validate()?;
+        Ok(Some(config))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn relay_cli_optional_server_limits_and_native_addresses_parse() {
+        let cli = Cli::try_parse_from(["p2p_file", "signal-server"]).unwrap();
+        let Command::SignalServer { relay, .. } = cli.command else {
+            panic!()
+        };
+        assert!(relay.config().unwrap().is_none());
+        let cli = Cli::try_parse_from([
+            "p2p_file",
+            "signal-server",
+            "--relay-listen",
+            "0.0.0.0:7001",
+            "--relay-listen",
+            "[::]:7001",
+            "--relay-ticket-ttl-secs",
+            "30",
+        ])
+        .unwrap();
+        let Command::SignalServer { relay, .. } = cli.command else {
+            panic!()
+        };
+        assert_eq!(relay.config().unwrap().unwrap().listen.len(), 2);
+        let node = crate::identity::Identity::generate().node_id().to_hex();
+        for spec in ["127.0.0.1:7001", "[::1]:7001", "relay.example:7001"] {
+            let cli = Cli::try_parse_from([
+                "p2p_file",
+                "push",
+                "--signal",
+                "signal.example:7000",
+                "--peer",
+                &node,
+                "--relay",
+                spec,
+                "file.bin",
+            ])
+            .unwrap();
+            let Command::Push { direct, .. } = cli.command else {
+                panic!()
+            };
+            assert_eq!(direct.relay.as_deref(), Some(spec));
+        }
+        assert!(
+            Cli::try_parse_from([
+                "p2p_file",
+                "serve",
+                "--signal",
+                "signal.example:7000",
+                "--advertise-only"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "p2p_file",
+                "serve",
+                "--signal",
+                "signal.example:7000",
+                "--relay",
+                "[::ffff:127.0.0.1]:7001"
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn ipv6_advertise_send_and_family_options_parse_without_ipv4_mapping() {

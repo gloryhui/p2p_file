@@ -201,6 +201,13 @@ fn client_config() -> Result<ClientConfig> {
 /// 端点同时装了服务端和客户端配置，所以两边都既能 accept 也能 connect——
 /// 打洞是对称的，谁先连谁后连由上层角色决定。
 pub fn endpoint_from_socket(socket: std::net::UdpSocket) -> Result<Endpoint> {
+    endpoint_from_socket_with_config(socket, quinn::EndpointConfig::default())
+}
+
+pub(crate) fn endpoint_from_socket_with_config(
+    socket: std::net::UdpSocket,
+    endpoint_config: quinn::EndpointConfig,
+) -> Result<Endpoint> {
     install_crypto_provider();
 
     // quinn 内部会用 tokio 的 from_std 接管这个 socket，而它要求 socket 处于
@@ -214,13 +221,8 @@ pub fn endpoint_from_socket(socket: std::net::UdpSocket) -> Result<Endpoint> {
         .ok_or_else(|| Error::Transport("当前没有可用的异步运行时".into()))?;
 
     let config = server_config()?;
-    let mut endpoint = Endpoint::new(
-        quinn::EndpointConfig::default(),
-        Some(config),
-        socket,
-        runtime,
-    )
-    .map_err(|err| Error::Transport(format!("用已有 socket 创建 QUIC 端点失败: {err}")))?;
+    let mut endpoint = Endpoint::new(endpoint_config, Some(config), socket, runtime)
+        .map_err(|err| Error::Transport(format!("用已有 socket 创建 QUIC 端点失败: {err}")))?;
 
     endpoint.set_default_client_config(client_config()?);
     Ok(endpoint)

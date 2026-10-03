@@ -261,10 +261,20 @@ impl DesktopSessionHandle {
         finished.await.map_err(|_| "网络会话已经关闭".into())
     }
 
-    pub fn reconfigure_signal(&self, server: impl Into<String>) -> std::result::Result<(), String> {
+    pub fn reconfigure_network(
+        &self,
+        server: String,
+        relay_server: Option<String>,
+    ) -> std::result::Result<(), String> {
+        if let Some(spec) = &relay_server {
+            crate::relay::client::validate_server_spec(spec).map_err(|e| e.to_string())?;
+        }
         self.commands
-            .try_send(SessionCommand::ReconfigureSignal(server.into()))
-            .map_err(|error| format!("网络会话暂时无法接收配置变更：{error}"))
+            .try_send(SessionCommand::ReconfigureNetwork {
+                server,
+                relay_server,
+            })
+            .map_err(|e| format!("网络配置队列不可用：{e}"))
     }
 
     pub fn start_tunnel_rule(&self, rule_id: impl Into<String>) -> std::result::Result<(), String> {
@@ -500,7 +510,10 @@ enum SessionCommand {
         verifier: RemoteVerifier,
         done: oneshot::Sender<()>,
     },
-    ReconfigureSignal(String),
+    ReconfigureNetwork {
+        server: String,
+        relay_server: Option<String>,
+    },
     StartTunnel(String),
     StopTunnel(String),
     RevokeTunnel {
@@ -511,6 +524,8 @@ enum SessionCommand {
     UpdateTunnelSettings {
         tunnel_rules: Vec<super::config::TunnelRule>,
     },
+    #[cfg(test)]
+    InspectDeferred(NodeId, oneshot::Sender<Option<PunchToken>>),
     #[cfg(test)]
     Inspect(oneshot::Sender<HashMap<NodeId, (u64, quinn::Connection)>>),
 }
@@ -537,6 +552,11 @@ enum SessionInput {
     SignalConnected {
         generation: u64,
         result: Result<SignalingClient>,
+    },
+    PeerPath {
+        peer: NodeId,
+        generation: u64,
+        detail: String,
     },
     PeerProgress {
         peer: NodeId,
@@ -677,7 +697,7 @@ async fn run_session(
     events: SessionEvents,
 ) {
     emit_lifecycle(&events, NetworkLifecycle::ConnectingSignal).await;
-    let network = match prepare_desktop_network(&config.network).await {
+    let mut network = match prepare_desktop_network(&config.network).await {
         Ok(network) => network,
         Err(error) => {
             for rule in config
@@ -896,6 +916,10 @@ async fn run_session(
             continue;
         }
         match wake {
+            #[cfg(test)]
+            Wake::Command(Some(SessionCommand::InspectDeferred(peer, reply))) => {
+                let _ = reply.send(deferred_candidates.get(&peer).map(|(_, token)| *token));
+            }
             #[cfg(test)]
             Wake::Command(Some(SessionCommand::Inspect(reply))) => {
                 let _ = reply.send(connections.clone());
@@ -1323,6 +1347,9 @@ async fn run_session(
                     continue;
                 }
                 if !reuse_authorized {
+                    if network.relay.is_some() {
+                        deferred_candidates.remove(&peer);
+                    }
                     if let Some((_, attempt)) = peer_attempts.remove(&peer) {
                         attempt.abort();
                     }
@@ -1452,14 +1479,23 @@ async fn run_session(
                 }
             }
             Wake::Command(Some(
-                command @ (SessionCommand::ReconfigureSignal(_)
+                command @ (SessionCommand::ReconfigureNetwork { .. }
                 | SessionCommand::UpdateRemoteAuth { .. }),
             )) => {
                 let mut auth_updated = None;
                 match command {
-                    SessionCommand::ReconfigureSignal(server) => {
+                    SessionCommand::ReconfigureNetwork {
+                        server,
+                        relay_server,
+                    } => {
                         signal_server = server;
                         credentials.clear();
+                        if let Some(old) = &network.relay {
+                            old.endpoints.close();
+                        }
+                        network.relay = relay_server.map(|server| {
+                            crate::relay::client::Fallback::new(server, config.network.families)
+                        });
                     }
                     SessionCommand::UpdateRemoteAuth { verifier, done } => {
                         credentials.clear();
@@ -1714,6 +1750,17 @@ async fn run_session(
                         continue;
                     }
                     let canonical = canonical_candidates(&candidates);
+                    if network.relay.is_some()
+                        && peers
+                            .state(node_id)
+                            .is_some_and(PeerLifecycle::is_connected)
+                    {
+                        // A real pairing may precede the old transport's close callback.
+                        // Direct probes cannot confirm an unchanged blackhole candidate on
+                        // a Relay path. Preserve the offer without replacing any live winner;
+                        // only actual closure may consume it for a fresh generation.
+                        deferred_candidates.insert(node_id, (candidates.clone(), token));
+                    }
                     if peers
                         .state(node_id)
                         .is_some_and(PeerLifecycle::is_connected)
@@ -1998,6 +2045,23 @@ async fn run_session(
                     error.into_inner().refuse();
                 }
             }
+            Wake::Input(Some(SessionInput::PeerPath {
+                peer,
+                generation,
+                detail,
+            })) => {
+                if peers.is_current(peer, generation)
+                    && !peers.state(peer).is_some_and(PeerLifecycle::is_connected)
+                {
+                    let _ = events
+                        .send(SessionEvent::PeerPath {
+                            peer,
+                            generation,
+                            detail,
+                        })
+                        .await;
+                }
+            }
             Wake::Input(Some(SessionInput::PeerProgress {
                 peer,
                 generation,
@@ -2019,10 +2083,7 @@ async fn run_session(
                 connection,
             })) => {
                 pending_inbound.remove(&(peer, generation));
-                if !peers.is_current(peer, generation)
-                    || peers.state(peer).is_some_and(PeerLifecycle::is_connected)
-                {
-                    connection.close(0u32.into(), b"duplicate or stale peer generation");
+                if !transport_can_publish(&peers, peer, generation, &connection) {
                     continue;
                 }
                 let _ = events
@@ -2030,10 +2091,9 @@ async fn run_session(
                         peer,
                         generation,
                         detail: format!(
-                            "对端 {} 已认证 transport：{} {}",
+                            "对端 {} 已认证 transport：{}",
                             peer.short(),
-                            AddressFamily::of(connection.remote_address()),
-                            connection.remote_address()
+                            network.transport_label(&connection)
                         ),
                     })
                     .await;
@@ -2332,6 +2392,12 @@ async fn run_session(
                         let _ = command_tx.try_send(SessionCommand::ConnectPeer(peer));
                     }
                     peer_candidates.remove(&peer);
+                    let relay_retry = if network.relay.is_some() {
+                        reconnect_probes.remove(&peer); // retire old token/source routes first
+                        deferred_candidates.remove(&peer)
+                    } else {
+                        None
+                    };
                     if peers.transition(peer, generation, PeerLifecycle::Disconnected) {
                         emit_peer_state(&events, peer, generation, PeerLifecycle::Disconnected)
                             .await;
@@ -2343,6 +2409,13 @@ async fn run_session(
                             },
                         )
                         .await;
+                    }
+                    if let Some((candidates, token)) = relay_retry {
+                        let _ = command_tx.try_send(SessionCommand::RetryCandidates {
+                            peer,
+                            candidates,
+                            token,
+                        });
                     }
                 }
             }
@@ -3058,7 +3131,7 @@ async fn start_peer_attempt(
             ),
         })
         .await;
-    if reachable.is_empty() {
+    if reachable.is_empty() && network.relay.is_none() {
         let detail = "对端候选地址与本机 UDP 地址族不匹配".to_owned();
         peers.transition(peer, generation, PeerLifecycle::Failed(detail.clone()));
         emit_peer_state(
@@ -3079,6 +3152,17 @@ async fn start_peer_attempt(
     let (inbound_tx, inbound_rx) = mpsc::channel(MAX_CANDIDATES);
     pending_inbound.insert((peer, generation), inbound_tx);
     let input_sender = inputs.clone();
+    let relay = network.relay.clone().map(|mut relay| {
+        let inputs = inputs.clone();
+        relay.progress = Some(std::sync::Arc::new(move |detail| {
+            let _ = inputs.try_send(SessionInput::PeerPath {
+                peer,
+                generation,
+                detail: detail.to_owned(),
+            });
+        }));
+        relay
+    });
     let paths: Vec<_> = network
         .paths
         .iter()
@@ -3094,6 +3178,7 @@ async fn start_peer_attempt(
             local_node,
             identity,
             paths,
+            relay,
             token,
             inbound_rx,
             permit,
@@ -3123,6 +3208,7 @@ async fn run_peer_attempt(
     local_node: NodeId,
     identity: Identity,
     paths: Vec<(NetworkPath, Vec<SocketAddr>)>,
+    relay: Option<crate::relay::client::Fallback>,
     token: PunchToken,
     inbound: mpsc::Receiver<quinn::Incoming>,
     _pending_permit: tokio::sync::OwnedSemaphorePermit,
@@ -3138,12 +3224,18 @@ async fn run_peer_attempt(
             state: PeerLifecycle::Authenticating,
         })
         .await;
-    let connection = race_peer_paths(
-        paths, token, peer, generation, local_node, identity, inbound,
+    let mut guard = race_peer_paths(
+        paths,
+        token,
+        peer,
+        generation,
+        local_node,
+        identity,
+        inbound,
+        relay.clone(),
     )
     .await
     .map_err(|error| error.to_string())?;
-    let guard = ConnectionGuard::new(connection);
     let connection = guard.connection();
 
     let _ = inputs
@@ -3188,6 +3280,11 @@ async fn run_peer_attempt(
         }
     };
     // No business stream handler or listener availability is published before this point.
+    if let Some(relay) = &relay {
+        guard
+            .retain_relay_endpoint(&relay.endpoints)
+            .map_err(|e| e.to_string())?;
+    }
     inputs
         .send(SessionInput::PeerConnected {
             peer,
@@ -3201,6 +3298,22 @@ async fn run_peer_attempt(
         .map_err(|_| "desktop session 已关闭".to_owned())
 }
 
+fn transport_can_publish(
+    peers: &PeerRegistry,
+    peer: NodeId,
+    generation: u64,
+    connection: &quinn::Connection,
+) -> bool {
+    if !peers.is_current(peer, generation)
+        || peers.state(peer).is_some_and(PeerLifecycle::is_connected)
+    {
+        connection.close(0u32.into(), b"duplicate or stale peer generation");
+        false
+    } else {
+        true
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn race_peer_paths(
     paths: Vec<(NetworkPath, Vec<SocketAddr>)>,
@@ -3210,7 +3323,8 @@ async fn race_peer_paths(
     local: NodeId,
     identity: Identity,
     mut inbound: mpsc::Receiver<quinn::Incoming>,
-) -> Result<quinn::Connection> {
+    relay: Option<crate::relay::client::Fallback>,
+) -> Result<ConnectionGuard> {
     let initiator = should_initiate_quic(local, peer);
     // Registration is synchronous and per path, before awaiting probes or any incoming connection.
     let mut routes = Vec::new();
@@ -3269,7 +3383,10 @@ async fn race_peer_paths(
                 crate::net::race::select_prepared(dials).await
             });
         }
-        return crate::net::race::finish_prepared_race(tasks).await;
+        if let Some(relay) = relay {
+            tasks.spawn(async move { relay.prepare(identity, peer, token).await });
+        }
+        return crate::net::race::finish_prepared_guard(tasks).await;
     }
     let mut probes = JoinSet::new();
     for (path, candidates, mut receiver) in routes {
@@ -3282,9 +3399,19 @@ async fn race_peer_paths(
         });
     }
     let mut authentication = JoinSet::new();
-    let deadline = time::sleep(
-        QUIC_HANDSHAKE_TIMEOUT + APPLICATION_HANDSHAKE_TIMEOUT + Duration::from_secs(6),
-    );
+    let has_relay = relay.is_some();
+    if let Some(relay) = relay {
+        let relay_identity = identity.clone();
+        authentication.spawn(async move { relay.wait(relay_identity, peer, token).await });
+    }
+    let deadline = time::sleep(if has_relay {
+        crate::relay::RELAY_FALLBACK_DELAY
+            + Duration::from_secs(3)
+            + crate::relay::RELAY_ATTEMPT_TIMEOUT
+            + APPLICATION_HANDSHAKE_TIMEOUT
+    } else {
+        QUIC_HANDSHAKE_TIMEOUT + APPLICATION_HANDSHAKE_TIMEOUT + Duration::from_secs(6)
+    });
     tokio::pin!(deadline);
     let result = loop {
         tokio::select! {
@@ -3293,7 +3420,7 @@ async fn race_peer_paths(
                 if authentication.len() >= MAX_CANDIDATES { incoming.refuse(); continue; }
                 let identity = identity.clone();
                 authentication.spawn(async move {
-                    authenticate_incoming(incoming, &identity, peer).await.map(ConnectionGuard::new)
+                    authenticate_incoming(incoming, &identity, peer).await.map(ConnectionGuard::new).map_err(Error::Transport)
                 });
             }
             result = authentication.join_next(), if !authentication.is_empty() => {
@@ -3306,7 +3433,7 @@ async fn race_peer_paths(
     authentication.abort_all();
     while probes.join_next().await.is_some() {}
     while authentication.join_next().await.is_some() {}
-    result.map(ConnectionGuard::release)
+    result
 }
 
 async fn punch_candidates(
@@ -3611,20 +3738,21 @@ mod tests {
                 local.node_id(),
                 local.clone(),
                 incoming,
+                None,
             ),
         )
         .await
         .unwrap()
         .unwrap();
         assert!(started.elapsed() < Duration::from_secs(3));
-        assert!(connection.remote_address().is_ipv6());
+        assert!(connection.connection().remote_address().is_ipv6());
         assert_eq!(
             time::timeout(Duration::from_secs(2), commits.recv())
                 .await
                 .unwrap(),
             Some(local.node_id())
         );
-        connection.close(0u32.into(), b"done");
+        connection.connection().close(0u32.into(), b"done");
         network.close();
         endpoint.close(0u32.into(), b"done");
         responder.await.unwrap();
@@ -3881,6 +4009,378 @@ mod tests {
         ha.shutdown();
         hb.shutdown();
         drop((ha, hb, tcp, destination));
+        server.abort();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn relay_authenticated_late_generation_is_closed_by_the_actual_publication_gate() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let admission = crate::relay::server::Admission::new(Default::default()).unwrap();
+        let server = tokio::spawn(crate::relay::server::run(socket, admission.clone()));
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let peer = b.node_id();
+        let local = a.node_id();
+        let token = PunchToken::random();
+        assert!(admission.issue(token, local, peer));
+        let responder = tokio::spawn(async move {
+            crate::relay::client::prepare(&b, local, token, address)
+                .await
+                .unwrap()
+                .wait_for_selection()
+                .await
+                .unwrap()
+        });
+        let mut guard = crate::relay::client::prepare(&a, peer, token, address)
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        let remote = responder.await.unwrap();
+        let pool = crate::relay::client::EndpointPool::default();
+        guard.retain_relay_endpoint(&pool).unwrap();
+        let mut peers = PeerRegistry::default();
+        let BeginPeerAttempt::Started(old) = peers.begin_attempt(peer) else {
+            panic!()
+        };
+        peers.transition(peer, old, PeerLifecycle::Disconnected);
+        let BeginPeerAttempt::Started(new) = peers.begin_attempt(peer) else {
+            panic!()
+        };
+        assert!(!transport_can_publish(
+            &peers,
+            peer,
+            old,
+            guard.connection()
+        ));
+        assert_eq!(peers.generation(peer), Some(new));
+        time::timeout(Duration::from_secs(2), remote.connection().closed())
+            .await
+            .unwrap();
+        pool.close();
+        drop((guard, remote));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn relay_pairing_before_close_keeps_live_winner_then_reconnects_on_fresh_tls() {
+        async fn deferred(handle: &DesktopSessionHandle, peer: NodeId) -> Option<PunchToken> {
+            let (tx, rx) = oneshot::channel();
+            handle
+                .commands
+                .send(SessionCommand::InspectDeferred(peer, tx))
+                .await
+                .unwrap();
+            time::timeout(Duration::from_secs(2), rx)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+        let (signal, relay, server) = crate::relay::tests::signaling_fixture().await;
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let blackhole_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let blackhole_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut ca = auth_config(signal);
+        let mut cb = auth_config(signal);
+        for (config, blackhole) in [(&mut ca, &blackhole_a), (&mut cb, &blackhole_b)] {
+            config.network.families = crate::net::NetworkFamilies::Ipv4Only;
+            config.network.relay_server = Some(relay.to_string());
+            config.network.advertise_only = true;
+            config.network.advertise = vec![blackhole.local_addr().unwrap()];
+        }
+        let (ha, mut ea) = spawn(a.clone(), ca).unwrap();
+        let (hb, mut eb) = spawn(b.clone(), cb).unwrap();
+        wait_signal_online(&mut ea).await;
+        wait_signal_online(&mut eb).await;
+        ha.connect_peer_with_password(b.node_id(), test_password())
+            .unwrap();
+        let rights_a = wait_authorization(&mut ea, b.node_id()).await;
+        let rights_b = wait_authorization(&mut eb, a.node_id()).await;
+        let (old_generation, old) = inspect(&ha).await[&b.node_id()].clone();
+        let old_b = inspect(&hb).await[&a.node_id()].1.clone();
+        let binding = ChannelBinding::from_connection(&old).unwrap();
+        ha.connect_peer(b.node_id()).unwrap(); // Actual server signs/registers/pairs; no synthetic token.
+        time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let (Some(a), Some(b)) = (
+                    deferred(&ha, b.node_id()).await,
+                    deferred(&hb, a.node_id()).await,
+                ) && a == b
+                {
+                    break;
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            inspect(&ha).await[&b.node_id()].1.stable_id(),
+            old.stable_id()
+        );
+        assert_eq!(
+            inspect(&hb).await[&a.node_id()].1.stable_id(),
+            old_b.stable_id()
+        );
+        assert!(old.close_reason().is_none()); // Signaling alone cannot replace a live winner.
+        while ea.try_recv().is_ok() {}
+        while eb.try_recv().is_ok() {}
+        old_b.close(0u32.into(), b"force pairing-before-close ordering");
+        assert_eq!(wait_authorization(&mut ea, b.node_id()).await, rights_a);
+        assert_eq!(wait_authorization(&mut eb, a.node_id()).await, rights_b);
+        let (generation, fresh) = inspect(&ha).await[&b.node_id()].clone();
+        assert_ne!(generation, old_generation);
+        assert_eq!(fresh.remote_address(), relay);
+        assert_ne!(ChannelBinding::from_connection(&fresh).unwrap(), binding);
+        assert_eq!(inspect(&ha).await.len(), 1);
+        ha.shutdown();
+        hb.shutdown();
+        drop((ha, hb));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn relay_password_grants_are_directional_fresh_and_wrong_password_never_connects() {
+        use super::super::remote_auth::AuthorizationGrant;
+        let (signal, relay, server) = crate::relay::tests::signaling_fixture().await;
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let blackhole_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let blackhole_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut ca = auth_config(signal);
+        let mut cb = auth_config(signal);
+        for (config, blackhole) in [(&mut ca, &blackhole_a), (&mut cb, &blackhole_b)] {
+            config.network.families = crate::net::NetworkFamilies::Ipv4Only;
+            config.network.relay_server = Some(relay.to_string());
+            config.network.advertise_only = true;
+            config.network.advertise = vec![blackhole.local_addr().unwrap()];
+        }
+        let restart = cb.clone();
+        let (ha, mut ea) = spawn(a.clone(), ca).unwrap();
+        let (hb, mut eb) = spawn(b.clone(), cb).unwrap();
+        wait_signal_online(&mut ea).await;
+        wait_signal_online(&mut eb).await;
+        ha.connect_peer_trusted(b.node_id()).unwrap(); // No implicit trust from RelayReady.
+        wait_failed(&mut ea).await;
+        wait_failed(&mut eb).await;
+        assert!(inspect(&ha).await.is_empty());
+        ha.connect_peer_with_password(b.node_id(), SecretPassword::new("Wrong9".into()).unwrap())
+            .unwrap();
+        wait_failed(&mut ea).await;
+        wait_failed(&mut eb).await;
+        assert!(inspect(&ha).await.is_empty());
+        assert!(inspect(&hb).await.is_empty());
+        ha.connect_peer_with_password(b.node_id(), test_password())
+            .unwrap();
+        let rights = wait_authorization(&mut ea, b.node_id()).await;
+        assert_eq!(
+            rights,
+            RemoteAuthorization {
+                inbound: AuthorizationGrant::default(),
+                outbound: AuthorizationGrant::password(true)
+            }
+        );
+        let rights = wait_authorization(&mut eb, a.node_id()).await;
+        assert_eq!(
+            rights,
+            RemoteAuthorization {
+                inbound: AuthorizationGrant::password(true),
+                outbound: AuthorizationGrant::default()
+            }
+        );
+        let (old_generation, old) = inspect(&ha).await[&b.node_id()].clone();
+        assert_eq!(old.remote_address(), relay);
+        let binding = ChannelBinding::from_connection(&old).unwrap();
+        hb.shutdown();
+        drop(hb);
+        time::timeout(Duration::from_secs(10), async {
+            while !inspect(&ha).await.is_empty() {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        while ea.try_recv().is_ok() {}
+        let (hb, mut eb) = spawn(b.clone(), restart).unwrap();
+        wait_signal_online(&mut eb).await;
+        ha.connect_peer_trusted(b.node_id()).unwrap(); // Previous Password grant does not survive.
+        wait_failed(&mut ea).await;
+        wait_failed(&mut eb).await;
+        assert!(inspect(&ha).await.is_empty());
+        ha.connect_peer_with_password(b.node_id(), test_password())
+            .unwrap();
+        let rights = wait_authorization(&mut ea, b.node_id()).await;
+        assert!(rights.outbound.password);
+        let (generation, new) = inspect(&ha).await[&b.node_id()].clone();
+        assert_ne!(generation, old_generation);
+        assert_ne!(ChannelBinding::from_connection(&new).unwrap(), binding);
+        assert_eq!(inspect(&ha).await.len(), 1);
+        assert!(old.close_reason().is_some());
+        ha.shutdown();
+        hb.shutdown();
+        drop((ha, hb));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn relay_trusted_auto_start_direct_relay_direct_uses_fresh_tls_and_generation() {
+        use super::super::{
+            config::{AllowedForwardTarget, DesktopConfig, TunnelRule},
+            remote_auth::AuthorizationGrant,
+            trusted_devices::TrustedDevice,
+        };
+        use crate::net::NetworkFamilies;
+        let root = std::env::temp_dir().join(format!(
+            "p2p-trusted-relay-switch-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("settings.json");
+        let mut a = Identity::generate();
+        let mut b = Identity::generate();
+        if a.node_id() > b.node_id() {
+            std::mem::swap(&mut a, &mut b);
+        }
+        security_config(
+            &path,
+            vec![TrustedDevice::new(a.node_id(), "peer".into(), None)],
+        );
+        let (signal, relay, server) = crate::relay::tests::signaling_fixture().await;
+        let blackhole_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let blackhole_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reserve = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = reserve.local_addr().unwrap();
+        drop(reserve);
+        let mut rule = TunnelRule::new(
+            "family recovery",
+            b.node_id().to_hex(),
+            listen.port(),
+            target.local_addr().unwrap(),
+        );
+        rule.auto_start = true;
+        let mut ca = auth_config(signal);
+        ca.tunnel_rules = vec![rule.clone()];
+        ca.network.families = NetworkFamilies::Ipv4Only;
+        ca.network.relay_server = Some(relay.to_string());
+        ca.network.advertise_only = true;
+        ca.network.advertise = vec![blackhole_a.local_addr().unwrap()];
+        let mut cb = auth_config(signal);
+        cb.network.families = NetworkFamilies::Ipv4Only;
+        cb.network.relay_server = Some(relay.to_string());
+        cb.config_path = Some(path.clone());
+        cb.trusted_devices = super::super::config::SettingsDraft::from_config(
+            DesktopConfig::load(&path).unwrap().unwrap(),
+        )
+        .trusted_devices;
+        cb.allowed_forward_targets = vec![AllowedForwardTarget::new(
+            "echo",
+            target.local_addr().unwrap(),
+            vec![a.node_id().to_hex()],
+        )];
+        let restart = cb.clone();
+        let (hb, mut eb) = spawn(b.clone(), cb).unwrap();
+        wait_signal_online(&mut eb).await;
+        let (ha, mut ea) = spawn(a.clone(), ca).unwrap();
+        wait_specific_tunnel_state(&mut ea, &rule.id, TunnelRuntimeState::Running).await;
+        let (old_generation, old_connection) = inspect(&ha).await[&b.node_id()].clone();
+        assert!(old_connection.remote_address().is_ipv4());
+        let old_binding = ChannelBinding::from_connection(&old_connection).unwrap();
+        hb.shutdown();
+        drop(hb);
+        time::timeout(Duration::from_secs(10), async {
+            while !inspect(&ha).await.is_empty() {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(old_connection.close_reason().is_some());
+        while ea.try_recv().is_ok() {}
+        let mut cb = restart.clone();
+        cb.network.advertise_only = true;
+        cb.network.advertise = vec![blackhole_b.local_addr().unwrap()];
+        cb.trusted_devices = super::super::config::SettingsDraft::from_config(
+            DesktopConfig::load(&path).unwrap().unwrap(),
+        )
+        .trusted_devices;
+        let (hb, mut eb) = spawn(b.clone(), cb).unwrap();
+        wait_signal_online(&mut eb).await;
+        ha.connect_peer_trusted(b.node_id()).unwrap();
+        wait_specific_tunnel_state(&mut ea, &rule.id, TunnelRuntimeState::Running).await;
+        let (generation, connection) = inspect(&ha).await[&b.node_id()].clone();
+        assert_ne!(generation, old_generation);
+        assert_ne!(connection.stable_id(), old_connection.stable_id());
+        assert_ne!(
+            ChannelBinding::from_connection(&connection).unwrap(),
+            old_binding
+        );
+        assert_eq!(connection.remote_address(), relay);
+        wait_grants(
+            &mut eb,
+            a.node_id(),
+            RemoteAuthorization {
+                inbound: AuthorizationGrant {
+                    password: false,
+                    trusted_device: true,
+                },
+                outbound: AuthorizationGrant::default(),
+            },
+        )
+        .await;
+        let mut tcp = tokio::net::TcpStream::connect(listen).await.unwrap();
+        tcp.write_all(b"relay!!").await.unwrap();
+        let (mut destination, _) = time::timeout(Duration::from_secs(3), target.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut data = [0; 7];
+        destination.read_exact(&mut data).await.unwrap();
+        assert_eq!(&data, b"relay!!");
+        // Address-family recovery did not mutate either password verifier or persistent trust.
+        assert_eq!(
+            super::super::config::SettingsDraft::from_config(
+                DesktopConfig::load(&path).unwrap().unwrap()
+            )
+            .trusted_devices
+            .len(),
+            1
+        );
+        let relay_generation = generation;
+        let relay_binding = ChannelBinding::from_connection(&connection).unwrap();
+        hb.shutdown();
+        drop(hb);
+        time::timeout(Duration::from_secs(10), async {
+            while !inspect(&ha).await.is_empty() {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        drop((tcp, destination));
+        while ea.try_recv().is_ok() {}
+        let (hb, mut eb) = spawn(b.clone(), restart).unwrap();
+        wait_signal_online(&mut eb).await;
+        ha.connect_peer_trusted(b.node_id()).unwrap();
+        wait_specific_tunnel_state(&mut ea, &rule.id, TunnelRuntimeState::Running).await;
+        let (generation, direct) = inspect(&ha).await[&b.node_id()].clone();
+        assert_ne!(generation, relay_generation);
+        assert_ne!(
+            ChannelBinding::from_connection(&direct).unwrap(),
+            relay_binding
+        );
+        assert_ne!(direct.remote_address(), relay);
+        assert!(connection.close_reason().is_some());
+        assert_eq!(inspect(&ha).await.len(), 1);
+        ha.shutdown();
+        hb.shutdown();
+        drop((ha, hb));
         server.abort();
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -4335,6 +4835,13 @@ mod tests {
     #[tokio::test]
     async fn one_way_auth_gates_commands_queue_and_remote_requests_then_both_passwords_enable_reverse_business()
      {
+        directional_business_fixture(false).await;
+    }
+    #[tokio::test]
+    async fn relay_one_way_auth_and_both_passwords_gate_bidirectional_files_and_tunnels() {
+        directional_business_fixture(true).await;
+    }
+    async fn directional_business_fixture(relay_enabled: bool) {
         use super::super::{
             protocol::{self, Frame, Message},
             task_model::{TaskDirection, TaskState},
@@ -4354,7 +4861,19 @@ mod tests {
         let pb = SecretPassword::new("Local9B".into()).unwrap();
         let ta = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let tb = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let (address, server) = start_local_server().await;
+        let reserve = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay = reserve.local_addr().unwrap();
+        drop(reserve);
+        let mut signal_config = SignalServerConfig::for_tests();
+        if relay_enabled {
+            signal_config.relay = Some(crate::relay::server::RelayServerConfig {
+                listen: vec![relay],
+                ..Default::default()
+            });
+        }
+        let (address, server) = start_local_server_with(signal_config).await;
+        let blackhole_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let blackhole_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut ca = auth_config(address);
         ca.remote_auth = Some(RemoteVerifier::create(&pa).unwrap());
         ca.transfer = Some(service_a.clone());
@@ -4373,6 +4892,14 @@ mod tests {
                 tb.local_addr().unwrap(),
                 vec![a.node_id().to_hex()],
             ));
+        if relay_enabled {
+            for (config, blackhole) in [(&mut ca, &blackhole_a), (&mut cb, &blackhole_b)] {
+                config.network.families = crate::net::NetworkFamilies::Ipv4Only;
+                config.network.relay_server = Some(relay.to_string());
+                config.network.advertise_only = true;
+                config.network.advertise = vec![blackhole.local_addr().unwrap()];
+            }
+        }
         let (ha, mut ea) = spawn(a.clone(), ca).unwrap();
         let (hb, mut eb) = spawn(b.clone(), cb).unwrap();
         let short_a = time::timeout(Duration::from_secs(5), async {
@@ -4403,6 +4930,9 @@ mod tests {
         );
         let conn_a = inspect(&ha).await[&b.node_id()].1.clone();
         let conn_b = inspect(&hb).await[&a.node_id()].1.clone();
+        if relay_enabled {
+            assert_eq!(conn_b.remote_address(), relay);
+        }
         // Reject forged peer requests despite an authenticated, live QUIC transport.
         let (mut send, mut recv) = conn_b.open_bi().await.unwrap();
         protocol::write(
@@ -5130,7 +5660,9 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        handle.reconfigure_signal(new_address.to_string()).unwrap();
+        handle
+            .reconfigure_network(new_address.to_string(), None)
+            .unwrap();
         wait_signal_online(&mut events).await;
         // Drain the original Hello; canceled registration must then close TCP.
         let mut bytes = Vec::new();

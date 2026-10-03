@@ -115,7 +115,7 @@
 
 ## 5. 明确不做
 
-接收批准/白名单产品流程、账户登录、云端存储、中继/TURN、远端目录浏览、同步盘、双向目录镜像、删除远端文件、自动更新、托盘/开机启动、移动端、Web 版、Intel Mac 打包。
+该 GPUI MVP 阶段不包含接收批准/白名单产品流程、账户登录、云端存储、中继/TURN、远端目录浏览、同步盘、双向目录镜像、删除远端文件、自动更新、托盘/开机启动、移动端、Web 版、Intel Mac 打包。后续可选认证 UDP Relay 的当前实现见 [架构 §4.9](../ARCHITECTURE.md#49-认证-udp-relay-fallbackissue-59)。
 不修改 #21/#22 来作为 GUI 完成的隐藏前提，不加入固定 1 GiB 队列，也不擅自调 Quinn window / congestion controller。
 
 ## 6. 产品验收清单

@@ -251,7 +251,7 @@ where
 
 /// Both signatures have been verified. Ready is still pending.
 pub struct VerifiedResponder {
-    outcome: HandshakeOutcome,
+    pub(crate) outcome: HandshakeOutcome,
 }
 impl VerifiedResponder {
     pub async fn finish<S: AsyncWrite + Unpin>(self, send: &mut S) -> Result<HandshakeOutcome> {

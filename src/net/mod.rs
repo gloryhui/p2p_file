@@ -1,4 +1,6 @@
-//! 建立直连：STUN 探映射 → 信令换候选 → 同时打洞 → 把 socket 交给 QUIC。
+//! 优先建立直连：STUN 探映射 → 信令换候选 → 同时打洞 → 把 socket 交给 QUIC。
+//! 用户配置 Relay 且 Direct 未及时建立 authenticated transport 时，延迟通过认证
+//! UDP Relay 转发端到端加密的 QUIC datagram；设备间 QUIC / Ed25519 身份认证不变。
 //!
 //! # 为什么全程只能用同一个 socket
 //!
@@ -14,7 +16,8 @@
 //! 双方同时在发。NAT 只在**出站包**穿过时建立映射，所以两边都要主动往对方
 //! 的候选地址发包，各自的 pinhole 才会在同一时间窗内打开。这也意味着家用
 //! 路由器如果是对称型 NAT（用同一个本地端口访问不同目标会拿到不同公网端口），
-//! 这套流程打不通，只能靠端口映射或中继。
+//! IPv4 打洞可能失败，仍优先竞速可用的原生 IPv6/IPv4 直连；配置 Relay 后才允许
+//! 延迟尝试上述认证 UDP 兜底。主动端口映射尚未实现。
 
 pub mod family;
 pub mod race;
@@ -51,6 +54,9 @@ pub const DEFAULT_STUN_SERVERS: &[&str] = &[
 /// Network preparation settings for the long-lived desktop session.
 #[derive(Clone, Debug)]
 pub struct DesktopNetworkConfig {
+    pub relay_server: Option<String>,
+    /// Diagnostic override: advertise only explicit candidates (also used by local E2E).
+    pub advertise_only: bool,
     pub local_port: u16,
     pub families: NetworkFamilies,
     pub stun_servers: Vec<String>,
@@ -62,6 +68,8 @@ pub struct DesktopNetworkConfig {
 impl Default for DesktopNetworkConfig {
     fn default() -> Self {
         Self {
+            relay_server: None,
+            advertise_only: false,
             local_port: 0,
             families: NetworkFamilies::DualStack,
             stun_servers: DEFAULT_STUN_SERVERS
@@ -94,6 +102,7 @@ impl NetworkPath {
     }
 }
 pub struct DesktopNetwork {
+    pub relay: Option<crate::relay::client::Fallback>,
     pub paths: Vec<NetworkPath>,
     pub local_candidates: Vec<Candidate>,
     pub diagnostics: Vec<String>,
@@ -109,13 +118,45 @@ impl DesktopNetwork {
         self.paths.iter().find(|p| p.family == family)
     }
     pub fn close(&self) {
+        if let Some(relay) = &self.relay {
+            relay.endpoints.close();
+        }
         for path in &self.paths {
             path.endpoint.close(0u32.into(), b"network shutdown");
         }
     }
     pub async fn wait_idle(&self) {
+        if let Some(relay) = &self.relay {
+            for endpoint in relay.endpoints.endpoints() {
+                endpoint.wait_idle().await;
+            }
+        }
         for path in &self.paths {
             path.endpoint.wait_idle().await;
+        }
+    }
+    pub fn transport_label(&self, connection: &quinn::Connection) -> String {
+        let kind = if self
+            .relay
+            .as_ref()
+            .is_some_and(|r| r.endpoints.is_relay(connection))
+        {
+            "Relay"
+        } else {
+            "Direct"
+        };
+        if kind == "Relay" {
+            format!(
+                "Relay {} {}",
+                AddressFamily::of(connection.remote_address()),
+                connection.remote_address()
+            )
+        } else {
+            format!(
+                "{} Direct {}",
+                AddressFamily::of(connection.remote_address()),
+                connection.remote_address()
+            )
         }
     }
 }
@@ -123,6 +164,8 @@ impl DesktopNetwork {
 /// 建立直连所需的参数。
 #[derive(Clone, Debug)]
 pub struct DirectConfig {
+    pub relay_server: Option<String>,
+    pub advertise_only: bool,
     /// 信令服务器地址（阿里云那台）。
     pub signal_server: String,
     /// 对端节点 ID。
@@ -152,6 +195,8 @@ pub struct DirectConfig {
 impl DirectConfig {
     pub fn new(signal_server: impl Into<String>, peer: NodeId) -> Self {
         Self {
+            relay_server: None,
+            advertise_only: false,
             signal_server: signal_server.into(),
             peer,
             local_port: 9000,
@@ -168,24 +213,35 @@ impl DirectConfig {
 
 /// Prepared native paths. No candidate or probe is an authenticated winner.
 pub struct DirectLink {
+    pub token: crate::nat::punch::PunchToken,
     pub network: DesktopNetwork,
     pub peer_addr: SocketAddr,
     pub peer_node_id: NodeId,
     pub peer_candidates: Vec<SocketAddr>,
-    signal: SignalingClient,
+    signal: tokio::sync::Mutex<SignalingClient>,
+    relay_used: tokio::sync::Mutex<bool>,
+    signal_server: String,
     probes: tokio::task::JoinSet<()>,
     observations: Vec<race::ProbeObservation>,
 }
 impl DirectLink {
+    pub(crate) fn probe_observations(&self) -> Vec<race::ProbeObservation> {
+        self.observations.clone()
+    }
     pub fn into_parts(self) -> (DesktopNetwork, SignalingClient, tokio::task::JoinSet<()>) {
-        (self.network, self.signal, self.probes)
+        (self.network, self.signal.into_inner(), self.probes)
     }
     pub fn endpoints(&self) -> Vec<quinn::Endpoint> {
-        self.network
+        let mut endpoints: Vec<_> = self
+            .network
             .paths
             .iter()
             .map(|p| p.endpoint.clone())
-            .collect()
+            .collect();
+        if let Some(relay) = &self.network.relay {
+            endpoints.extend(relay.endpoints.endpoints());
+        }
+        endpoints
     }
     /// Unauthenticated QUIC helper retained for the pending-handshake regression.
     pub async fn connect(&self) -> Result<quinn::Connection> {
@@ -196,7 +252,7 @@ impl DirectLink {
         crate::transport::quic::connect(&path.endpoint, self.peer_addr, "p2pfile").await
     }
     pub fn signal_server(&self) -> &str {
-        self.signal.server()
+        &self.signal_server
     }
     pub fn describe(&self) -> String {
         format!(
@@ -221,6 +277,68 @@ impl DirectLink {
                     .map(|a| (path.endpoint.clone(), *a))
             })
             .collect();
+        if let Some(relay) = &self.network.relay {
+            // Reconnect is a new pairing/transport, never an inherited relay socket or grant.
+            // A fresh signaling registration avoids confusing queued offers from an older attempt.
+            let mut used = self.relay_used.lock().await;
+            let mut probes = tokio::task::JoinSet::new();
+            let (token, candidates, observations) = if *used {
+                let mut signal = SignalingClient::connect(
+                    &self.signal_server,
+                    identity,
+                    self.network.local_candidates.clone(),
+                )
+                .await?;
+                let offer =
+                    resolve_peer_waiting(&mut signal, self.peer_node_id, Duration::from_secs(15))
+                        .await?;
+                *self.signal.lock().await = signal;
+                let mut candidates = Vec::new();
+                let mut observations = Vec::new();
+                for path in &self.network.paths {
+                    let reachable = path.reachable_candidates(&offer.candidates);
+                    if reachable.is_empty() {
+                        continue;
+                    }
+                    candidates.extend(reachable.iter().map(|addr| (path.endpoint.clone(), *addr)));
+                    let socket = path.punch_socket.clone();
+                    let mut receiver = socket.register_probe(&offer.token)?;
+                    let token = offer.token;
+                    let (tx, rx) = tokio::sync::watch::channel(None);
+                    observations.push((path.endpoint.clone(), rx));
+                    probes.spawn(async move {
+                        for _ in 0..PunchConfig::default().attempts {
+                            for address in &reachable {
+                                let _ = socket.send_probe_to(&token, *address).await;
+                            }
+                            if let Ok(Some(source)) =
+                                tokio::time::timeout(Duration::from_millis(200), receiver.recv())
+                                    .await
+                            {
+                                let _ = socket.send_probe_to(&token, source).await;
+                                tx.send_replace(Some(source));
+                            }
+                        }
+                    });
+                }
+                (offer.token, candidates, observations)
+            } else {
+                (self.token, candidates, self.observations.clone())
+            };
+            *used = true;
+            let mut tasks =
+                race::prepared_tasks(candidates, observations, identity, self.peer_node_id);
+            let fallback = relay.clone();
+            let identity = identity.clone();
+            let peer = self.peer_node_id;
+            tasks.spawn(async move { fallback.prepare(identity, peer, token).await });
+            let result = race::finish_prepared_guard(tasks).await;
+            probes.abort_all();
+            while probes.join_next().await.is_some() {}
+            let mut guard = result?;
+            guard.retain_relay_endpoint(&relay.endpoints)?;
+            return Ok(guard.release());
+        }
         race::authenticated_race_with_probes(
             candidates,
             self.observations.clone(),
@@ -233,6 +351,8 @@ impl DirectLink {
 
 pub async fn establish(identity: &Identity, config: &DirectConfig) -> Result<DirectLink> {
     let network = prepare_desktop_network(&DesktopNetworkConfig {
+        relay_server: config.relay_server.clone(),
+        advertise_only: config.advertise_only,
         local_port: config.local_port,
         families: config.families,
         stun_servers: config.stun_servers.clone(),
@@ -249,9 +369,19 @@ pub async fn establish(identity: &Identity, config: &DirectConfig) -> Result<Dir
     .await?;
     let offer = resolve_peer_waiting(&mut signal, config.peer, config.signal_timeout).await?;
     let peer_candidates = network.reachable_candidates(&offer.candidates);
-    let peer_addr = *peer_candidates.first().ok_or_else(|| {
-        Error::Transport("no peer candidate matches an available native path".into())
-    })?;
+    let peer_addr = match peer_candidates.first() {
+        Some(address) => *address,
+        None if network.relay.is_some() => offer
+            .candidates
+            .first()
+            .map(|c| c.addr)
+            .unwrap_or(AddressFamily::Ipv4.loopback(0)),
+        None => {
+            return Err(Error::Transport(
+                "no peer candidate matches an available native path".into(),
+            ));
+        }
+    };
     let mut probes = tokio::task::JoinSet::new();
     let mut observations = Vec::new();
     for path in &network.paths {
@@ -286,11 +416,14 @@ pub async fn establish(identity: &Identity, config: &DirectConfig) -> Result<Dir
         });
     }
     Ok(DirectLink {
+        token: offer.token,
         network,
         peer_addr,
         peer_node_id: config.peer,
         peer_candidates,
-        signal,
+        signal_server: config.signal_server.clone(),
+        signal: tokio::sync::Mutex::new(signal),
+        relay_used: tokio::sync::Mutex::new(false),
         probes,
         observations,
     })
@@ -299,6 +432,9 @@ pub async fn establish(identity: &Identity, config: &DirectConfig) -> Result<Dir
 /// One family may fail without disabling the other. Fixed ports are bound once
 /// per family; ephemeral ports are independently advertised with their real value.
 pub async fn prepare_desktop_network(config: &DesktopNetworkConfig) -> Result<DesktopNetwork> {
+    if let Some(spec) = &config.relay_server {
+        crate::relay::client::validate_server_spec(spec)?;
+    }
     let mut tasks = tokio::task::JoinSet::new();
     for family in [AddressFamily::Ipv6, AddressFamily::Ipv4] {
         if !config.families.enabled(family) {
@@ -332,7 +468,7 @@ pub async fn prepare_desktop_network(config: &DesktopNetworkConfig) -> Result<De
             Err(error) => diagnostics.push(format!("{family} path unavailable: {error}")),
         }
     }
-    if paths.is_empty() {
+    if paths.is_empty() && config.relay_server.is_none() {
         return Err(Error::Transport(diagnostics.join("; ")));
     }
     paths.sort_by_key(|p| p.family);
@@ -344,6 +480,10 @@ pub async fn prepare_desktop_network(config: &DesktopNetworkConfig) -> Result<De
     sort_candidates(&mut local_candidates);
     bound_candidates(&mut local_candidates);
     Ok(DesktopNetwork {
+        relay: config
+            .relay_server
+            .clone()
+            .map(|server| crate::relay::client::Fallback::new(server, config.families)),
         paths,
         local_candidates,
         diagnostics,
@@ -406,13 +546,29 @@ async fn prepare_path(family: AddressFamily, config: &DesktopNetworkConfig) -> R
         }
         (observation, None, None)
     };
-    let mut candidates = build_candidates_for(
-        family,
-        local_addr.port(),
-        public_addr,
-        &config.advertise,
-        config.include_loopback,
-    );
+    let mut candidates = if config.advertise_only {
+        config
+            .advertise
+            .iter()
+            .filter(|addr| family.accepts(**addr))
+            .copied()
+            .map(|address| {
+                if family == AddressFamily::Ipv4 {
+                    Candidate::reflexive(address)
+                } else {
+                    Candidate::host(address)
+                }
+            })
+            .collect()
+    } else {
+        build_candidates_for(
+            family,
+            local_addr.port(),
+            public_addr,
+            &config.advertise,
+            config.include_loopback,
+        )
+    };
     dedup_candidates(&mut candidates);
     sort_candidates(&mut candidates);
     let (endpoint, punch_socket) = endpoint_from_socket_with_punch_dispatcher(socket.into_std()?)?;
@@ -751,6 +907,8 @@ mod tests {
     #[tokio::test]
     async fn desktop网络探测与quinn端点保持同一udp地址() {
         let config = DesktopNetworkConfig {
+            relay_server: None,
+            advertise_only: false,
             local_port: 0,
             families: NetworkFamilies::Ipv4Only,
             stun_servers: Vec::new(),

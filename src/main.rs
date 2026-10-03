@@ -61,6 +61,7 @@ async fn run(cli: Cli) -> Result<()> {
         } => cmd_send(&key_file, file, peer, chunk_size).await,
 
         Command::SignalServer {
+            relay,
             listen,
             short_id_db,
             max_device_ids,
@@ -73,6 +74,7 @@ async fn run(cli: Cli) -> Result<()> {
                 max_device_ids,
                 new_device_ids_per_minute,
                 new_device_ids_per_ip_per_minute,
+                relay,
             )
             .await
         }
@@ -306,13 +308,15 @@ async fn cmd_send(
 }
 
 // ---------------------------------------------------------------------------
-// 公网直连：信令服务器 / serve / tunnel / push
+// 公网连接：IPv4/IPv6 Direct 优先，可选认证 UDP Relay 兜底；信令 / serve / tunnel / push
 // ---------------------------------------------------------------------------
 
 /// 把命令行参数翻译成打洞配置。
 fn direct_config(opts: &DirectOpts, peer: p2p_file::identity::NodeId) -> DirectConfig {
     let mut config = DirectConfig::new(opts.signal.clone(), peer);
     config.local_port = opts.port;
+    config.relay_server = opts.relay.clone();
+    config.advertise_only = opts.advertise_only;
     config.families = opts.ip_family;
     config.advertise = opts.advertise.clone();
     config.signal_timeout = Duration::from_secs(opts.wait);
@@ -377,9 +381,11 @@ async fn cmd_signal_server(
     max_device_ids: u32,
     new_device_ids_per_minute: u32,
     new_device_ids_per_ip_per_minute: u32,
+    relay: p2p_file::cli::RelayServerOpts,
 ) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let config = SignalServerConfig {
+        relay: relay.config()?,
         short_id_database: Some(short_id_db),
         max_short_id_mappings: max_device_ids,
         short_id_allocations_per_minute: new_device_ids_per_minute,
@@ -387,7 +393,15 @@ async fn cmd_signal_server(
         ..SignalServerConfig::default()
     };
     println!("信令服务器监听 {listen}");
-    println!("它只负责让双方交换候选地址，业务数据一个字节都不经过这里。");
+    if let Some(relay) = &config.relay {
+        println!(
+            "Relay UDP enabled: {:?}；仅转发已 pairing 且双边认证的加密 datagram。",
+            relay.listen
+        );
+        println!("云安全组还需放通配置的 Relay UDP 端口；QUIC 身份与业务权限仍由对端验证。");
+    } else {
+        println!("Relay UDP disabled；只交换候选地址，业务数据走 P2P。");
+    }
     println!("记得在云主机安全组里放通这个 TCP 端口。");
     println!("按 Ctrl-C 退出。");
 

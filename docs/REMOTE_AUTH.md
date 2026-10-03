@@ -163,5 +163,8 @@ Windows/macOS 的交互式 GPUI 输入、剪贴板和本机双设备体验仍需
 
 此设计按 Issue 使用密码派生 key + challenge-response，未实现 PAKE，因此不提供
 抗离线猜测保证；默认随机 10 位密码优于较短自定义密码。授权方向绑定当前会话；
-不提供账号、Trusted Device、密码找回、2FA、屏幕共享、远控、TURN、中继、ID 自选/
-回收/转让或 UPnP/NAT-PMP/PCP。
+Issue #51 的设计范围不包含账号、Trusted Device、密码找回、2FA、屏幕共享、远控、
+TURN/中继、ID 自选/回收/转让或 UPnP/NAT-PMP/PCP。后续 Trusted Device 扩展见
+[TRUSTED_DEVICES.md](TRUSTED_DEVICES.md)，可选认证 UDP Relay 见
+[架构 §4.9](ARCHITECTURE.md#49-认证-udp-relay-fallbackissue-59)；Relay 只转发端到端
+加密的 QUIC datagram，不改变此处设备间身份认证与方向授权边界。

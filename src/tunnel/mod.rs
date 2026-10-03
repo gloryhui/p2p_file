@@ -1,7 +1,7 @@
 //! 通用隧道：把家里的 TCP 服务直接映射到本机。
 //!
-//! 数据全部走已经打通的 P2P 直连（QUIC），阿里云那台只参与牵线，
-//! **一个字节的业务数据都不经过它**。
+//! 直连优先；可选 Relay fallback 仅转发加密 UDP datagram。
+//! QUIC 和设备身份认证始终端到端，服务器不解析业务协议。
 //!
 //! # 两个角色
 //!
@@ -155,6 +155,41 @@ pub async fn serve_loop(
 /// 处理一次已经建立好的直连会话。
 ///
 /// 直到「没有活跃连接、且静默超过 `re_punch_after`」才返回。
+// Each pairing has a separate socket and cancellation handle. Candidate/source hints
+// only cancel a relay after the *same NodeId* has completed its direct TLS-bound auth.
+struct RelayOffer {
+    peer: NodeId,
+    candidates: Vec<SocketAddr>,
+    observations: Vec<crate::net::race::ProbeObservation>,
+    abort: tokio::task::AbortHandle,
+    direct: Option<Connection>,
+}
+struct RelayWinner {
+    peer: NodeId,
+    guard: crate::net::race::ConnectionGuard,
+    permit: OwnedSemaphorePermit,
+}
+fn start_serve_relay(
+    relay: &crate::relay::client::Fallback,
+    identity: &Identity,
+    peer: NodeId,
+    token: crate::nat::punch::PunchToken,
+    pending: &Arc<Semaphore>,
+    tasks: &mut JoinSet<Result<RelayWinner>>,
+) -> Option<tokio::task::AbortHandle> {
+    let permit = pending.clone().try_acquire_owned().ok()?;
+    let relay = relay.clone();
+    let identity = identity.clone();
+    Some(tasks.spawn(async move {
+        let guard = relay.wait(identity, peer, token).await?;
+        Ok(RelayWinner {
+            peer,
+            guard,
+            permit,
+        })
+    }))
+}
+
 pub async fn serve_session(
     link: DirectLink,
     identity: Identity,
@@ -162,7 +197,15 @@ pub async fn serve_session(
 ) -> Result<()> {
     info!("直连已就绪，等待对端接入：{}", link.describe());
 
-    let (network, _signal, mut probes) = link.into_parts();
+    let initial = link.network.relay.as_ref().map(|_| {
+        (
+            link.peer_node_id,
+            link.token,
+            link.peer_candidates.clone(),
+            link.probe_observations(),
+        )
+    });
+    let (network, mut signal, mut probes) = link.into_parts();
     let (incoming_tx, mut incoming_rx) = mpsc::channel(64);
     let mut accept_tasks = JoinSet::new();
     for path in &network.paths {
@@ -185,10 +228,105 @@ pub async fn serve_session(
     let mut idle_changes = active.idle_changes.subscribe();
     let mut idle_deadline = active.idle_deadline(grace);
     let mut connection_tasks = JoinSet::new();
+    let mut relay_tasks = JoinSet::new();
+    let mut offers = HashMap::new();
+    let (authenticated_tx, mut authenticated_rx) = if network.relay.is_some() {
+        let (tx, rx) = mpsc::channel::<(NodeId, Connection)>(64);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    if let (Some(relay), Some(initial)) = (&network.relay, initial)
+        && let Some(abort) = start_serve_relay(
+            relay,
+            &identity,
+            initial.0,
+            initial.1,
+            &pending,
+            &mut relay_tasks,
+        )
+    {
+        offers.insert(
+            *initial.1.as_bytes(),
+            RelayOffer {
+                peer: initial.0,
+                candidates: initial.2,
+                observations: initial.3,
+                abort,
+                direct: None,
+            },
+        );
+    }
 
     loop {
         let incoming = tokio::select! {
-            incoming = incoming_rx.recv() => incoming,
+            incoming = incoming_rx.recv(), if !network.paths.is_empty() => incoming,
+            message = signal.next_event(), if network.relay.is_some() => {
+                match message {
+                    Ok(crate::discovery::signal::SignalMessage::PeerCandidates {node_id, candidates, token}) => {
+                        offers.retain(|_, offer| !offer.abort.is_finished() || offer.direct.as_ref().is_some_and(|c| c.close_reason().is_none()));
+                        if offers.contains_key(token.as_bytes()) || offers.len() >= DEFAULT_MAX_PENDING_HANDSHAKES { continue; }
+                        let reachable = network.reachable_candidates(&candidates);
+                        if offers.values().any(|offer| offer.peer == node_id && offer.candidates == reachable) { continue; }
+                        let relay = network.relay.as_ref().unwrap();
+                        let Some(abort) = start_serve_relay(relay, &identity, node_id, token, &pending, &mut relay_tasks) else { continue; };
+                        let mut observations = Vec::new();
+                        for path in &network.paths {
+                            let candidates = path.reachable_candidates(&candidates);
+                            if candidates.is_empty() { continue; }
+                            let socket = path.punch_socket.clone();
+                            let Ok(mut receiver) = socket.register_probe(&token) else { continue; };
+                            let (tx, rx) = watch::channel(None);
+                            observations.push((path.endpoint.clone(), rx));
+                            probes.spawn(async move {
+                                for _ in 0..crate::nat::punch::PunchConfig::default().attempts {
+                                    for address in &candidates { let _ = socket.send_probe_to(&token, *address).await; }
+                                    if let Ok(Some(source)) = tokio::time::timeout(Duration::from_millis(200), receiver.recv()).await {
+                                        let _ = socket.send_probe_to(&token, source).await;
+                                        tx.send_replace(Some(source));
+                                    }
+                                }
+                            });
+                        }
+                        offers.insert(*token.as_bytes(), RelayOffer {peer: node_id, candidates: reachable, observations, abort, direct: None});
+                    }
+                    Err(error) => { warn!(%error, "Relay signaling pairing unavailable; retiring this serve generation"); break; }
+                    _ => {}
+                }
+                continue;
+            },
+            authenticated = async {authenticated_rx.as_mut().unwrap().recv().await}, if network.relay.is_some() => {
+                if let Some((peer, connection)) = authenticated {
+                    let source = connection.remote_address();
+                    let matches: Vec<_> = offers.iter().filter(|(_, offer)| offer.peer == peer &&
+                        (offer.candidates.contains(&source) || offer.observations.iter().any(|(_, rx)| *rx.borrow() == Some(source))))
+                        .map(|(token, _)| *token).collect();
+                    // Ambiguous routing never cancels a different pairing generation.
+                    if matches.len() == 1 && let Some(offer) = offers.get_mut(&matches[0]) { offer.abort.abort(); offer.direct = Some(connection); }
+                }
+                continue;
+            },
+            result = relay_tasks.join_next(), if !relay_tasks.is_empty() => {
+                if let Some(Ok(Ok(mut winner))) = result {
+                    if !config.peer_allowed(winner.peer) { continue; }
+                    let relay = network.relay.as_ref().unwrap();
+                    if let Err(error) = winner.guard.retain_relay_endpoint(&relay.endpoints) { warn!(%error); continue; }
+                    let connection = winner.guard.release();
+                    info!(peer = %winner.peer.short(), path_kind = "relay", family = %crate::net::AddressFamily::of(connection.remote_address()), remote = %connection.remote_address(), "对端已通过端到端认证");
+                    let config = config.clone();
+                    let active = active.clone();
+                    let file_receives = file_receives.clone();
+                    let connections = connections.clone();
+                    connection_tasks.spawn(async move {
+                        let id = connections.lock().unwrap().insert(connection.clone());
+                        drop(winner.permit);
+                        let _active = ActiveSession::new(active);
+                        if let Err(error) = serve_streams(connection, winner.peer, config, file_receives).await { warn!(%error); }
+                        connections.lock().unwrap().remove(id);
+                    });
+                } else if let Some(Ok(Err(error))) = result { debug!(%error, "Relay attempt ended"); }
+                continue;
+            },
             _ = tokio::time::sleep_until(idle_deadline) => {
                 if active.count.load(Ordering::Relaxed) == 0 {
                     // active 刚刚结束时，Drop 会记录真实的 idle 起点。即使
@@ -240,6 +378,7 @@ pub async fn serve_session(
         let active = Arc::clone(&active);
         let file_receives = Arc::clone(&file_receives);
         let connections = Arc::clone(&connections);
+        let authenticated_tx = authenticated_tx.clone();
         connection_tasks.spawn(async move {
             let connection = match tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, incoming).await {
                 Ok(Ok(connection)) => connection,
@@ -253,8 +392,16 @@ pub async fn serve_session(
                 }
             };
             let connection_id = connections.lock().unwrap().insert(connection.clone());
-            if let Err(err) =
-                serve_connection(connection, &identity, config, active, file_receives, permit).await
+            if let Err(err) = serve_connection(
+                connection,
+                &identity,
+                config,
+                active,
+                file_receives,
+                permit,
+                authenticated_tx,
+            )
+            .await
             {
                 warn!(error = %err, "处理连接时出错");
             }
@@ -266,6 +413,8 @@ pub async fn serve_session(
     // Connection 对 UDP socket 的引用，下一轮才能安全复用固定的本地端口。
     network.close();
     accept_tasks.abort_all();
+    relay_tasks.abort_all();
+    while relay_tasks.join_next().await.is_some() {}
     probes.abort_all();
     while accept_tasks.join_next().await.is_some() {}
     while probes.join_next().await.is_some() {}
@@ -285,7 +434,7 @@ pub async fn serve_session(
     for connection in connections {
         let _ = tokio::time::timeout(Duration::from_secs(3), connection.closed()).await;
     }
-    drop(_signal);
+    drop(signal);
     drop(network);
     // quinn 的 endpoint driver 在 drop 后还需要一个调度机会收掉底层
     // socket 引用；显式让出执行权，保证下一轮固定端口 bind 不与清理竞态。
@@ -385,6 +534,7 @@ impl Drop for ActiveSession {
 }
 
 /// 处理一条已建立的 QUIC 连接：先认证，再按流的类型分发。
+#[allow(clippy::too_many_arguments)]
 async fn serve_connection(
     connection: Connection,
     identity: &Identity,
@@ -392,6 +542,7 @@ async fn serve_connection(
     active: Arc<ActiveState>,
     file_receives: Arc<Semaphore>,
     pending_permit: OwnedSemaphorePermit,
+    authenticated: Option<mpsc::Sender<(NodeId, Connection)>>,
 ) -> Result<()> {
     let remote = connection.remote_address();
 
@@ -417,6 +568,9 @@ async fn serve_connection(
     }
     // 到这里已经完成 QUIC handshake、应用握手和白名单检查；之后的业务
     // 服务不再占用 pending-handshake 配额。
+    if let Some(sender) = authenticated {
+        let _ = sender.try_send((peer_id, connection.clone()));
+    }
     drop(pending_permit);
     let _active = ActiveSession::new(active);
     info!(peer = %peer_id.short(), %remote, "对端已通过认证");
@@ -868,7 +1022,7 @@ async fn open_session(link: &DirectLink, identity: &Identity) -> Result<Connecti
     info!(
         peer = %link.peer_node_id.short(),
         remote = %connection_remote(connection.clone()),
-        "直连已加密并认证"
+        "端到端 QUIC 已加密并认证"
     );
     Ok(connection)
 }
@@ -912,7 +1066,7 @@ async fn open_tunnel(tcp: TcpStream, connection: &Connection, target: &str) -> R
     }
 }
 
-/// 客户端：把一个文件推到对端（走直连，不经过任何服务器）。
+/// 客户端：把文件推到对端（直连优先，可选端到端加密 Relay）。
 ///
 /// 先自己完成握手并核对对端身份，再把发送流程交给 [`send_file_after_handshake`]，
 /// 避免握两次手（`send_file` 内部也会握手）。
@@ -1174,6 +1328,256 @@ mod tests {
         client_link.network.wait_idle().await;
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[tokio::test]
+    async fn relay_real_pairing_blackhole_file_resume_speedtest_and_multiple_allowlisted_tunnels() {
+        use crate::net::NetworkFamilies;
+        use crate::speedtest::{SpeedTestDirection, run_speedtest};
+        let (signal, relay, signal_task) = crate::relay::tests::signaling_fixture().await;
+        let mut server_id = Identity::generate();
+        let mut client_id = Identity::generate();
+        if server_id.node_id() > client_id.node_id() {
+            std::mem::swap(&mut server_id, &mut client_id);
+        }
+        let blackhole_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let blackhole_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut sc = test_direct_config(signal, client_id.node_id());
+        sc.families = NetworkFamilies::Ipv4Only;
+        sc.relay_server = Some(relay.to_string());
+        sc.advertise_only = true;
+        sc.advertise = vec![blackhole_a.local_addr().unwrap()];
+        let mut cc = test_direct_config(signal, server_id.node_id());
+        cc.families = sc.families;
+        cc.relay_server = sc.relay_server.clone();
+        cc.advertise_only = true;
+        cc.advertise = vec![blackhole_b.local_addr().unwrap()];
+        let blackholes_v6 = if crate::net::family::ipv6_test_available() {
+            let a = crate::net::family::bind_udp("[::1]:0".parse().unwrap()).unwrap();
+            let b = crate::net::family::bind_udp("[::1]:0".parse().unwrap()).unwrap();
+            sc.families = NetworkFamilies::DualStack;
+            cc.families = sc.families;
+            sc.advertise.push(a.local_addr().unwrap());
+            cc.advertise.push(b.local_addr().unwrap());
+            Some((a, b))
+        } else {
+            None
+        };
+        let (sl, cl) = tokio::join!(establish(&server_id, &sc), establish(&client_id, &cc));
+        let sl = sl.unwrap();
+        let cl = cl.unwrap();
+        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = echo.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            let mut tasks = JoinSet::new();
+            for _ in 0..3 {
+                let (mut tcp, _) = echo.accept().await.unwrap();
+                tasks.spawn(async move {
+                    let (mut r, mut w) = tcp.split();
+                    tokio::io::copy(&mut r, &mut w).await.unwrap();
+                });
+            }
+            while tasks.join_next().await.is_some() {}
+        });
+        let root = std::env::temp_dir().join(format!(
+            "p2p-relay-business-{:032x}",
+            rand::random::<u128>()
+        ));
+        let receive = root.join("receive");
+        std::fs::create_dir_all(&receive).unwrap();
+        let file = root.join("relay.bin");
+        let bytes = vec![119_u8; 200_000];
+        std::fs::write(&file, &bytes).unwrap();
+        let manifest = crate::transfer::chunker::manifest_from_path(&file, 65536).unwrap();
+        let mut partial = crate::storage::PartialDownload::create(&receive, manifest).unwrap();
+        partial.write_chunk(0, &bytes[..65536]).unwrap();
+        partial.checkpoint().unwrap();
+        drop(partial);
+        let server_network = sl.network.relay.clone().unwrap();
+        let direct_endpoints = sl.endpoints();
+        let serve = tokio::spawn(serve_session(
+            sl,
+            server_id.clone(),
+            ServeConfig {
+                allowed_peers: vec![client_id.node_id()],
+                forwards: vec![target],
+                recv_dir: Some(receive.clone()),
+                re_punch_after: Duration::from_secs(30),
+                ..ServeConfig::new()
+            },
+        ));
+        let started = tokio::time::Instant::now();
+        let connection =
+            tokio::time::timeout(Duration::from_secs(8), cl.connect_authenticated(&client_id))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(started.elapsed() >= crate::relay::RELAY_FALLBACK_DELAY);
+        assert_eq!(connection.remote_address(), relay);
+        assert!(
+            cl.network
+                .relay
+                .as_ref()
+                .unwrap()
+                .endpoints
+                .is_relay(&connection)
+        );
+        let mut tasks = JoinSet::new();
+        for index in 0..3 {
+            let connection = connection.clone();
+            tasks.spawn(async move {
+                let (mut tx, mut rx) = connection.open_bi().await.unwrap();
+                write_frame(
+                    &mut tx,
+                    &ControlMessage::TunnelOpen {
+                        target: target.to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    read_frame(&mut rx).await.unwrap(),
+                    Some(ControlMessage::TunnelReady)
+                );
+                let bytes = vec![index as u8; 100_000];
+                tx.write_all(&bytes).await.unwrap();
+                tx.finish().unwrap();
+                let mut response = vec![0; bytes.len()];
+                rx.read_exact(&mut response).await.unwrap();
+                assert_eq!(response, bytes);
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+        echo_task.await.unwrap();
+        for direction in [
+            SpeedTestDirection::Upload,
+            SpeedTestDirection::Download,
+            SpeedTestDirection::Both,
+        ] {
+            let reports = run_speedtest(
+                &connection,
+                direction,
+                Duration::from_secs(1),
+                65536,
+                |_| {},
+            )
+            .await
+            .unwrap();
+            assert!(reports.iter().all(|r| r.bytes > 0 && r.remote == relay));
+        }
+        let report = send_file_after_handshake(&connection, &file, 65536, server_id.node_id())
+            .await
+            .unwrap();
+        assert_eq!(report.chunks_skipped, 1);
+        assert_eq!(std::fs::read(receive.join("relay.bin")).unwrap(), bytes);
+        let (mut tx, mut rx) = connection.open_bi().await.unwrap();
+        write_frame(
+            &mut tx,
+            &ControlMessage::TunnelOpen {
+                target: "127.0.0.1:1".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame(&mut rx).await.unwrap(),
+            Some(ControlMessage::TunnelError { .. })
+        ));
+        let old_binding = ChannelBinding::from_connection(&connection).unwrap();
+        connection.close(0u32.into(), b"test reconnect");
+        let fresh =
+            tokio::time::timeout(Duration::from_secs(8), cl.connect_authenticated(&client_id))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(fresh.remote_address(), relay);
+        assert_ne!(
+            ChannelBinding::from_connection(&fresh).unwrap(),
+            old_binding
+        );
+        assert_ne!(fresh.stable_id(), connection.stable_id());
+        fresh.close(0u32.into(), b"test done");
+        server_network.endpoints.close();
+        for endpoint in direct_endpoints {
+            endpoint.close(0u32.into(), b"test done");
+        }
+        tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        cl.network.close();
+        cl.network.wait_idle().await;
+        signal_task.abort();
+        let _ = signal_task.await;
+        drop(blackholes_v6);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_configured_fast_direct_wins_without_any_relay_udp_request() {
+        fast_direct_relay_fixture(crate::net::NetworkFamilies::Ipv4Only).await;
+    }
+    #[tokio::test]
+    async fn relay_configured_fast_ipv6_direct_wins_without_any_relay_udp_request() {
+        if crate::net::family::ipv6_test_available() {
+            fast_direct_relay_fixture(crate::net::NetworkFamilies::Ipv6Only).await;
+        }
+    }
+    async fn fast_direct_relay_fixture(families: crate::net::NetworkFamilies) {
+        let signal = spawn_signal_server().await;
+        let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let mut sc = test_direct_config(signal, a.node_id());
+        sc.families = families;
+        sc.relay_server = Some(relay.local_addr().unwrap().to_string());
+        let mut cc = test_direct_config(signal, b.node_id());
+        cc.families = families;
+        cc.relay_server = sc.relay_server.clone();
+        let (sl, cl) = tokio::join!(establish(&b, &sc), establish(&a, &cc));
+        let sl = sl.unwrap();
+        let cl = cl.unwrap();
+        let endpoints = sl.endpoints();
+        let serve = tokio::spawn(serve_session(
+            sl,
+            b,
+            ServeConfig {
+                re_punch_after: Duration::from_secs(20),
+                ..ServeConfig::new()
+            },
+        ));
+        let connection = cl.connect_authenticated(&a).await.unwrap();
+        assert!(
+            !cl.network
+                .relay
+                .as_ref()
+                .unwrap()
+                .endpoints
+                .is_relay(&connection)
+        );
+        assert_eq!(
+            connection.remote_address().is_ipv6(),
+            families == crate::net::NetworkFamilies::Ipv6Only
+        );
+        let mut bytes = [0; 512];
+        assert!(
+            tokio::time::timeout(
+                crate::relay::RELAY_FALLBACK_DELAY + Duration::from_millis(300),
+                relay.recv_from(&mut bytes)
+            )
+            .await
+            .is_err()
+        );
+        connection.close(0u32.into(), b"done");
+        for endpoint in endpoints {
+            endpoint.close(0u32.into(), b"done");
+        }
+        serve.await.unwrap().unwrap();
+        cl.network.close();
+        cl.network.wait_idle().await;
+    }
+
     #[test]
     fn 允许列表为空时不限制节点() {
         let config = ServeConfig::new();
@@ -1582,7 +1986,7 @@ mod tests {
         serve_task.abort();
     }
 
-    /// 全链路：信令牵线 → 打洞 → 直接推文件（不经过任何服务器）。
+    /// 本用例验证 Direct 路径：信令牵线 → 打洞 → 推文件，业务数据不经过服务器。
     #[tokio::test]
     async fn 打洞后能直接推文件() {
         let signal_addr = spawn_signal_server().await;

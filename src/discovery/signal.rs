@@ -1,12 +1,15 @@
 //! 公网信令：让两个素不相识的节点交换各自的候选地址。
 //!
-//! 信令服务器只做「牵线」，**不碰业务数据**。职责是：
+//! Direct 成功时服务器只负责信令，不承载业务数据。信令职责是：
 //!
 //! 1. 节点上线时登记自己的节点 ID 和候选地址；
 //! 2. 一方查询另一方时，把双方候选互相推送；
-//! 3. 之后双方自行打洞，数据走直连，服务器不参与。
+//! 3. 之后双方优先自行直连；用户配置 Relay 且 Direct 未及时建立 authenticated
+//!    transport 时，可选独立 Relay UDP task 延迟转发端到端加密的 QUIC datagram。
 //!
-//! 走 TCP + 长度前缀 postcard，这样只要放通一个 TCP 端口就能用。
+//! Relay 看不到业务明文，QUIC / Ed25519 身份认证仍是设备间端到端。
+//!
+//! 信令走 TCP + 长度前缀 postcard；启用 Relay 还需放通配置的 UDP 端口。
 //!
 //! # 信令本身是明文的，所以注册必须自证身份
 //!
@@ -66,6 +69,10 @@ pub const SHORT_ID_PROTOCOL_VERSION: u32 = 3;
 const SHORT_LOOKUP_WINDOW: Duration = Duration::from_secs(10);
 const MAX_SHORT_LOOKUP_IPS: usize = 1024;
 const SHORT_LOOKUP_UNAVAILABLE: &str = "设备查询不可用或请求过多，请稍后重试";
+pub const NODE_LOOKUP_WINDOW: Duration = Duration::from_secs(10);
+pub const DEFAULT_NODE_LOOKUPS_PER_CONNECTION: u32 = 64;
+pub const DEFAULT_NODE_LOOKUPS_PER_IP: u32 = 256;
+const MAX_NODE_LOOKUP_IPS: usize = 1024;
 
 /// 注册 challenge 长度（256 bit）。
 pub const CHALLENGE_LEN: usize = 32;
@@ -97,6 +104,8 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// 默认值面向公网部署；测试用更小的值来快速验证边界行为。
 #[derive(Clone, Debug)]
 pub struct SignalServerConfig {
+    /// None preserves the direct-only server startup and wire protocol.
+    pub relay: Option<crate::relay::server::RelayServerConfig>,
     /// Persistent by default. None explicitly opts into an ephemeral embedded/test registry.
     pub short_id_database: Option<PathBuf>,
     /// New durable mappings only; reconnects do not consume these budgets.
@@ -106,6 +115,9 @@ pub struct SignalServerConfig {
     pub short_lookups_per_connection: u32,
     pub short_lookups_per_ip: u32,
     pub max_short_lookup_misses: u32,
+    /// Ordinary NodeId requests, independently of offline waiter capacity.
+    pub node_lookups_per_connection: u32,
+    pub node_lookups_per_ip: u32,
     /// 单节点候选地址上限。
     pub max_candidates: usize,
     /// 在线节点总数上限。
@@ -122,7 +134,7 @@ pub struct SignalServerConfig {
     pub register_timeout: Duration,
     /// 登记成功后，两次收到帧之间的最大空闲时间。
     ///
-    /// 这是一条兜底：真正的业务数据走 P2P 直连，长时间不碰信令是正常的，
+    /// 这是一条兜底：业务数据走已认证 QUIC（Direct 或 Relay），长时间没有信令业务请求是正常的，
     /// 所以给得比较宽松，只用来回收半死连接。
     pub idle_timeout: Duration,
     /// 单帧写入超时。
@@ -137,6 +149,7 @@ pub struct SignalServerConfig {
 impl Default for SignalServerConfig {
     fn default() -> Self {
         Self {
+            relay: None,
             short_id_database: Some(PathBuf::from("signal-device-ids.sqlite3")),
             max_short_id_mappings: 1_000_000,
             short_id_allocations_per_minute: 120,
@@ -144,6 +157,8 @@ impl Default for SignalServerConfig {
             short_lookups_per_connection: 5,
             short_lookups_per_ip: 20,
             max_short_lookup_misses: 3,
+            node_lookups_per_connection: DEFAULT_NODE_LOOKUPS_PER_CONNECTION,
+            node_lookups_per_ip: DEFAULT_NODE_LOOKUPS_PER_IP,
             max_candidates: MAX_CANDIDATES,
             max_registered_peers: MAX_REGISTERED_PEERS,
             max_waiter_entries: MAX_WAITER_ENTRIES,
@@ -173,7 +188,7 @@ impl SignalServerConfig {
 pub enum CandidateKind {
     /// 服务器反射地址（STUN 看到的公网映射）。
     ServerReflexive,
-    /// 中继地址（TURN / relay），成功率最高但绕远路。
+    /// Relay 兜底候选；实际使用须经过认证 UDP admission，不代表实现完整 TURN。
     Relay,
     /// 用端口预测猜出来的地址，只在对称型 NAT 下才用。
     Predicted,
@@ -184,8 +199,8 @@ pub enum CandidateKind {
 impl CandidateKind {
     /// 数字越小越优先尝试。
     ///
-    /// 顺序是刻意排的：先试公网映射（直连、延迟低），再试局域网和 IPv6
-    /// 直连（同网段时最快），打洞不成才用中继，最后才是猜出来的地址。
+    /// 顺序是刻意排的：先公网映射，再 Host（局域网或原生 IPv6）和端口预测地址，
+    /// 最后 Relay 候选；运行时原生 IPv6/IPv4 直连竞速优先，认证 Relay 只做延迟兜底。
     pub fn priority(self) -> u32 {
         match self {
             Self::ServerReflexive => 0,
@@ -427,7 +442,9 @@ struct WaiterKey {
 /// 内存里的在线表。进程重启即清空——客户端会重新登记。
 #[derive(Default)]
 struct Registry {
+    relay: Option<crate::relay::server::Admission>,
     short_lookup_ips: HashMap<IpAddr, LookupWindow>,
+    node_lookup_ips: HashMap<IpAddr, LookupWindow>,
     peers: HashMap<NodeId, PeerRecord>,
     /// 谁在等谁上线：`waiters[target] = { (requester, connection_id), ... }`。
     waiters: HashMap<NodeId, HashSet<WaiterKey>>,
@@ -546,6 +563,19 @@ impl ShortIdResources {
 }
 
 impl Registry {
+    fn take_node_lookup(&mut self, ip: IpAddr, config: &SignalServerConfig) -> bool {
+        self.node_lookup_ips
+            .retain(|_, bucket| !bucket.expired_after(NODE_LOOKUP_WINDOW));
+        if !self.node_lookup_ips.contains_key(&ip)
+            && self.node_lookup_ips.len() >= MAX_NODE_LOOKUP_IPS
+        {
+            return false;
+        }
+        self.node_lookup_ips
+            .entry(ip)
+            .or_insert_with(LookupWindow::new)
+            .take_in_window(config.node_lookups_per_ip, u32::MAX, NODE_LOOKUP_WINDOW)
+    }
     fn take_short_lookup(&mut self, ip: IpAddr, config: &SignalServerConfig) -> bool {
         self.short_lookup_ips.retain(|_, window| !window.expired());
         if !self.short_lookup_ips.contains_key(&ip)
@@ -647,6 +677,11 @@ impl Registry {
         // 顺序写进双方的发送队列，两边读到的第一条必然是同一次牵线的，
         // `同一对节点拿到的令牌必须一致` 这条测试盯着这个不变量。
         let token = PunchToken::random();
+        if let Some(relay) = &self.relay
+            && !relay.issue(token, a, b)
+        {
+            tracing::warn!("Relay ticket capacity unavailable; direct pairing still proceeds");
+        }
 
         tracing::info!(
             a = %a.short(),
@@ -731,9 +766,35 @@ pub(crate) async fn run_signal_server_on_borrowed(
     config: SignalServerConfig,
 ) -> Result<()> {
     let local = listener.local_addr()?;
-    tracing::info!(%local, "信令服务器已启动，等待节点接入（只牵线，不过数据）");
+    tracing::info!(%local, "信令服务器已启动，等待节点接入");
 
-    let registry = Arc::new(Mutex::new(Registry::default()));
+    let mut relay_tasks = tokio::task::JoinSet::new();
+    let relay = if let Some(relay_config) = &config.relay {
+        relay_config.validate()?;
+        if relay_config.listen.is_empty() {
+            return Err(Error::Discovery(
+                "enabled Relay requires a UDP listener".into(),
+            ));
+        }
+        let admission = crate::relay::server::Admission::new(relay_config.clone())?;
+        let mut sockets = Vec::new();
+        for address in &relay_config.listen {
+            let socket = tokio::net::UdpSocket::from_std(crate::net::family::bind_udp(*address)?)?;
+            sockets.push(socket);
+        }
+        relay_tasks.spawn(crate::relay::server::run_listeners(
+            sockets,
+            admission.clone(),
+        ));
+        Some(admission)
+    } else {
+        tracing::info!("Relay UDP disabled; signal exchanges candidates only");
+        None
+    };
+    let registry = Arc::new(Mutex::new(Registry {
+        relay,
+        ..Registry::default()
+    }));
     let short_ids = ShortIdResources::new(&config)?;
     let config = Arc::new(config);
 
@@ -745,6 +806,9 @@ pub(crate) async fn run_signal_server_on_borrowed(
         let accepted = tokio::select! {
             accepted = listener.accept() => accepted,
             _ = clients.join_next(), if !clients.is_empty() => continue,
+            ended = relay_tasks.join_next(), if !relay_tasks.is_empty() => {
+                return Err(Error::Discovery(format!("Relay UDP task stopped: {ended:?}")));
+            },
         };
         let (stream, remote) = match accepted {
             Ok(pair) => pair,
@@ -803,6 +867,7 @@ async fn handle_signal_client(
 ) -> Result<()> {
     let remote_ip = stream.peer_addr()?.ip();
     let mut short_window = LookupWindow::new();
+    let mut node_window = LookupWindow::new();
     // 信令消息都很小，别让 Nagle 拖慢牵线。
     let _ = stream.set_nodelay(true);
     let (read_half, write_half) = stream.into_split();
@@ -1119,18 +1184,6 @@ async fn handle_signal_client(
                 let me = registration.node_id;
                 let my_connection = registration.connection_id;
 
-                if me == target {
-                    if !send_or_close(
-                        &outbox,
-                        SignalMessage::Error {
-                            reason: "别查自己".into(),
-                        },
-                    ) {
-                        break "待写队列已满";
-                    }
-                    continue;
-                }
-
                 let mut reg = registry.lock().await;
                 // 所有权：本连接必须仍然是这个节点的当前记录。否则说明该节点
                 // 已经在别处重新登记，这条连接不能再代表它。
@@ -1142,6 +1195,40 @@ async fn handle_signal_client(
                     drop(reg);
                     reject(&outbox, "本连接已被该节点的新连接取代");
                     break "连接所有权已被取代";
+                }
+
+                // Gate every ordinary lookup before observing target availability,
+                // pairing/ticket issuance, or offline waiter mutation. Both budgets
+                // belong to the actual TCP connection/source IP, not the requested ID.
+                if !node_window.take_in_window(
+                    config.node_lookups_per_connection,
+                    u32::MAX,
+                    NODE_LOOKUP_WINDOW,
+                ) || !reg.take_node_lookup(remote_ip, &config)
+                {
+                    drop(reg);
+                    if !send_or_close(
+                        &outbox,
+                        SignalMessage::Error {
+                            reason: SHORT_LOOKUP_UNAVAILABLE.into(),
+                        },
+                    ) {
+                        break "待写队列已满";
+                    }
+                    continue;
+                }
+
+                if me == target {
+                    drop(reg);
+                    if !send_or_close(
+                        &outbox,
+                        SignalMessage::Error {
+                            reason: "别查自己".into(),
+                        },
+                    ) {
+                        break "待写队列已满";
+                    }
+                    continue;
                 }
 
                 if reg.peers.contains_key(&target) {
@@ -2271,6 +2358,228 @@ mod tests {
                 other => panic!("注册应当成功，实际 {other:?}"),
             }
         }
+    }
+
+    async fn node_lookup_reply(raw: &mut Raw, target: NodeId) -> SignalMessage {
+        raw.send(&SignalMessage::Lookup { node_id: target }).await;
+        tokio::time::timeout(Duration::from_secs(5), raw.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn lookup_pair(a: &mut Raw, a_id: NodeId, b: &mut Raw, b_id: NodeId) -> PunchToken {
+        let SignalMessage::PeerCandidates { node_id, token, .. } = node_lookup_reply(a, b_id).await
+        else {
+            panic!("lookup must pair")
+        };
+        assert_eq!(node_id, b_id);
+        let other = tokio::time::timeout(Duration::from_secs(5), b.recv())
+            .await
+            .unwrap();
+        assert!(
+            matches!(other, Some(SignalMessage::PeerCandidates {node_id, token: other, ..}) if node_id == a_id && other == token)
+        );
+        token
+    }
+
+    async fn assert_target_has_no_candidates(raw: &mut Raw) {
+        // A FIFO Ping barrier proves all earlier target pushes have been consumed,
+        // without sleeping or assuming a quiet interval means no flood.
+        raw.send(&SignalMessage::Ping).await;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), raw.recv())
+                .await
+                .unwrap(),
+            Some(SignalMessage::Pong)
+        ));
+    }
+
+    #[tokio::test]
+    async fn node_lookup_connection_limit_stops_pairing_tickets_and_target_flood_and_recovers() {
+        for enable_relay in [false, true] {
+            let (addr, registry) = spawn_signal_server_with(SignalServerConfig {
+                node_lookups_per_connection: 3,
+                node_lookups_per_ip: 20,
+                ..SignalServerConfig::for_tests()
+            })
+            .await;
+            let admission = crate::relay::server::Admission::new(Default::default()).unwrap();
+            if enable_relay {
+                registry.lock().await.relay = Some(admission.clone());
+            }
+            let a = Identity::generate();
+            let b = Identity::generate();
+            let mut ra = Raw::connect(addr).await;
+            let mut rb = Raw::connect(addr).await;
+            ra.full_register(&a, vec![]).await;
+            rb.full_register(&b, vec![]).await;
+            let mut tokens = HashSet::new();
+            for _ in 0..3 {
+                let token = lookup_pair(&mut ra, a.node_id(), &mut rb, b.node_id()).await;
+                assert!(tokens.insert(*token.as_bytes()));
+            }
+            let ticket_count = if enable_relay { 3 } else { 0 };
+            assert_eq!(admission.ticket_count(), ticket_count);
+            for target in [b.node_id(), Identity::generate().node_id(), a.node_id()]
+                .into_iter()
+                .cycle()
+                .take(12)
+            {
+                assert!(
+                    matches!(node_lookup_reply(&mut ra, target).await, SignalMessage::Error {reason} if reason == SHORT_LOOKUP_UNAVAILABLE)
+                );
+            }
+            assert_target_has_no_candidates(&mut rb).await;
+            assert_eq!(admission.ticket_count(), ticket_count);
+            assert_eq!(registry.lock().await.waiter_entries(), 0);
+            // Both connection and IP windows expire; an actual Lookup pairs again.
+            tokio::time::pause();
+            tokio::time::advance(NODE_LOOKUP_WINDOW).await;
+            tokio::time::resume();
+            let token = lookup_pair(&mut ra, a.node_id(), &mut rb, b.node_id()).await;
+            assert!(tokens.insert(*token.as_bytes()));
+            assert_eq!(admission.ticket_count(), if enable_relay { 4 } else { 0 });
+            assert_eq!(registry.lock().await.relay.is_some(), enable_relay);
+        }
+    }
+
+    #[tokio::test]
+    async fn node_lookup_ip_limit_survives_new_identity_and_connection_then_recovers() {
+        let (addr, registry) = spawn_signal_server_with(SignalServerConfig {
+            node_lookups_per_connection: 10,
+            node_lookups_per_ip: 2,
+            ..SignalServerConfig::for_tests()
+        })
+        .await;
+        let admission = crate::relay::server::Admission::new(Default::default()).unwrap();
+        registry.lock().await.relay = Some(admission.clone());
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let c = Identity::generate();
+        let d = Identity::generate();
+        let mut ra = Raw::connect(addr).await;
+        let mut rb = Raw::connect(addr).await;
+        let mut rc = Raw::connect(addr).await;
+        ra.full_register(&a, vec![]).await;
+        rb.full_register(&b, vec![]).await;
+        rc.full_register(&c, vec![]).await;
+        lookup_pair(&mut ra, a.node_id(), &mut rb, b.node_id()).await;
+        lookup_pair(&mut rc, c.node_id(), &mut rb, b.node_id()).await;
+        let mut reconnect = Raw::connect(addr).await;
+        reconnect.full_register(&a, vec![]).await;
+        let mut fresh_identity = Raw::connect(addr).await;
+        fresh_identity.full_register(&d, vec![]).await;
+        for raw in [&mut reconnect, &mut fresh_identity, &mut rc] {
+            assert!(
+                matches!(node_lookup_reply(raw, b.node_id()).await, SignalMessage::Error {reason} if reason == SHORT_LOOKUP_UNAVAILABLE)
+            );
+        }
+        assert_eq!(admission.ticket_count(), 2);
+        assert_target_has_no_candidates(&mut rb).await;
+        tokio::time::pause();
+        tokio::time::advance(NODE_LOOKUP_WINDOW).await;
+        tokio::time::resume();
+        lookup_pair(&mut fresh_identity, d.node_id(), &mut rb, b.node_id()).await;
+        assert_eq!(admission.ticket_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn node_lookup_ip_buckets_are_bounded_and_expired_entries_are_reclaimed() {
+        let config = SignalServerConfig {
+            node_lookups_per_ip: 2,
+            ..SignalServerConfig::for_tests()
+        };
+        let mut registry = Registry::default();
+        for n in 0..MAX_NODE_LOOKUP_IPS {
+            assert!(
+                registry.take_node_lookup(IpAddr::V6(std::net::Ipv6Addr::from(n as u128)), &config)
+            );
+        }
+        let first = IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED);
+        assert!(registry.take_node_lookup(first, &config)); // Existing bucket still works at capacity.
+        assert!(!registry.take_node_lookup(first, &config));
+        let fresh = "192.0.2.1".parse().unwrap();
+        assert!(!registry.take_node_lookup(fresh, &config));
+        assert_eq!(registry.node_lookup_ips.len(), MAX_NODE_LOOKUP_IPS);
+        assert!(registry.take_short_lookup(fresh, &config)); // Independent Short ID limiter.
+        for bucket in registry.node_lookup_ips.values_mut() {
+            bucket.started -= NODE_LOOKUP_WINDOW;
+        }
+        assert!(registry.take_node_lookup(fresh, &config));
+        assert_eq!(registry.node_lookup_ips.len(), 1);
+        assert!(registry.take_node_lookup(first, &config));
+        assert_eq!(registry.node_lookup_ips.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn node_lookup_rate_limit_keeps_offline_waiter_until_registration_and_releases_pending_quota()
+     {
+        let (addr, registry) = spawn_signal_server_with(SignalServerConfig {
+            node_lookups_per_connection: 2,
+            max_pending_lookups: 1,
+            ..SignalServerConfig::for_tests()
+        })
+        .await;
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let c = Identity::generate().node_id();
+        let mut ra = Raw::connect(addr).await;
+        ra.full_register(&a, vec![]).await;
+        for _ in 0..2 {
+            assert!(
+                matches!(node_lookup_reply(&mut ra, b.node_id()).await, SignalMessage::PeerPending {node_id} if node_id == b.node_id())
+            );
+        }
+        assert_eq!(registry.lock().await.waiter_entries(), 1);
+        assert!(
+            matches!(node_lookup_reply(&mut ra, c).await, SignalMessage::Error {reason} if reason == SHORT_LOOKUP_UNAVAILABLE)
+        );
+        assert_eq!(registry.lock().await.waiter_entries(), 1);
+        let mut rb = Raw::connect(addr).await;
+        rb.full_register(&b, vec![]).await;
+        assert!(
+            matches!(ra.recv().await, Some(SignalMessage::PeerCandidates {node_id, ..}) if node_id == b.node_id())
+        );
+        assert!(
+            matches!(rb.recv().await, Some(SignalMessage::PeerCandidates {node_id, ..}) if node_id == a.node_id())
+        );
+        let reg = registry.lock().await;
+        assert_eq!(reg.waiter_entries(), 0);
+        assert!(reg.pending_by_connection.is_empty());
+        drop(reg);
+        tokio::time::pause();
+        tokio::time::advance(NODE_LOOKUP_WINDOW).await;
+        tokio::time::resume();
+        assert!(
+            matches!(node_lookup_reply(&mut ra, c).await, SignalMessage::PeerPending {node_id} if node_id == c)
+        );
+        assert_eq!(registry.lock().await.waiter_entries(), 1);
+    }
+
+    #[tokio::test]
+    async fn relay_pairing_ticket_quota_does_not_starve_unrelated_real_node_lookups() {
+        let (addr, registry) = spawn_signal_server_with(SignalServerConfig::for_tests()).await;
+        let admission = crate::relay::server::Admission::new(Default::default()).unwrap();
+        registry.lock().await.relay = Some(admission.clone());
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let c = Identity::generate();
+        let d = Identity::generate();
+        let mut ra = Raw::connect(addr).await;
+        let mut rb = Raw::connect(addr).await;
+        let mut rc = Raw::connect(addr).await;
+        let mut rd = Raw::connect(addr).await;
+        for (raw, id) in [(&mut ra, &a), (&mut rb, &b), (&mut rc, &c), (&mut rd, &d)] {
+            raw.full_register(id, vec![]).await;
+        }
+        let quota = crate::relay::server::MAX_TICKETS_PER_PAIR;
+        for _ in 0..quota + 4 {
+            lookup_pair(&mut ra, a.node_id(), &mut rb, b.node_id()).await;
+        }
+        assert_eq!(admission.ticket_count(), quota);
+        lookup_pair(&mut rc, c.node_id(), &mut rd, d.node_id()).await;
+        assert_eq!(admission.ticket_count(), quota + 1);
     }
 
     #[test]

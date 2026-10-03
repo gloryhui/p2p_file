@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 #
 # 端到端验证：在一台机器上跑起「家里那台」和「本机」两个进程，
-# 用真实的信令服务器牵线、真实的 UDP 打洞、真实的 QUIC 隧道，
+# 用真实的信令服务器牵线、原生 IPv4/IPv6 直连或可选认证 UDP Relay、真实的 QUIC 隧道，
 # 验证「隧道端口转发」和「文件直推」两条路都能通。
 #
 # 用法：
 #   ./scripts/e2e.sh              # 用 target/debug
 #   ./scripts/e2e.sh --release    # 用 target/release
 #
-# 注意：两个进程用的是同一个 IP，所以打洞一定会命中局域网候选地址。
+# 注意：Direct fixture 的两个进程使用同一个 IP，可命中局域网候选地址；
+# Relay fixture 使用受控直连黑洞，UDP Relay 只转发设备间端到端加密的 QUIC datagram。
 # 这个脚本验证的是**整条链路的接线**（信令、令牌、打洞、QUIC、隧道分发、
 # 文件落盘校验），验证不了真实 NAT 穿透——那需要两台在不同网络里的机器。
 # NAT 穿透的关键逻辑由 src/nat/punch.rs 的单元测试覆盖（含地址相关映射场景）。
@@ -17,10 +18,12 @@ set -euo pipefail
 
 PROFILE="debug"
 NATIVE_FAMILY="ipv4-only"
+RELAY_MODE=false
 for option in "$@"; do
     case "$option" in
         --release) PROFILE="release" ;;
         --ipv6) NATIVE_FAMILY="ipv6-only" ;;
+        --relay) RELAY_MODE=true ;;
         *) echo "未知参数: $option" >&2; exit 1 ;;
     esac
 done
@@ -28,7 +31,11 @@ DIRECT_OPTIONS=(--ip-family "$NATIVE_FAMILY" --stun 127.0.0.1:9)
 if [[ "$NATIVE_FAMILY" == "ipv6-only" ]]; then
     DIRECT_OPTIONS=(--ip-family ipv6-only --stun '[::1]:9')
 fi
+if [[ "$RELAY_MODE" == true ]]; then
+    DIRECT_OPTIONS+=(--relay 127.0.0.1:7001 --advertise-only)
+fi
 advertise_address() {
+    if [[ "$RELAY_MODE" == true ]]; then set -- "$(( $1 + 1000 ))"; fi
     if [[ "$NATIVE_FAMILY" == "ipv6-only" ]]; then printf '[::1]:%s' "$1"; else printf '127.0.0.1:%s' "$1"; fi
 }
 
@@ -54,7 +61,7 @@ cleanup() {
 trap cleanup EXIT
 
 pass() { printf '  \033[32m✓\033[0m %s\n' "$1"; }
-fail() { printf '  \033[31m✗\033[0m %s\n' "$1"; exit 1; }
+fail() { for logfile in "$WORK"/*.log; do echo "$logfile"; tail -40 "$logfile"; done; printf '  \033[31m✗\033[0m %s\n' "$1"; exit 1; }
 step() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
 # 等日志里出现某段文字，最多等 N 秒。
@@ -91,7 +98,25 @@ python3 "$WORK/target.py" > "$WORK/target.log" 2>&1 &
 PIDS+=($!)
 pass "目标服务 127.0.0.1:9999"
 
-"$BIN" --log warn signal-server --listen 127.0.0.1:7000 --short-id-db "$WORK/device-ids.sqlite3" > "$WORK/signal.log" 2>&1 &
+RELAY_SERVER_OPTIONS=()
+if [[ "$RELAY_MODE" == true ]]; then
+    RELAY_SERVER_OPTIONS=(--relay-listen 127.0.0.1:7001)
+    # Held UDP ports deliberately never respond; candidates differ from real Quinn ports.
+    python3 -u - <<'PYBH' > "$WORK/blackholes.log" 2>&1 &
+import socket, time
+sockets = []
+for port in (10101, 10102, 10103, 10105, 10106):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", port))
+    sockets.append(s)
+print("blackholes ready", flush=True)
+while True:
+    time.sleep(60)
+PYBH
+    PIDS+=($!)
+    wait_for "$WORK/blackholes.log" 'blackholes ready' 5 || fail 'blackhole fixture failed'
+fi
+"$BIN" --log warn signal-server "${RELAY_SERVER_OPTIONS[@]}" --listen 127.0.0.1:7000 --short-id-db "$WORK/device-ids.sqlite3" > "$WORK/signal.log" 2>&1 &
 PIDS+=($!)
 sleep 1
 pass "信令服务器 127.0.0.1:7000"
@@ -137,7 +162,7 @@ else
 fi
 
 python3 - <<'PY' || fail "隧道转发数据不正确"
-import socket, os, sys
+import socket, os, sys, concurrent.futures
 def roundtrip(msg, port=2222):
     s = socket.create_connection(("127.0.0.1", port), timeout=30)
     s.sendall(msg)
@@ -154,6 +179,9 @@ assert roundtrip(b"hello") == b"hello", "小消息不对"
 assert roundtrip(b"second") == b"second", "第二条连接不对（多路复用）"
 blob = os.urandom(1_000_000)
 assert roundtrip(blob) == blob, "1MB 随机数据不对"
+with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+    results = list(pool.map(roundtrip, [blob] * 4))
+assert results == [blob] * 4, "并发连接串包"
 PY
 pass "隧道转发正确（含 1MB 随机数据、多条并发连接）"
 if [[ "$NATIVE_FAMILY" == "ipv6-only" ]]; then
@@ -162,6 +190,11 @@ else
     grep -qa 'family=IPv4' "$WORK/tunnel.log" || fail "实际已认证 winner 未报告 IPv4"
 fi
 pass "实际业务使用已认证的 $NATIVE_FAMILY winner"
+if [[ "$RELAY_MODE" == true ]]; then
+    grep -qa 'path_kind="relay"' "$WORK/tunnel.log" || fail 'blackhole fallback did not select relay'
+    grep -qa 'Relay UDP 已就绪' "$WORK/tunnel.log" || fail 'missing RelayReady diagnostic'
+    pass 'direct blackholes → authenticated Relay winner'
+fi
 
 step "2.25 纯网络测速（不读写文件、不经过文件协议）"
 RUST_LOG=info "$BIN" --key-file "$WORK/laptop.key" --log info speedtest \
@@ -233,7 +266,7 @@ pass "第二次连接同样成功（隔一段时间再连也能通）"
 printf '\n\033[32m%s 全部通过\033[0m\n' "$NATIVE_FAMILY"
 
 # The default invocation validates both native families. Public IPv6 is not required.
-if [[ "$NATIVE_FAMILY" == "ipv4-only" ]]; then
+if [[ "$NATIVE_FAMILY" == "ipv4-only" && "$RELAY_MODE" == false ]]; then
     cleanup
     PIDS=()
     if python3 - <<'PYV6'
@@ -254,4 +287,6 @@ PYV6
         probe_rc=$?
         [[ "$probe_rc" == 42 ]] || exit "$probe_rc"
     fi
+    # Third deterministic fixture: real pairing/admission/QUIC, all direct candidates blackholed.
+    if [[ "$PROFILE" == "release" ]]; then "$0" --relay --release; else "$0" --relay; fi
 fi
