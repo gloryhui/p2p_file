@@ -164,6 +164,11 @@ $BIN push --signal $SIGNAL --peer $HOME_ID ./大文件.mkv
 信令服务器需升级并持久保存 `--short-id-db` 数据库；CLI 长 NodeId 流程继续可用。
 协议、迁移与安全边界见 [远程访问认证](docs/REMOTE_AUTH.md)。
 
+设置页可启用「关闭窗口后后台运行」与「登录系统时启动」（默认关闭）。macOS 菜单栏
+图标实时显示核心状态，点击展开设备、信令、传输、测速与隧道状态面板；Windows/Linux
+提供托盘入口。后台保留同一会话，未完成文件重启后仍需手动继续。平台差异和登录项
+说明见 [后台运行](docs/DESKTOP_BACKGROUND.md)。
+
 
 ```bash
 cargo run --locked --features gui --bin p2p-desktop

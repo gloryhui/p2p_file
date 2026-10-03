@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const APP_DIR_NAME: &str = "p2p_file";
-const CONFIG_SCHEMA_VERSION: u32 = 5;
+const CONFIG_SCHEMA_VERSION: u32 = 6;
 static CONFIG_MUTATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const LEGACY_CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -99,6 +99,7 @@ impl SpeedtestDirection {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SettingsDraft {
+    pub background: super::background::BackgroundOptions,
     pub relay_server: Option<String>,
     pub signal_host: String,
     pub signal_port: String,
@@ -190,6 +191,7 @@ fn new_rule_id() -> String {
 impl SettingsDraft {
     pub fn defaults(downloads_dir: Option<PathBuf>) -> Self {
         Self {
+            background: Default::default(),
             relay_server: None,
             signal_host: String::new(),
             signal_port: String::new(),
@@ -212,6 +214,7 @@ impl SettingsDraft {
             direction => direction,
         };
         Self {
+            background: config.background,
             relay_server: config.relay_server,
             signal_host: config
                 .signal
@@ -253,6 +256,7 @@ impl SettingsDraft {
         }
 
         let config = DesktopConfig {
+            background: self.background,
             relay_server: self.relay_server.clone(),
             schema_version: CONFIG_SCHEMA_VERSION,
             signal: Some(SignalConfig {
@@ -277,6 +281,7 @@ impl SettingsDraft {
         let mut config = self.to_config()?;
         if let Some(saved) = DesktopConfig::load(path)? {
             // A settings draft predating a trust/password mutation must not undo it.
+            config.background = saved.background;
             config.trusted_devices = saved.trusted_devices;
             config.remote_auth = saved.remote_auth;
         }
@@ -323,6 +328,8 @@ impl DesktopConfig {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DesktopConfig {
+    #[serde(default)]
+    background: super::background::BackgroundOptions,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     relay_server: Option<String>,
     schema_version: u32,
@@ -371,6 +378,7 @@ impl DesktopConfig {
         let mut config = match Self::load(path)? {
             Some(config) => config,
             None => Self {
+                background: Default::default(),
                 relay_server: None,
                 schema_version: CONFIG_SCHEMA_VERSION,
                 signal: None,
@@ -385,6 +393,16 @@ impl DesktopConfig {
             },
         };
         config.remote_auth = Some(verifier);
+        config.write_atomic(path)
+    }
+    pub fn save_background_options(
+        path: &Path,
+        options: super::background::BackgroundOptions,
+    ) -> Result<(), ConfigError> {
+        let _guard = config_mutation_lock()?;
+        let mut config = Self::load(path)?
+            .ok_or_else(|| ConfigError::Invalid("请先完成本机身份初始化".into()))?;
+        config.background = options;
         config.write_atomic(path)
     }
     pub fn save_trusted_devices(
@@ -464,6 +482,7 @@ impl DesktopConfig {
                     return Err(ConfigError::Corrupt("旧配置版本字段不一致".into()));
                 }
                 Self {
+                    background: Default::default(),
                     relay_server: None,
                     schema_version: CONFIG_SCHEMA_VERSION,
                     signal: Some(legacy.signal),
@@ -477,7 +496,7 @@ impl DesktopConfig {
                     trusted_devices: Vec::new(),
                 }
             }
-            2 | 3 | 4 | CONFIG_SCHEMA_VERSION => {
+            2 | 3 | 4 | 5 | CONFIG_SCHEMA_VERSION => {
                 let mut config = serde_json::from_slice::<Self>(&bytes)
                     .map_err(|error| ConfigError::Corrupt(error.to_string()))?;
                 if version < 4 && (config.signal.is_none() || config.receive_directory.is_none()) {
@@ -486,6 +505,11 @@ impl DesktopConfig {
                 if version < 5 && !config.trusted_devices.is_empty() {
                     return Err(ConfigError::Corrupt(
                         "旧配置版本不能声明可信设备授权".into(),
+                    ));
+                }
+                if version < 6 && config.background != Default::default() {
+                    return Err(ConfigError::Corrupt(
+                        "旧配置版本不能启用后台运行或登录启动".into(),
                     ));
                 }
                 // v2 had target-only grants. Preserve rows, but require explicit peer authorization.
@@ -939,6 +963,7 @@ mod tests {
 
     fn valid_draft(receive_directory: PathBuf) -> SettingsDraft {
         SettingsDraft {
+            background: Default::default(),
             relay_server: None,
             signal_host: "relay.example.test".into(),
             signal_port: "7000".into(),
@@ -998,7 +1023,7 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
         let migrated = DesktopConfig::load(&path).unwrap().unwrap();
         assert!(migrated.remote_auth.is_none());
-        assert_eq!(migrated.schema_version, 5);
+        assert_eq!(migrated.schema_version, CONFIG_SCHEMA_VERSION);
         fs::write(&path, b"corrupt").unwrap();
         assert!(DesktopConfig::save_remote_auth(&path, verifier).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"corrupt");
@@ -1016,6 +1041,7 @@ mod tests {
             SpeedtestDirection::Upload
         );
         let upgraded = SettingsDraft::from_config(DesktopConfig {
+            background: Default::default(),
             relay_server: None,
             schema_version: CONFIG_SCHEMA_VERSION,
             signal: Some(SignalConfig {
@@ -1693,11 +1719,56 @@ mod tests {
             value.as_object_mut().unwrap().remove("trusted_devices");
             fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
             let saved = DesktopConfig::load(&path).unwrap().unwrap();
-            assert_eq!(saved.schema_version, 5);
+            assert_eq!(saved.schema_version, CONFIG_SCHEMA_VERSION);
             assert!(saved.trusted_devices.is_empty());
             assert_eq!(saved.remote_auth, draft.remote_auth);
             assert_eq!(saved.signal.unwrap().host, draft.signal_host);
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn background_migration_is_opt_in_and_stale_drafts_preserve_login_and_security() {
+        use super::super::background::BackgroundOptions;
+        let root = temp_dir("background-migration");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("settings.json");
+        let mut draft = valid_draft(root.clone());
+        draft.remote_auth = Some(
+            super::super::remote_auth::RemoteVerifier::create(
+                &super::super::remote_auth::SecretPassword::new("A9b8C7".into()).unwrap(),
+            )
+            .unwrap(),
+        );
+        draft.trusted_devices = vec![super::super::trusted_devices::TrustedDevice::new(
+            crate::identity::Identity::generate().node_id(),
+            "kept".into(),
+            None,
+        )];
+        let baseline = draft.to_config().unwrap();
+        let mut old = serde_json::to_value(&baseline).unwrap();
+        old["schema_version"] = 5.into();
+        old.as_object_mut().unwrap().remove("background");
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        let migrated = DesktopConfig::load(&path).unwrap().unwrap();
+        assert_eq!(migrated.background, BackgroundOptions::default());
+        assert_eq!(migrated.remote_auth, baseline.remote_auth);
+        assert_eq!(migrated.trusted_devices, baseline.trusted_devices);
+        let enabled = BackgroundOptions {
+            close_to_tray: true,
+            launch_at_login: true,
+        };
+        DesktopConfig::save_background_options(&path, enabled).unwrap();
+        draft.save_atomic(&path).unwrap(); // Draft predates the dedicated preference mutation.
+        let saved = DesktopConfig::load(&path).unwrap().unwrap();
+        assert_eq!(saved.background, enabled);
+        assert_eq!(saved.remote_auth, baseline.remote_auth);
+        assert_eq!(saved.trusted_devices, baseline.trusted_devices);
+        old["background"] = serde_json::to_value(enabled).unwrap();
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        assert!(DesktopConfig::load(&path).is_err());
+        let corrupt = fs::read(&path).unwrap();
+        assert!(DesktopConfig::save_background_options(&path, enabled).is_err());
+        assert_eq!(fs::read(&path).unwrap(), corrupt);
         fs::remove_dir_all(root).unwrap();
     }
 }

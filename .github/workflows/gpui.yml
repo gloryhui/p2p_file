@@ -25,6 +25,7 @@ jobs:
               libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev
               libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev
               libxkbcommon-dev libxkbcommon-x11-dev
+              xvfb openbox xdotool x11-utils python3-dbus python3-gi mesa-vulkan-drivers
           - os: windows-2022
             target: x86_64-pc-windows-msvc
             executable: p2p-desktop.exe
@@ -52,6 +53,12 @@ jobs:
         run: cargo check --locked --features gui --bin p2p-desktop --target ${{ matrix.target }}
       - name: Build native desktop shell
         run: cargo build --locked --features gui --bin p2p-desktop --target ${{ matrix.target }}
+      - name: Verify native X11 background lifetime with isolated SNI host
+        if: runner.os == 'Linux'
+        run: >-
+          dbus-run-session -- /usr/bin/python3 scripts/desktop-background-smoke.py
+          --binary target/${{ matrix.target }}/debug/p2p-desktop
+          --output "${{ runner.temp }}/p2p-background-smoke"
       - name: Configure macOS loopback alias for RFC 5780 fixtures
         if: runner.os == 'macOS'
         run: sudo ifconfig lo0 alias 127.0.0.2 up
