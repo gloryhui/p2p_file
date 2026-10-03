@@ -783,6 +783,37 @@ impl TransferService {
         self.changed.send_modify(|v| *v = v.wrapping_add(1));
         *self.receive_root.lock().unwrap() = root;
     }
+    pub async fn select_paths(&self, peer: NodeId, paths: Vec<PathBuf>) -> Result<Vec<TaskId>> {
+        let generation = self.epoch.load(std::sync::atomic::Ordering::Acquire);
+        let selections = blocking(move || super::drop_send::classify(paths)).await?;
+        let mut ids = Vec::new();
+        for selection in selections {
+            if generation != self.epoch.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(disk::failure(
+                    "拖拽扫描期间网络会话已重建；已加入项保留，请重新检查任务列表",
+                ));
+            }
+            let result = match selection {
+                super::drop_send::Selection::File(path) => {
+                    self.select_file(peer, path).await.map(|id| vec![id])
+                }
+                super::drop_send::Selection::Directory(path) => {
+                    self.select_directory(peer, path).await
+                }
+            };
+            match result {
+                Ok(selected) => ids.extend(selected),
+                Err(error) if ids.is_empty() => return Err(error),
+                Err(error) => {
+                    return Err(disk::failure(&format!(
+                        "拖拽批次未全部加入，已加入 {} 个任务并保留；其余项需重新提交：{error}",
+                        ids.len()
+                    )));
+                }
+            }
+        }
+        Ok(ids)
+    }
     pub async fn select_file(&self, peer: NodeId, source: PathBuf) -> Result<TaskId> {
         let _selection_activity = self.activity.file(peer)?;
         struct CancelScan(super::files::ScanCancellation);
@@ -2853,6 +2884,67 @@ mod tests {
             *self.b.first_chunk_gate.lock().unwrap() = Some((reached_tx, release_rx));
             (reached, release)
         }
+    }
+    #[tokio::test]
+    async fn drop_batch_preflight_failure_and_epoch_change_cannot_admit_remaining_paths() {
+        let pair = Pair::new().await;
+        let file = pair.root.join("first.bin");
+        fs::write(&file, b"selected file").unwrap();
+        let directory = pair.root.join("directory");
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("child.bin"), b"child").unwrap();
+        assert!(
+            pair.a
+                .select_paths(pair.ib, vec![file.clone(), pair.root.join("missing")])
+                .await
+                .is_err()
+        );
+        assert!(pair.a.snapshot().await.unwrap().is_empty());
+        let (reached_tx, reached) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        *pair.a.admission_gate.lock().unwrap() = Some((reached_tx, release_rx));
+        let service = pair.a.clone();
+        let peer = pair.ib;
+        let selection =
+            tokio::spawn(async move { service.select_paths(peer, vec![file, directory]).await });
+        reached.await.unwrap();
+        pair.a.interrupt_all().await.unwrap();
+        release.send(()).unwrap();
+        assert!(
+            selection
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("网络会话已重建")
+        );
+        let records = pair.a.snapshot().await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].state(), TaskState::Interrupted);
+        assert_eq!(pair.a.queue_metrics().pending, 0);
+        assert!(pair.b.snapshot().await.unwrap().is_empty());
+        pair.shutdown().await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drop_batch_directory_scan_failure_keeps_previously_admitted_tasks_visible() {
+        let pair = Pair::new().await;
+        let first = pair.root.join("first.bin");
+        fs::write(&first, b"first").unwrap();
+        let directory = pair.root.join("invalid-directory");
+        fs::create_dir(&directory).unwrap();
+        std::os::unix::fs::symlink(&first, directory.join("link.bin")).unwrap();
+        let error = pair
+            .a
+            .select_paths(pair.ib, vec![first, directory])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("已加入 1 个任务并保留"));
+        let records = pair.a.snapshot().await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].state(), TaskState::Queued);
+        assert_eq!(pair.a.queue_metrics().pending, 1);
+        pair.shutdown().await;
     }
     #[tokio::test]
     async fn receive_space_precheck_reports_refusal_and_manual_retry_preserves_task() {
