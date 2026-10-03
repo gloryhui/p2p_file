@@ -17,7 +17,7 @@ Intel Mac 的本机诊断与构建入口，复用共享打包器、边界测试�
 ./packaging/macos-x86_64/build.sh --app-only --output "$HOME/p2p-file-builds/intel app"
 ```
 
-需要 Xcode Command Line Tools、有效 macOS SDK、Git、rustup、rustc/Cargo >=1.85.0、
+需要 Xcode Command Line Tools、有效 macOS SDK、Git、rustup、rustc/Cargo >=1.90.0、
 Python >=3.11（含 tomllib）和 `x86_64-apple-darwin` target。doctor 只检查并给出修复
 命令，不自动安装软件；缺少 target 时执行 `rustup target add x86_64-apple-darwin`。
 

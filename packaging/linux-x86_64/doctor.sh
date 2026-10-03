@@ -60,9 +60,9 @@ rust_version_at_least_minimum() {
         return 0
     elif (( 10#$major < 1 )); then
         return 1
-    elif (( 10#$minor > 85 )); then
+    elif (( 10#$minor > 90 )); then
         return 0
-    elif (( 10#$minor < 85 )); then
+    elif (( 10#$minor < 90 )); then
         return 1
     fi
     (( 10#$patch >= 0 ))
@@ -72,24 +72,24 @@ check_rust_version() {
     local name=$1 path output version remediation
     remediation="Run: rustup update stable"
     if ! path=$(command -v "$name" 2>/dev/null); then
-        report FAIL "$name version" "not found" ">= 1.85.0" "Install Rust with rustup, then run: $remediation"
+        report FAIL "$name version" "not found" ">= 1.90.0" "Install Rust with rustup, then run: $remediation"
         return
     fi
 
     if ! output=$("$path" --version 2>&1); then
-        report FAIL "$name version" "$path (version command failed: ${output%%$'\n'*})" ">= 1.85.0" "$remediation"
+        report FAIL "$name version" "$path (version command failed: ${output%%$'\n'*})" ">= 1.90.0" "$remediation"
         return
     fi
     output=${output%%$'\n'*}
     if ! version=$(extract_rust_version "$name" "$output"); then
-        report FAIL "$name version" "$path (unrecognized version output: $output)" ">= 1.85.0" "$remediation"
+        report FAIL "$name version" "$path (unrecognized version output: $output)" ">= 1.90.0" "$remediation"
         return
     fi
 
     if rust_version_at_least_minimum "$version"; then
-        report PASS "$name version" "$path ($version)" ">= 1.85.0" "none"
+        report PASS "$name version" "$path ($version)" ">= 1.90.0" "none"
     else
-        report FAIL "$name version" "$path ($version)" ">= 1.85.0" "$remediation"
+        report FAIL "$name version" "$path ($version)" ">= 1.90.0" "$remediation"
     fi
 }
 
