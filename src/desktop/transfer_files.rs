@@ -405,8 +405,23 @@ pub fn publish(
 ) -> Result<PathBuf> {
     super::publish::file(store, record, download)
 }
+pub fn cleanup_skipped_staging(record: &TaskRecord) -> Result<()> {
+    let existing = (|| {
+        let root = super::secure_fs::root(record.local_path())?;
+        let internal = super::secure_fs::child(&root, ".p2p-desktop", false)?;
+        let peer = super::secure_fs::child(&internal, record.peer_id().as_str(), false)?;
+        super::secure_fs::child(&peer, record.task_id().as_str(), false)
+    })();
+    match existing {
+        Ok(dir) => cleanup_directory(record, dir),
+        Err(Error::Io(e)) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
 pub fn cleanup_staging(record: &TaskRecord) -> Result<()> {
-    let dir = stage_capability(record)?;
+    cleanup_directory(record, stage_capability(record)?)
+}
+fn cleanup_directory(record: &TaskRecord, dir: cap_std::fs::Dir) -> Result<()> {
     let manifest = &record
         .file_details()
         .ok_or_else(|| failure("缺少文件任务绑定"))?

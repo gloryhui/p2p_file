@@ -138,6 +138,8 @@ pub(super) struct Detail {
     pub state: &'static str,
     pub total: u64,
     pub confirmed: u64,
+    pub skipped_files: usize,
+    pub saved_bytes: u64,
     pub rate: f64,
     pub eta: Option<u64>,
     pub wall_seconds: Option<u64>,
@@ -421,6 +423,15 @@ pub(super) fn project(
         state,
         total,
         confirmed,
+        skipped_files: selected
+            .iter()
+            .filter(|r| r.file_details().is_some_and(|d| d.skipped_existing))
+            .count(),
+        saved_bytes: selected
+            .iter()
+            .filter_map(|r| r.file_details().filter(|d| d.skipped_existing))
+            .map(|d| d.manifest.total_len)
+            .sum(),
         rate: speed,
         eta: eta(total.saturating_sub(confirmed), speed, blocked),
         wall_seconds,

@@ -20,6 +20,7 @@ mod drop_send;
 mod e2e;
 mod files;
 mod frame_budget;
+mod incremental;
 pub(in crate::desktop) mod instance_lock;
 mod network_state;
 mod notifications;
@@ -1008,6 +1009,8 @@ struct DesktopShell {
     selected_files: Vec<PathBuf>,
     native_dialogs: usize,
     selected_folder: Option<PathBuf>,
+    directory_preview: Option<incremental::Preview>,
+    directory_preview_request: Option<task_model::TaskId>,
     settings: SettingsDraft,
     identity_id: Option<String>,
     identity: Option<Identity>,
@@ -1925,6 +1928,7 @@ impl DesktopShell {
         card = card.child(div().text_xs().text_color(rgb(ui_theme::TEXT_SECONDARY)).child(detail.scope_label))
             .child(Self::detail_field("任务名称", detail.name.clone()))
             .child(Self::detail_field("设备 / 方向 / 状态", format!("{} · {direction} · {}", detail.peer.short(), detail.state)))
+            .child(Self::detail_field("增量节省", format!("已跳过 {} 个相同文件 · {}", detail.skipped_files, format_bytes(detail.saved_bytes))))
             .child(Self::detail_field("已确认 / 总大小", format!("{} / {}（{} / {} 字节）", format_bytes(detail.confirmed), format_bytes(detail.total), detail.confirmed, detail.total)))
             .child(Self::detail_field("当前文件速度", if detail.rate > 0. { format!("{:.2} MiB/s", detail.rate / 1_048_576.) } else { "未知 / 无活动文件速度".into() }))
             .child(Self::detail_field("数据预计剩余", detail.eta.map_or_else(|| "未知".into(), task_details::duration)))
@@ -2725,6 +2729,8 @@ impl DesktopShell {
         config.tunnel_rules = self.settings.tunnel_rules.clone();
         match session::spawn(identity, config) {
             Ok((handle, mut session_events)) => {
+                self.directory_preview = None;
+                self.directory_preview_request = None;
                 self.network_epoch = self.network_epoch.wrapping_add(1);
                 let network_epoch = self.network_epoch;
                 self.peer_generations.clear();
@@ -2849,6 +2855,18 @@ impl DesktopShell {
                                             format!("信令在线；已登记本机身份 {}", peer.short());
                                         shell.network_status = label.clone().into();
                                         shell.set_status(label, cx);
+                                    }
+                                    session::SessionEvent::DirectoryPreview(preview) => {
+                                        if shell.directory_preview_request.as_ref() != Some(&preview.id) {
+                                            if let Some(session) = &shell.network_session { let _ = session.cancel_directory_preview(preview.id); }
+                                            return;
+                                        }
+                                        shell.directory_preview_request = None;
+                                        shell.directory_preview = Some(preview);
+                                        shell.set_status("目录差异预览已就绪；确认后开始发送", cx);
+                                    }
+                                    session::SessionEvent::DirectoryPreviewFailed(request) => {
+                                        if shell.directory_preview_request.as_ref() == Some(&request) { shell.directory_preview_request = None; cx.notify(); }
                                     }
                                     session::SessionEvent::SelectionQueued {peer,count}=>{shell.set_status(format!("扫描已完成，{count} 项已入队，绑定对端 {}",peer.to_hex()),cx);}
                                     session::SessionEvent::SpeedRequestEnded {peer}=>{if shell.speed_peer==Some(peer){shell.speed_request_until=None;}cx.notify();}
@@ -3500,6 +3518,13 @@ impl DesktopShell {
         self.pick_folder(cx);
     }
     fn pick_folder(&mut self, cx: &mut Context<Self>) {
+        self.pick_folder_mode(false, cx);
+    }
+    fn pick_folder_mode(&mut self, incremental: bool, cx: &mut Context<Self>) {
+        if incremental && self.directory_preview_request.is_some() {
+            self.set_status("目录预览正在计算，请稍候", cx);
+            return;
+        }
         if self.native_dialogs > 0 {
             self.set_status("请先关闭当前文件对话框", cx);
             return;
@@ -3543,17 +3568,36 @@ impl DesktopShell {
                                         .as_ref()
                                         .ok_or("网络会话已关闭".to_owned())
                                         .and_then(|session| {
-                                            session.send_directory(peer, path.clone())
+                                            if incremental {
+                                                session
+                                                    .preview_directory(peer, path.clone())
+                                                    .map(Some)
+                                            } else {
+                                                session
+                                                    .send_directory(peer, path.clone())
+                                                    .map(|_| None)
+                                            }
                                         });
                                     shell.selected_folder = Some(path.clone());
                                     match result {
-                                        Ok(()) => shell.set_status(
+                                        Ok(request) => {
+                                            if incremental {
+                                                if let Some(old) = shell.directory_preview.take()
+                                                    && let Some(session) = &shell.network_session
+                                                {
+                                                    let _ =
+                                                        session.cancel_directory_preview(old.id);
+                                                }
+                                                shell.directory_preview_request = request;
+                                            }
+                                            shell.set_status(
                                             format!(
                                                 "正在后台扫描目录 {path_text}；发送对象 {} 已固定",
                                                 peer.to_hex()
                                             ),
                                             cx,
-                                        ),
+                                        )
+                                        }
                                         Err(e) => shell.set_status(e, cx),
                                     }
                                 } else {
@@ -3574,6 +3618,67 @@ impl DesktopShell {
                 .ok();
         })
         .detach();
+    }
+
+    fn directory_preview_card(&self, cx: &mut Context<Self>) -> gpui::Div {
+        if let Some(request) = &self.directory_preview_request {
+            let request = request.clone();
+            return div()
+                .p_3()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .text_sm()
+                        .child("正在扫描并比较目录；确认前不会发送文件"),
+                )
+                .child(
+                    ui_components::compact_secondary_button("取消预览", true).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |shell, _, _, cx| {
+                            let result = shell
+                                .network_session
+                                .as_ref()
+                                .ok_or_else(|| "网络会话已关闭".to_owned())
+                                .and_then(|session| {
+                                    session.cancel_directory_preview(request.clone())
+                                });
+                            match result {
+                                Ok(()) => {
+                                    shell.directory_preview_request = None;
+                                    shell.set_status("已取消目录预览，未创建发送任务", cx);
+                                }
+                                Err(e) => shell.set_status(e, cx),
+                            }
+                        }),
+                    ),
+                );
+        }
+        let Some(preview) = &self.directory_preview else {
+            return div();
+        };
+        let peer = preview.peer;
+        let id = preview.id.clone();
+        let cancel = preview.id.clone();
+        div().p_3().flex().flex_col().gap_2().border_1().border_color(rgb(ui_theme::BORDER))
+            .child(div().text_sm().child("目录增量发送预览"))
+            .child(div().text_xs().child(format!("源目录：{}", preview.source.display())))
+            .child(div().text_xs().child(format!("固定对端：{}", peer.to_hex())))
+            .child(div().text_xs().child(if preview.supported {
+                format!("新增 {} · 修改 {} · 未变化 {} · 目录 {}", preview.added, preview.changed, preview.unchanged, preview.directories)
+            } else { format!("对端不支持增量比较：{} 个文件将全量发送 · 目录 {}", preview.added, preview.directories) }))
+            .child(div().text_xs().child(format!("预计传输 {} · 预计节省 {}", format_bytes(preview.transfer_bytes), format_bytes(preview.saved_bytes))))
+            .child(div().text_xs().text_color(rgb(ui_theme::TEXT_MUTED)).child("预览有效期 5 分钟；发送时再次校验，实际结果可能变化。修改文件保留旧备份，多余文件保留。"))
+            .child(div().flex().gap_2()
+                .child(ui_components::compact_secondary_button("确认发送", true).on_mouse_up(MouseButton::Left, cx.listener(move |shell, _, _, cx| {
+                    let result = shell.network_session.as_ref().ok_or_else(|| "网络会话已关闭".to_owned()).and_then(|session| session.confirm_directory(peer, id.clone()));
+                    match result { Ok(()) => { shell.directory_preview = None; shell.set_status("目录已确认，正在加入发送队列", cx); }, Err(e) => shell.set_status(e, cx) }
+                })))
+                .child(ui_components::compact_secondary_button("取消", true).on_mouse_up(MouseButton::Left, cx.listener(move |shell, _, _, cx| {
+                    let result = shell.network_session.as_ref().ok_or_else(|| "网络会话已关闭".to_owned()).and_then(|session| session.cancel_directory_preview(cancel.clone()));
+                    match result { Ok(()) => { shell.directory_preview = None; shell.set_status("已取消目录预览，未创建发送任务", cx); }, Err(e) => shell.set_status(e, cx) }
+                }))))
     }
 
     fn choose_receive_directory(
@@ -4590,6 +4695,16 @@ impl DesktopShell {
             .child(
                 ui_components::compact_secondary_button("选择目录", enabled)
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::choose_folder)),
+            )
+            .child(
+                ui_components::compact_secondary_button(
+                    "增量发送目录",
+                    enabled && self.directory_preview_request.is_none(),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|shell, _, _, cx| shell.pick_folder_mode(true, cx)),
+                ),
             );
         let drop_hint = if self.drop_admission(cx).allowed() {
             "可拖入文件和目录 · 每批最多 128 项"
@@ -5868,9 +5983,16 @@ impl Render for DesktopShell {
             .child(self.connection_receive_row(window, cx))
             .when_some(speed_card, |page, speed_card| page.child(speed_card))
             .child(self.transfer_card(window, cx).when(
-                self.show_diagnostics || self.detail_selection.is_some(),
+                self.show_diagnostics
+                    || self.detail_selection.is_some()
+                    || self.directory_preview.is_some()
+                    || self.directory_preview_request.is_some(),
                 |card| card.min_h(px(320.)).flex_shrink_0(),
             ))
+            .when(
+                self.directory_preview.is_some() || self.directory_preview_request.is_some(),
+                |page| page.child(self.directory_preview_card(cx)),
+            )
             .when(self.detail_selection.is_some(), |page| {
                 page.child(self.task_details_card(cx))
             })
@@ -6169,6 +6291,8 @@ pub fn run(background_start: bool) {
                         selected_files: Vec::new(),
                         native_dialogs: 0,
                         selected_folder: None,
+                        directory_preview: None,
+                        directory_preview_request: None,
                         settings,
                         identity_id,
                         identity,

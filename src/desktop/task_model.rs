@@ -401,6 +401,10 @@ impl ProgressHint {
     }
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Local durable binding for one selected file. Never serialized as a wire frame.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -411,6 +415,10 @@ pub struct FileTaskDetails {
     pub receipt_committed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub incremental: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub skipped_existing: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -533,6 +541,8 @@ impl TaskRecord {
             publish_prepared: false,
             receipt_committed: false,
             source_root: None,
+            incremental: false,
+            skipped_existing: false,
         });
         record.validate()?;
         Ok(record)
@@ -630,7 +640,10 @@ impl TaskRecord {
     }
     pub(crate) fn commit_receipt(&mut self, now: i64) -> Result<(), TaskModelError> {
         let (prepared, receipt) = if let Some(details) = &mut self.file_details {
-            (details.publish_prepared, &mut details.receipt_committed)
+            (
+                details.publish_prepared || details.skipped_existing,
+                &mut details.receipt_committed,
+            )
         } else if let Some(details) = &mut self.directory_details {
             (details.publish_prepared, &mut details.receipt_committed)
         } else {
@@ -641,6 +654,28 @@ impl TaskRecord {
         }
         *receipt = true;
         self.transition_to(TaskState::Completed, None, now)
+    }
+
+    pub(crate) fn enable_incremental(&mut self) -> Result<(), TaskModelError> {
+        if self.group_id().is_none()
+            || self.file_details.is_none()
+            || self.state == TaskState::Completed
+        {
+            return Err(TaskModelError::NotRecoverable);
+        }
+        self.file_details.as_mut().unwrap().incremental = true;
+        Ok(())
+    }
+    pub(crate) fn commit_skipped(&mut self, now: i64) -> Result<(), TaskModelError> {
+        let details = self
+            .file_details
+            .as_mut()
+            .ok_or(TaskModelError::NotRecoverable)?;
+        if !details.incremental || details.publish_prepared || self.state != TaskState::Finalizing {
+            return Err(TaskModelError::NotRecoverable);
+        }
+        details.skipped_existing = true;
+        self.commit_receipt(now)
     }
 
     pub fn task_id(&self) -> &TaskId {
@@ -709,7 +744,13 @@ impl TaskRecord {
                 || (self.direction == TaskDirection::Send && details.publish_prepared)
                 || (self.direction == TaskDirection::Receive
                     && details.receipt_committed
-                    && !details.publish_prepared)
+                    && !details.publish_prepared
+                    && !details.skipped_existing)
+                || (details.incremental && self.group_id.is_none())
+                || (details.skipped_existing
+                    && (!details.incremental
+                        || !details.receipt_committed
+                        || details.publish_prepared))
             {
                 return Err(TaskModelError::InvalidManifestIdentity);
             }
@@ -879,6 +920,34 @@ mod tests {
         {
             PathBuf::from(format!("/{relative}"))
         }
+    }
+
+    #[test]
+    fn incremental_fields_default_for_legacy_records_and_reject_unbound_skip() {
+        let record = TaskRecord::new_file(
+            TaskId::generate(),
+            peer(),
+            TaskDirection::Send,
+            test_path("source/empty.txt"),
+            "empty.txt".into(),
+            FileManifest::new(
+                "empty.txt",
+                0,
+                crate::protocol::manifest::MIN_CHUNK_SIZE,
+                vec![],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut value = serde_json::to_value(&record).unwrap();
+        assert!(value["file_details"].get("incremental").is_none());
+        assert!(value["file_details"].get("skipped_existing").is_none());
+        let decoded: TaskRecord = serde_json::from_value(value.clone()).unwrap();
+        decoded.validate().unwrap();
+        assert!(!decoded.file_details().unwrap().incremental);
+        value["file_details"]["skipped_existing"] = true.into();
+        let decoded: TaskRecord = serde_json::from_value(value).unwrap();
+        assert!(decoded.validate().is_err());
     }
 
     #[test]

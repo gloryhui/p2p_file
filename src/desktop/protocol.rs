@@ -28,6 +28,7 @@ pub const CAP_REMOTE_AUTH: u64 = 256;
 pub const CAP_TRUSTED_DEVICE_AUTH: u64 = 1 << 9;
 pub const CAP_FILE_FLOW: u64 = 1 << 10;
 pub const CAP_AUTO_RESUME: u64 = 1 << 11;
+pub const CAP_INCREMENTAL_DIRECTORY: u64 = 1 << 12;
 pub const REQUIRED_CAPABILITIES: u64 =
     15 | CAP_FILE_TRANSFER | CAP_DIRECTORY_TRANSFER | CAP_SPEED_EXECUTION;
 pub const LOCAL_CAPABILITIES: u64 = REQUIRED_CAPABILITIES
@@ -35,7 +36,8 @@ pub const LOCAL_CAPABILITIES: u64 = REQUIRED_CAPABILITIES
     | CAP_REMOTE_AUTH
     | CAP_TRUSTED_DEVICE_AUTH
     | CAP_FILE_FLOW
-    | CAP_AUTO_RESUME;
+    | CAP_AUTO_RESUME
+    | CAP_INCREMENTAL_DIRECTORY;
 pub const MAX_FRAME_BYTES: u32 = 4 * 1024 * 1024;
 pub const MAX_CHUNKS: usize = 65_536;
 pub const MAX_TASKS_PER_PEER: usize = 128;
@@ -204,6 +206,30 @@ pub enum Message {
     AutomaticResumeTask {
         task_id: TaskId,
     },
+    CompareFile {
+        task_id: TaskId,
+        relative_path: String,
+        manifest: Box<FileManifest>,
+    },
+    ComparedFile {
+        task_id: TaskId,
+        root_hash: ChunkHash,
+        difference: Difference,
+    },
+    IncrementalOffer {
+        task_id: TaskId,
+        group_id: TaskId,
+        relative_path: String,
+        entry: Entry,
+        automatic: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum Difference {
+    Added,
+    Changed,
+    Unchanged,
 }
 
 impl Message {
@@ -247,7 +273,10 @@ impl Message {
         match self {
             Self::Hello { .. } | Self::Ready | Self::TunnelReady | Self::TunnelOpen { .. } => None,
             Self::Speed(control) => Some(control.test_id()),
-            Self::AutomaticOffer { task_id, .. }
+            Self::CompareFile { task_id, .. }
+            | Self::ComparedFile { task_id, .. }
+            | Self::IncrementalOffer { task_id, .. }
+            | Self::AutomaticOffer { task_id, .. }
             | Self::AutomaticResumeTask { task_id }
             | Self::Offer { task_id, .. }
             | Self::Resume { task_id, .. }
@@ -276,6 +305,19 @@ impl Message {
                 entry,
                 ..
             } => entry.validate(relative_path),
+            Self::IncrementalOffer {
+                relative_path,
+                entry,
+                ..
+            } => match entry {
+                Entry::File(_) => entry.validate(relative_path),
+                _ => Err(invalid("增量请求必须为目录内文件")),
+            },
+            Self::CompareFile {
+                relative_path,
+                manifest,
+                ..
+            } => Entry::File(manifest.clone()).validate(relative_path),
             Self::Speed(control) => control.validate(),
             Self::Chunk { data, .. } if data.len() > 1024 * 1024 => {
                 Err(invalid("桌面数据分片超限"))
@@ -285,7 +327,7 @@ impl Message {
             }
             Self::Completed {
                 receipt_version, ..
-            } if *receipt_version != 1 => Err(invalid("不支持的完成回执版本")),
+            } if !matches!(*receipt_version, 1 | 2) => Err(invalid("不支持的完成回执版本")),
             Self::TunnelOpen { target }
                 if target.port() == 0
                     || target.ip().is_unspecified()
@@ -452,6 +494,7 @@ pub enum WireTaskState {
 
 #[derive(Clone, Debug)]
 struct Binding {
+    incremental: bool,
     sender: Actor,
     root: ChunkHash,
     chunks: usize,
@@ -505,6 +548,7 @@ impl TaskProtocol {
         self.tasks.insert(
             task,
             Binding {
+                incremental: false,
                 sender,
                 root,
                 chunks,
@@ -541,6 +585,29 @@ impl TaskProtocol {
             return Err(invalid("桌面任务对端身份不符"));
         }
         frame.validate()?;
+        let incremental = matches!(frame.message, Message::IncrementalOffer { .. });
+        let normalized;
+        let frame = if let Message::IncrementalOffer {
+            task_id,
+            group_id,
+            relative_path,
+            entry,
+            ..
+        } = &frame.message
+        {
+            normalized = Frame {
+                request_id: frame.request_id,
+                message: Message::Offer {
+                    task_id: task_id.clone(),
+                    group_id: Some(group_id.clone()),
+                    relative_path: relative_path.clone(),
+                    entry: entry.clone(),
+                },
+            };
+            &normalized
+        } else {
+            frame
+        };
         let task = frame
             .message
             .task_id()
@@ -563,6 +630,7 @@ impl TaskProtocol {
             self.tasks.insert(
                 task.clone(),
                 Binding {
+                    incremental,
                     sender: actor,
                     root,
                     chunks,
@@ -630,7 +698,7 @@ impl TaskProtocol {
                     || !matches!(
                         binding.state,
                         WireTaskState::Transferring | WireTaskState::Pausing
-                    )
+                    ) && !(binding.incremental && binding.state == WireTaskState::Offered)
                 {
                     return Err(invalid("限速保活任务状态不符"));
                 }
@@ -667,8 +735,13 @@ impl TaskProtocol {
                 }
                 binding.state = WireTaskState::ResumeRequested;
             }
-            Message::Completed { root_hash, .. } => {
-                if actor == binding.sender
+            Message::Completed {
+                root_hash,
+                receipt_version,
+                ..
+            } => {
+                if (*receipt_version == 2 && !binding.incremental)
+                    || actor == binding.sender
                     || binding.root != *root_hash
                     || !matches!(
                         binding.state,
@@ -921,6 +994,66 @@ mod tests {
             },
         }
     }
+    #[test]
+    fn incremental_receipt_and_comparison_keepalive_require_offer_opt_in() {
+        let peer = Identity::generate().node_id();
+        let normal = offer(task());
+        let Message::Offer {
+            task_id,
+            relative_path,
+            entry,
+            ..
+        } = normal.message.clone()
+        else {
+            unreachable!()
+        };
+        let root_hash = entry.identity(&relative_path).0;
+        let incremental = Frame {
+            request_id: 1,
+            message: Message::IncrementalOffer {
+                task_id: task_id.clone(),
+                group_id: TaskId::generate(),
+                relative_path,
+                entry,
+                automatic: false,
+            },
+        };
+        assert_eq!(
+            Frame::decode(&incremental.encode().unwrap()).unwrap(),
+            incremental
+        );
+        let wait = Frame {
+            request_id: 1,
+            message: Message::FlowWait {
+                task_id: task_id.clone(),
+            },
+        };
+        let mut gate = TaskProtocol::new(peer);
+        gate.observe(peer, Actor::Local, &normal).unwrap();
+        assert!(gate.observe(peer, Actor::Remote, &wait).is_err());
+        let mut receipt = Frame {
+            request_id: 1,
+            message: Message::Completed {
+                task_id,
+                root_hash,
+                receipt_version: 2,
+            },
+        };
+        assert!(gate.observe(peer, Actor::Remote, &receipt).is_err());
+        let mut gate = TaskProtocol::new(peer);
+        gate.observe(peer, Actor::Local, &incremental).unwrap();
+        assert!(gate.observe(peer, Actor::Local, &wait).is_err());
+        gate.observe(peer, Actor::Remote, &wait).unwrap();
+        receipt.request_id = 2;
+        assert!(
+            gate.observe(Identity::generate().node_id(), Actor::Remote, &receipt)
+                .is_err()
+        );
+        gate.observe(peer, Actor::Remote, &receipt).unwrap();
+        assert_eq!(gate.state(&task()), Some(WireTaskState::Completed));
+        assert!(gate.observe(peer, Actor::Remote, &receipt).is_err());
+    }
+
     fn transferring() -> (NodeId, TaskProtocol, ChunkHash) {
         let peer = Identity::generate().node_id();
         let mut gate = TaskProtocol::new(peer);
