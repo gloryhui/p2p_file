@@ -53,6 +53,10 @@ pub(crate) struct TransferService {
     upload_limit: super::bandwidth::ByteLimit,
     download_limit: super::bandwidth::ByteLimit,
     flow_peers: Arc<Mutex<HashSet<NodeId>>>,
+    incremental_peers: Arc<Mutex<HashSet<NodeId>>>,
+    previews: Arc<Mutex<HashMap<TaskId, super::incremental::Pending>>>,
+    preview_requests: Arc<Mutex<HashMap<NodeId, super::incremental::Request>>>,
+    comparisons: Arc<tokio::sync::Semaphore>,
     frame_budget: super::frame_budget::FrameBudget,
     rate_origin: Instant,
     rates: Arc<Mutex<HashMap<TaskId, super::queue::RateSampler>>>,
@@ -89,6 +93,10 @@ pub(crate) struct TransferPresentation {
     pub bytes_per_second: HashMap<TaskId, f64>,
     pub groups: HashMap<TaskId, super::queue::GroupProgress>,
     pub queue: super::queue::QueueMetrics,
+}
+struct ReceiveMode {
+    automatic: bool,
+    incremental: bool,
 }
 struct SendMode {
     automatic: bool,
@@ -182,6 +190,10 @@ impl TransferService {
             upload_limit: Default::default(),
             download_limit: Default::default(),
             flow_peers: Default::default(),
+            incremental_peers: Default::default(),
+            previews: Default::default(),
+            preview_requests: Default::default(),
+            comparisons: Arc::new(tokio::sync::Semaphore::new(2)),
             frame_budget: super::frame_budget::FrameBudget::default(),
             rate_origin: Instant::now(),
             rates: Arc::new(Mutex::new(HashMap::new())),
@@ -428,6 +440,288 @@ impl TransferService {
         self.upload_limit.set_kib(limits.upload_kib);
         self.download_limit.set_kib(limits.download_kib);
         Ok(())
+    }
+    pub fn set_peer_incremental_support(&self, peer: NodeId, supported: bool) {
+        let mut peers = self.incremental_peers.lock().unwrap();
+        if supported {
+            peers.insert(peer);
+        } else {
+            peers.remove(&peer);
+        }
+        if let Some(request) = self.preview_requests.lock().unwrap().remove(&peer) {
+            request.cancellation.cancel();
+        }
+        self.previews
+            .lock()
+            .unwrap()
+            .retain(|_, preview| preview.summary.peer != peer);
+    }
+    pub fn cancel_preview(&self, id: &TaskId) {
+        self.preview_requests.lock().unwrap().retain(|_, request| {
+            if &request.id == id {
+                request.cancellation.cancel();
+                false
+            } else {
+                true
+            }
+        });
+        self.previews.lock().unwrap().remove(id);
+    }
+    pub fn begin_preview(&self, peer: NodeId, id: TaskId) -> Result<()> {
+        let mut requests = self.preview_requests.lock().unwrap();
+        requests.retain(|_, request| {
+            if request.created.elapsed() >= super::incremental::PREVIEW_LIFETIME {
+                request.cancellation.cancel();
+                false
+            } else {
+                true
+            }
+        });
+        if requests.len() >= 8 && !requests.contains_key(&peer) {
+            return Err(disk::failure("待预览设备数量已达上限"));
+        }
+        if let Some(old) = requests.insert(
+            peer,
+            super::incremental::Request {
+                id,
+                created: Instant::now(),
+                cancellation: super::files::ScanCancellation::default(),
+            },
+        ) {
+            old.cancellation.cancel();
+        }
+        self.previews
+            .lock()
+            .unwrap()
+            .retain(|_, p| p.summary.peer != peer);
+        Ok(())
+    }
+    #[cfg(test)]
+    pub async fn preview_directory(
+        &self,
+        connection: &Connection,
+        peer: NodeId,
+        source: PathBuf,
+    ) -> Result<super::incremental::Preview> {
+        let request = TaskId::generate();
+        self.begin_preview(peer, request.clone())?;
+        self.preview_directory_request(connection, peer, source, request)
+            .await
+    }
+    pub async fn preview_directory_request(
+        &self,
+        connection: &Connection,
+        peer: NodeId,
+        source: PathBuf,
+        request: TaskId,
+    ) -> Result<super::incremental::Preview> {
+        let _activity = self.activity.file(peer)?;
+        let _permit = self
+            .comparisons
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| disk::failure("目录比较繁忙，请稍后重试"))?;
+        let epoch = self.epoch.load(std::sync::atomic::Ordering::Acquire);
+        let supported = self.incremental_peers.lock().unwrap().contains(&peer);
+        struct CancelScan(super::files::ScanCancellation);
+        impl Drop for CancelScan {
+            fn drop(&mut self) {
+                self.0.cancel();
+            }
+        }
+        let (cancellation, started) = {
+            let requests = self.preview_requests.lock().unwrap();
+            let active = requests
+                .get(&peer)
+                .filter(|r| r.id == request)
+                .ok_or_else(|| disk::failure("目录预览已取消"))?;
+            (active.cancellation.clone(), active.created)
+        };
+        let _scan_guard = CancelScan(cancellation.clone());
+        let remote_cancel = cancellation.clone();
+        let source_path = source.clone();
+        let records = tokio::time::timeout(
+            super::incremental::PREVIEW_LIFETIME.saturating_sub(started.elapsed()),
+            blocking(move || {
+                let _permit = _permit;
+                super::files::scan_directory(peer, &source, &cancellation)
+            }),
+        )
+        .await
+        .map_err(|_| disk::failure("目录扫描超时，请选择较小目录"))??;
+        let mut summary = super::incremental::Preview {
+            id: request.clone(),
+            peer,
+            source: source_path,
+            added: 0,
+            changed: 0,
+            unchanged: 0,
+            directories: 0,
+            transfer_bytes: 0,
+            saved_bytes: 0,
+            supported,
+        };
+        for record in &records {
+            remote_cancel.check()?;
+            if epoch != self.epoch.load(std::sync::atomic::Ordering::Acquire)
+                || started.elapsed() >= super::incremental::PREVIEW_LIFETIME
+            {
+                return Err(disk::failure("目录预览已失效，请重新选择"));
+            }
+            let Some(details) = record.file_details() else {
+                summary.directories += 1;
+                continue;
+            };
+            let difference = if supported {
+                let comparison = self.compare_remote(connection, record);
+                tokio::pin!(comparison);
+                let mut polling = tokio::time::interval(Duration::from_millis(100));
+                loop {
+                    tokio::select! {
+                        result = &mut comparison => break result?,
+                        _ = polling.tick() => { remote_cancel.check()?; if started.elapsed() >= super::incremental::PREVIEW_LIFETIME { return Err(disk::failure("目录比较超时，请选择较小目录")); } }
+                    }
+                }
+            } else {
+                protocol::Difference::Added
+            };
+            match difference {
+                protocol::Difference::Added => summary.added += 1,
+                protocol::Difference::Changed => summary.changed += 1,
+                protocol::Difference::Unchanged => summary.unchanged += 1,
+            }
+            if difference == protocol::Difference::Unchanged {
+                summary.saved_bytes += details.manifest.total_len;
+            } else {
+                summary.transfer_bytes += details.manifest.total_len;
+            }
+        }
+        if connection.close_reason().is_some()
+            || epoch != self.epoch.load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(disk::failure("目录预览连接已失效"));
+        }
+        let mut requests = self.preview_requests.lock().unwrap();
+        if !requests.get(&peer).is_some_and(|r| r.id == request) {
+            return Err(disk::failure("目录预览已取消或被新的预览替代"));
+        }
+        requests.get_mut(&peer).unwrap().created = Instant::now();
+        let mut previews = self.previews.lock().unwrap();
+        previews.retain(|_, p| {
+            p.created.elapsed() < super::incremental::PREVIEW_LIFETIME && p.summary.peer != peer
+        });
+        if previews.len() >= 8 {
+            return Err(disk::failure("待确认目录数量已达上限"));
+        }
+        previews.insert(
+            summary.id.clone(),
+            super::incremental::Pending {
+                summary: summary.clone(),
+                records,
+                connection: connection.stable_id(),
+                epoch,
+                created: Instant::now(),
+            },
+        );
+        Ok(summary)
+    }
+    async fn compare_remote(
+        &self,
+        connection: &Connection,
+        record: &TaskRecord,
+    ) -> Result<protocol::Difference> {
+        let details = record.file_details().unwrap();
+        tokio::time::timeout(
+            super::incremental::COMPARE_TIMEOUT + Duration::from_secs(5),
+            async {
+                let (mut send, mut recv) = connection.open_bi().await.map_err(disk::local_error)?;
+                protocol::write(
+                    &mut send,
+                    &Frame {
+                        request_id: 1,
+                        message: Message::CompareFile {
+                            task_id: record.task_id().clone(),
+                            relative_path: details.relative_path.clone(),
+                            manifest: Box::new(details.manifest.clone()),
+                        },
+                    },
+                )
+                .await?;
+                send.finish().map_err(disk::local_error)?;
+                let reply = self.frame_budget.read(&mut recv, None).await?;
+                match reply.frame {
+                    Frame {
+                        request_id: 1,
+                        message:
+                            Message::ComparedFile {
+                                task_id,
+                                root_hash,
+                                difference,
+                            },
+                    } if task_id == *record.task_id()
+                        && root_hash == details.manifest.root_hash =>
+                    {
+                        Ok(difference)
+                    }
+                    Frame {
+                        request_id: 1,
+                        message: Message::Error { task_id, code },
+                    } if task_id == *record.task_id() => Err(remote_error(code)),
+                    _ => Err(disk::failure("目录比较响应身份不符")),
+                }
+            },
+        )
+        .await
+        .map_err(|_| disk::failure("目录比较响应超时"))?
+    }
+    pub async fn confirm_directory(
+        &self,
+        connection: &Connection,
+        peer: NodeId,
+        id: TaskId,
+    ) -> Result<Vec<TaskId>> {
+        let _activity = self.activity.file(peer)?;
+        self.preview_requests
+            .lock()
+            .unwrap()
+            .retain(|_, request| request.id != id);
+        let pending = self
+            .previews
+            .lock()
+            .unwrap()
+            .remove(&id)
+            .ok_or_else(|| disk::failure("目录预览已失效，请重新选择"))?;
+        if pending.summary.peer != peer
+            || pending.connection != connection.stable_id()
+            || connection.close_reason().is_some()
+            || pending.epoch != self.epoch.load(std::sync::atomic::Ordering::Acquire)
+            || pending.created.elapsed() >= super::incremental::PREVIEW_LIFETIME
+        {
+            return Err(disk::failure("目录预览已失效，请重新选择"));
+        }
+        let epoch = self.epoch.clone();
+        let queue = self.sender_queue.clone();
+        let generation = pending.epoch;
+        self.store(move |store| {
+            if generation != epoch.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(disk::failure("旧传输会话已取消"));
+            }
+            let mut records = pending.records;
+            if pending.summary.supported {
+                for record in &mut records {
+                    if record.file_details().is_some() {
+                        record.enable_incremental().map_err(disk::local_error)?;
+                    }
+                }
+            }
+            let ids = store.create_selection(records).map_err(disk::local_error)?;
+            for id in &ids {
+                disk::transition(store, id, TaskState::Queued)?;
+            }
+            Self::admit_locked(store, &queue, peer, ids.clone(), &epoch, generation)?;
+            Ok(ids)
+        })
+        .await
     }
     pub fn set_peer_flow_support(&self, peer: NodeId, supported: bool) {
         let mut peers = self.flow_peers.lock().unwrap();
@@ -724,9 +1018,18 @@ impl TransferService {
     pub async fn interrupt_all(&self) -> Result<()> {
         self.recovery.lock().unwrap().clear();
         self.automatic_sends.lock().unwrap().clear();
+        {
+            let mut requests = self.preview_requests.lock().unwrap();
+            for request in requests.values() {
+                request.cancellation.cancel();
+            }
+            requests.clear();
+        }
+        self.previews.lock().unwrap().clear();
         self.epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.sender_queue.lock().unwrap().clear();
         self.flow_peers.lock().unwrap().clear();
+        self.incremental_peers.lock().unwrap().clear();
         self.store(|store| {
             let ids = store
                 .list()
@@ -1465,8 +1768,21 @@ impl TransferService {
             relative_path: details.relative_path.clone(),
             entry: Entry::File(Box::new(details.manifest.clone())),
         };
-        io.send(if automatic { offer.automatic() } else { offer })
-            .await?;
+        let offer = if details.incremental && self.incremental_peers.lock().unwrap().contains(&peer)
+        {
+            Message::IncrementalOffer {
+                task_id: id.clone(),
+                group_id: record.group_id().unwrap().clone(),
+                relative_path: details.relative_path.clone(),
+                entry: Entry::File(Box::new(details.manifest.clone())),
+                automatic,
+            }
+        } else if automatic {
+            offer.automatic()
+        } else {
+            offer
+        };
+        io.send(offer).await?;
         if let Some(reply) = continue_reply {
             protocol::write(
                 reply,
@@ -1687,9 +2003,26 @@ impl TransferService {
                     .await?;
                 }
                 Message::Paused { .. } => {}
-                Message::Completed { .. } => {
+                Message::Completed {
+                    receipt_version, ..
+                } => {
+                    if receipt_version == 2 {
+                        self.recovery.lock().unwrap().forget(id);
+                        let id = id.clone();
+                        self.state(&id, TaskState::Finalizing).await?;
+                        self.store(move |store| {
+                            store
+                                .commit_skipped(
+                                    &id,
+                                    system_time_unix_ms().map_err(disk::local_error)?,
+                                )
+                                .map_err(disk::local_error)
+                        })
+                        .await?;
+                    } else {
+                        self.receipt(id).await?;
+                    }
                     self.progress(id, manifest.total_len).await?;
-                    self.receipt(id).await?;
                     io.finish();
                     return Ok(());
                 }
@@ -1862,16 +2195,42 @@ impl TransferService {
                         authorization.guard(true, async {
                         let buffered=tokio::time::timeout(Duration::from_secs(5),service.frame_budget.read(&mut recv,None)).await.map_err(|_|disk::failure("文件流首帧超时"))??;
                         let super::frame_budget::BufferedFrame {frame:mut first,_lease}=buffered;
-                        let automatic=first.message.manual().is_some();
+                        let incremental = matches!(&first.message, Message::IncrementalOffer { .. });
+                        let incremental_automatic = matches!(&first.message, Message::IncrementalOffer { automatic: true, .. });
+                        if incremental {
+                            if !service.incremental_peers.lock().unwrap().contains(&peer) { return Err(disk::failure("未协商目录增量能力")); }
+                            if let Message::IncrementalOffer { task_id, group_id, relative_path, entry, .. } = first.message.clone() {
+                                first.message = Message::Offer { task_id, group_id: Some(group_id), relative_path, entry };
+                            }
+                        }
+                        let automatic=incremental_automatic || first.message.manual().is_some();
                         if let Some(message)=first.message.manual() {first.message=message;}
                         match &first.message {
+                            Message::CompareFile { task_id, relative_path, manifest } if first.request_id == 1 => {
+                                if !service.incremental_peers.lock().unwrap().contains(&peer) { return Err(disk::failure("未协商目录增量能力")); }
+                                let permit = match service.comparisons.clone().try_acquire_owned() {
+                                    Ok(permit) => permit,
+                                    Err(_) => { protocol::write(&mut send, &Frame { request_id: 1, message: Message::Error { task_id: task_id.clone(), code: ErrorCode::Busy } }).await?; send.finish().map_err(disk::local_error)?; return Ok(()); }
+                                };
+                                let owner = service.activity.file(peer)?;
+                                let root = service.receive_root.lock().unwrap().clone();
+                                let relative = relative_path.clone(); let manifest = *manifest.clone(); let root_hash = manifest.root_hash; let task_id = task_id.clone();
+                                let compared = blocking(move || { let _permit = permit; let _owner = owner; super::incremental::compare(root, relative, manifest) }).await;
+                                let (difference, _) = match compared {
+                                    Ok(compared) => compared,
+                                    Err(error) => { protocol::write(&mut send, &Frame { request_id: 1, message: Message::Error { task_id, code: error_code(&error) } }).await?; send.finish().map_err(disk::local_error)?; return Err(error); }
+                                };
+                                protocol::write(&mut send, &Frame { request_id: 1, message: Message::ComparedFile { task_id, root_hash, difference } }).await?;
+                                send.finish().map_err(disk::local_error)?;
+                                Ok(())
+                            },
                             Message::TunnelOpen{target}=> {
                                 drop(_lease);
                                 let allowed=allowed_forward_targets.borrow().clone();
                                 super::tunnel::serve_open(send,recv,*target,peer,&allowed).await
                             },
                             Message::Speed(_)=> { let speed=speed.ok_or_else(||disk::failure("对端不支持测速执行"))?;drop(_lease);speed.serve_control(send,recv,first).await },
-                            Message::Offer{..} => service.receive_offer(send,recv,&connection,peer,super::frame_budget::BufferedFrame{frame:first,_lease},automatic).await,
+                            Message::Offer{..} => service.receive_offer(send,recv,&connection,peer,super::frame_budget::BufferedFrame{frame:first,_lease},ReceiveMode {automatic,incremental}).await,
                             Message::ResumeTask{task_id} if first.request_id==1 => {
                                 // This recovery path initiates a new Offer stream, so it also
                                 // needs the local outgoing right; it is not a stream reply.
@@ -2009,8 +2368,12 @@ impl TransferService {
         connection: &Connection,
         peer: NodeId,
         buffered: super::frame_budget::BufferedFrame,
-        automatic: bool,
+        mode: ReceiveMode,
     ) -> Result<()> {
+        let ReceiveMode {
+            automatic,
+            incremental,
+        } = mode;
         let super::frame_budget::BufferedFrame {
             frame: first,
             _lease,
@@ -2065,7 +2428,23 @@ impl TransferService {
             self.measurements.lock().unwrap().automatic(&task_id);
         }
         let mut io = TaskIo::new(send, recv, peer, task_id.clone(), self.frame_budget.clone());
-        io.observe(&first)?;
+        if incremental {
+            let frame = Frame {
+                request_id: first.request_id,
+                message: Message::IncrementalOffer {
+                    task_id: task_id.clone(),
+                    group_id: group_id
+                        .clone()
+                        .ok_or_else(|| disk::failure("增量文件缺少目录身份"))?,
+                    relative_path: relative_path.clone(),
+                    entry: Entry::File(manifest.clone()),
+                    automatic,
+                },
+            };
+            io.observe(&frame)?;
+        } else {
+            io.observe(&first)?;
+        }
         drop(first);
         let root = self.receive_root.lock().unwrap().clone();
         let id = task_id.clone();
@@ -2075,28 +2454,70 @@ impl TransferService {
                 if automatic {
                     check_automatic(store, &recovery, peer, &id)?;
                 }
-                disk::accept_entry(store, peer, &id, &root, relative_path, *manifest, group_id)
+                let record = disk::accept_entry(
+                    store,
+                    peer,
+                    &id,
+                    &root,
+                    relative_path,
+                    *manifest,
+                    group_id,
+                )?;
+                if incremental
+                    && record.state() != TaskState::Completed
+                    && !record.file_details().unwrap().incremental
+                {
+                    store.enable_incremental(&id).map_err(disk::local_error)?;
+                    return store.task(&id).map_err(disk::local_error);
+                }
+                Ok(record)
             })
             .await?;
         drop(_lease);
         if record.file_details().unwrap().receipt_committed {
             let completed = record.clone();
-            if blocking(move || disk::cleanup_staging(&completed))
-                .await
-                .is_err()
+            let owner = _guard.clone();
+            if blocking(move || {
+                let _owner = owner;
+                if completed.file_details().unwrap().skipped_existing {
+                    disk::cleanup_skipped_staging(&completed)
+                } else {
+                    disk::cleanup_staging(&completed)
+                }
+            })
+            .await
+            .is_err()
             {
                 tracing::warn!("持久回执重发；暂存清理仍需重试");
             }
             io.send(Message::Completed {
                 task_id,
                 root_hash: record.file_details().unwrap().manifest.root_hash,
-                receipt_version: 1,
+                receipt_version: if incremental && record.file_details().unwrap().skipped_existing {
+                    2
+                } else {
+                    1
+                },
             })
             .await?;
             io.finish();
             return Ok(());
         }
         self.state(&task_id, TaskState::Transferring).await?;
+        if incremental && !record.file_details().unwrap().publish_prepared {
+            match self
+                .try_existing_file(&mut io, &record, _guard.clone())
+                .await
+            {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) => {
+                    io.report_error(&error).await;
+                    self.finish_error(&task_id, &error, connection).await;
+                    return Err(error);
+                }
+            }
+        }
         let local = record.clone();
         let budget = self.receive_space.clone();
         let owner = _guard.clone();
@@ -2131,6 +2552,88 @@ impl TransferService {
             self.finish_error(&task_id, error, connection).await;
         }
         result
+    }
+    /// Keep the attempt alive through background hashing, sync and receipt commit.
+    async fn try_existing_file(
+        &self,
+        io: &mut TaskIo,
+        record: &TaskRecord,
+        owner: Arc<ActiveGuard>,
+    ) -> Result<bool> {
+        let local = record.clone();
+        let pool = self.comparisons.clone();
+        let hashing_owner = owner.clone();
+        let comparison = async move {
+            let permit = pool
+                .acquire_owned()
+                .await
+                .map_err(|_| disk::failure("目录比较已关闭"))?;
+            blocking(move || {
+                let _permit = permit;
+                let _owner = hashing_owner;
+                let details = local.file_details().unwrap();
+                super::incremental::compare(
+                    local.local_path().to_path_buf(),
+                    details.relative_path.clone(),
+                    details.manifest.clone(),
+                )
+            })
+            .await
+        };
+        tokio::pin!(comparison);
+        let mut keepalive = tokio::time::interval(Duration::from_secs(5));
+        let checked = loop {
+            tokio::select! {
+                result = &mut comparison => break result?,
+                _ = keepalive.tick() => { io.send(Message::FlowWait { task_id: record.task_id().clone() }).await?; }
+            }
+        };
+        let Some(proof) = checked.1 else {
+            return Ok(false);
+        };
+        self.state(record.task_id(), TaskState::Finalizing).await?;
+        let id = record.task_id().clone();
+        let commit_owner = owner.clone();
+        self.store(move |store| {
+            let _owner = commit_owner;
+            proof.make_durable()?;
+            store
+                .commit_skipped(&id, system_time_unix_ms().map_err(disk::local_error)?)
+                .map_err(disk::local_error)
+        })
+        .await?;
+        let completed = record.clone();
+        if blocking(move || {
+            let _owner = owner;
+            disk::cleanup_skipped_staging(&completed)
+        })
+        .await
+        .is_err()
+        {
+            tracing::warn!("跳过文件回执已提交；暂存清理仍需重试");
+        }
+        self.progress(
+            record.task_id(),
+            record.file_details().unwrap().manifest.total_len,
+        )
+        .await?;
+        #[cfg(test)]
+        if self
+            .drop_completion
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            let _ = io.send.reset(77u32.into());
+            return Err(disk::failure("测试在持久回执后切断完成消息"));
+        }
+        io.send(Message::Completed {
+            task_id: record.task_id().clone(),
+            root_hash: record.file_details().unwrap().manifest.root_hash,
+            receipt_version: 2,
+        })
+        .await?;
+        io.finish();
+        self.recovery.lock().unwrap().forget(record.task_id());
+        Ok(true)
     }
     async fn receive_directory(
         &self,
@@ -2797,6 +3300,8 @@ mod tests {
             let key_b = identity_b.clone();
             let ia = identity_a.node_id();
             let ib = identity_b.node_id();
+            a.set_peer_incremental_support(ib, true);
+            b.set_peer_incremental_support(ia, true);
             a.set_peer_flow_support(ib, true);
             b.set_peer_flow_support(ia, true);
             let ea = client_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -4194,6 +4699,468 @@ mod tests {
         assert!(download.bitmap().count_set() > 0);
         assert!(download.temp_path().exists());
         drop(download);
+        pair.shutdown().await;
+    }
+    #[tokio::test]
+    async fn incremental_pending_request_cancellation_supersession_and_capacity_are_bounded() {
+        let pair = Pair::new().await;
+        let source = pair.root.join("目录");
+        fs::create_dir(&source).unwrap();
+        let first = TaskId::generate();
+        pair.a.begin_preview(pair.ib, first.clone()).unwrap();
+        let cancellation = pair.a.preview_requests.lock().unwrap()[&pair.ib]
+            .cancellation
+            .clone();
+        let second = TaskId::generate();
+        pair.a.begin_preview(pair.ib, second.clone()).unwrap();
+        assert!(cancellation.check().is_err());
+        assert!(
+            pair.a
+                .preview_directory_request(&pair.ca, pair.ib, source.clone(), first)
+                .await
+                .is_err()
+        );
+        pair.a.cancel_preview(&second);
+        assert!(
+            pair.a
+                .preview_directory_request(&pair.ca, pair.ib, source, second)
+                .await
+                .is_err()
+        );
+        for _ in 0..8 {
+            pair.a
+                .begin_preview(Identity::generate().node_id(), TaskId::generate())
+                .unwrap();
+        }
+        assert!(pair.a.begin_preview(pair.ib, TaskId::generate()).is_err());
+        for request in pair.a.preview_requests.lock().unwrap().values_mut() {
+            request.created = Instant::now() - super::super::incremental::PREVIEW_LIFETIME;
+        }
+        pair.a.begin_preview(pair.ib, TaskId::generate()).unwrap();
+        assert_eq!(pair.a.preview_requests.lock().unwrap().len(), 1);
+        assert!(pair.a.snapshot().await.unwrap().is_empty());
+        assert!(pair.b.snapshot().await.unwrap().is_empty());
+        pair.shutdown().await;
+    }
+    #[tokio::test]
+    async fn incremental_retry_can_skip_now_identical_target_and_clean_existing_partial() {
+        let pair = Pair::new().await;
+        let source = pair.root.join("目录");
+        fs::create_dir(&source).unwrap();
+        let bytes = vec![19; 300_000];
+        fs::write(source.join("a.bin"), &bytes).unwrap();
+        let preview = pair
+            .a
+            .preview_directory(&pair.ca, pair.ib, source)
+            .await
+            .unwrap();
+        let ids = pair
+            .a
+            .confirm_directory(&pair.ca, pair.ib, preview.id)
+            .await
+            .unwrap();
+        let file = pair
+            .a
+            .snapshot()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.file_details().is_some())
+            .unwrap();
+        let details = file.file_details().unwrap().clone();
+        let id = file.task_id().clone();
+        let group = file.group_id().cloned();
+        let root = pair.root.join("b-receive");
+        let peer = pair.ia;
+        let received = pair
+            .b
+            .store(move |store| {
+                let record = disk::accept_entry(
+                    store,
+                    peer,
+                    &id,
+                    &root,
+                    details.relative_path,
+                    details.manifest,
+                    group,
+                )?;
+                disk::transition(store, &id, TaskState::Transferring)?;
+                disk::transition(store, &id, TaskState::Interrupted)?;
+                Ok(record)
+            })
+            .await
+            .unwrap();
+        let mut download = disk::open_download(&received).unwrap();
+        download.write_chunk(0, &bytes[..256 * 1024]).unwrap();
+        download.checkpoint().unwrap();
+        let part = download.temp_path().to_path_buf();
+        assert!(part.exists());
+        drop(download);
+        fs::create_dir(pair.root.join("b-receive/目录")).unwrap();
+        fs::write(pair.root.join("b-receive/目录/a.bin"), &bytes).unwrap();
+        pair.a.send_selection(&pair.ca, pair.ib, ids).await.unwrap();
+        assert!(
+            pair.b
+                .task(file.task_id().clone())
+                .await
+                .unwrap()
+                .file_details()
+                .unwrap()
+                .skipped_existing
+        );
+        assert!(!part.exists());
+        assert!(!part.with_file_name("data.bitmap").exists());
+        assert_eq!(
+            fs::read_dir(pair.root.join("b-receive/目录"))
+                .unwrap()
+                .count(),
+            1
+        );
+        pair.shutdown().await;
+    }
+    #[tokio::test]
+    async fn incremental_preview_and_transfer_preserve_identical_files_and_back_up_changes() {
+        let pair = Pair::new().await;
+        let source = pair.root.join("目录");
+        let target = pair.root.join("b-receive/目录");
+        fs::create_dir_all(source.join("空目录")).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        for (name, bytes) in [
+            ("same.txt", &b"same"[..]),
+            ("changed.txt", &b"new"[..]),
+            ("added.txt", &b"added"[..]),
+            ("empty.txt", &b""[..]),
+        ] {
+            fs::write(source.join(name), bytes).unwrap();
+        }
+        fs::write(target.join("same.txt"), b"same").unwrap();
+        fs::write(target.join("changed.txt"), b"old").unwrap();
+        fs::write(target.join("empty.txt"), b"").unwrap();
+        fs::write(target.join("extra.txt"), b"keep").unwrap();
+        let identity = super::super::secure_fs::identity(
+            &std::fs::File::open(target.join("same.txt")).unwrap(),
+        )
+        .unwrap();
+        let preview = pair
+            .a
+            .preview_directory(&pair.ca, pair.ib, source)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                preview.added,
+                preview.changed,
+                preview.unchanged,
+                preview.directories,
+                preview.transfer_bytes,
+                preview.saved_bytes
+            ),
+            (1, 1, 2, 2, 8, 4)
+        );
+        assert!(pair.a.snapshot().await.unwrap().is_empty());
+        assert!(pair.b.snapshot().await.unwrap().is_empty());
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 4);
+        let ids = pair
+            .a
+            .confirm_directory(&pair.ca, pair.ib, preview.id)
+            .await
+            .unwrap();
+        pair.a
+            .send_selection(&pair.ca, pair.ib, ids.clone())
+            .await
+            .unwrap();
+        for id in &ids {
+            wait_state(&pair.b, id, TaskState::Completed).await;
+        }
+        let received = pair.b.snapshot().await.unwrap();
+        assert_eq!(
+            received
+                .iter()
+                .filter(|r| r.file_details().is_some_and(|d| d.skipped_existing))
+                .count(),
+            2
+        );
+        assert_eq!(
+            super::super::secure_fs::identity(
+                &std::fs::File::open(target.join("same.txt")).unwrap()
+            )
+            .unwrap(),
+            identity
+        );
+        assert!(target.join("空目录").is_dir());
+        assert_eq!(fs::read(target.join("extra.txt")).unwrap(), b"keep");
+        assert_eq!(fs::read(target.join("changed.txt")).unwrap(), b"new");
+        assert_eq!(fs::read(target.join("added.txt")).unwrap(), b"added");
+        let backups: Vec<_> = fs::read_dir(&target)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("changed+")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read(&backups[0]).unwrap(), b"old");
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 7);
+        fs::create_dir(pair.root.join("reopened")).unwrap();
+        fs::copy(
+            pair.root.join("b-state/tasks.json"),
+            pair.root.join("reopened/tasks.json"),
+        )
+        .unwrap();
+        let (reopened, _) = TaskStore::open(&pair.root.join("reopened/tasks.json")).unwrap();
+        assert_eq!(
+            reopened
+                .list()
+                .iter()
+                .filter(|r| r.file_details().is_some_and(|d| d.skipped_existing))
+                .count(),
+            2
+        );
+        let detail = super::super::task_details::project(
+            &received,
+            &super::super::task_details::Selection::Group(received[0].group_id().unwrap().clone()),
+            |_| 0.,
+            |_| None,
+            |_| false,
+            system_time_unix_ms().unwrap(),
+        );
+        assert_eq!(detail.unwrap().saved_bytes, 4);
+        drop(reopened);
+        pair.shutdown().await;
+    }
+    #[tokio::test]
+    async fn incremental_cancel_expiry_peer_and_connection_binding_never_admit_tasks() {
+        let mut pair = Pair::new().await;
+        let source = pair.root.join("目录");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("a.txt"), b"a").unwrap();
+        let preview = pair
+            .a
+            .preview_directory(&pair.ca, pair.ib, source.clone())
+            .await
+            .unwrap();
+        pair.a.cancel_preview(&preview.id);
+        assert!(
+            pair.a
+                .confirm_directory(&pair.ca, pair.ib, preview.id)
+                .await
+                .is_err()
+        );
+        let preview = pair
+            .a
+            .preview_directory(&pair.ca, pair.ib, source.clone())
+            .await
+            .unwrap();
+        assert!(
+            pair.a
+                .confirm_directory(&pair.ca, pair.ia, preview.id)
+                .await
+                .is_err()
+        );
+        let preview = pair
+            .a
+            .preview_directory(&pair.ca, pair.ib, source.clone())
+            .await
+            .unwrap();
+        pair.a
+            .previews
+            .lock()
+            .unwrap()
+            .get_mut(&preview.id)
+            .unwrap()
+            .created = Instant::now() - super::super::incremental::PREVIEW_LIFETIME;
+        assert!(
+            pair.a
+                .confirm_directory(&pair.ca, pair.ib, preview.id)
+                .await
+                .is_err()
+        );
+        let preview = pair
+            .a
+            .preview_directory(&pair.ca, pair.ib, source.clone())
+            .await
+            .unwrap();
+        pair.reconnect().await;
+        assert!(
+            pair.a
+                .confirm_directory(&pair.ca, pair.ib, preview.id)
+                .await
+                .is_err()
+        );
+        let preview = pair
+            .a
+            .preview_directory(&pair.ca, pair.ib, source)
+            .await
+            .unwrap();
+        pair.a.interrupt_all().await.unwrap();
+        assert!(
+            pair.a
+                .confirm_directory(&pair.ca, pair.ib, preview.id)
+                .await
+                .is_err()
+        );
+        assert!(pair.a.snapshot().await.unwrap().is_empty());
+        assert!(pair.b.snapshot().await.unwrap().is_empty());
+        assert_eq!(
+            fs::read_dir(pair.root.join("b-receive")).unwrap().count(),
+            0
+        );
+        pair.shutdown().await;
+    }
+    #[tokio::test]
+    async fn incremental_rechecks_receiver_and_refuses_changed_source_after_preview() {
+        let pair = Pair::new().await;
+        let source = pair.root.join("目录");
+        let target = pair.root.join("b-receive/目录");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&target).unwrap();
+        for name in ["receiver.txt", "sender.txt"] {
+            fs::write(source.join(name), b"same").unwrap();
+            fs::write(target.join(name), b"same").unwrap();
+        }
+        let preview = pair
+            .a
+            .preview_directory(&pair.ca, pair.ib, source.clone())
+            .await
+            .unwrap();
+        assert_eq!(preview.unchanged, 2);
+        fs::write(target.join("receiver.txt"), b"diff").unwrap();
+        fs::write(source.join("sender.txt"), b"diff").unwrap();
+        let ids = pair
+            .a
+            .confirm_directory(&pair.ca, pair.ib, preview.id)
+            .await
+            .unwrap();
+        let error = pair
+            .a
+            .send_selection(&pair.ca, pair.ib, ids)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("源文件内容已变化"));
+        assert_eq!(fs::read(target.join("receiver.txt")).unwrap(), b"same");
+        assert_eq!(fs::read(target.join("sender.txt")).unwrap(), b"same");
+        assert!(
+            !pair
+                .b
+                .snapshot()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.file_details().is_some_and(|d| d.skipped_existing))
+        );
+        pair.shutdown().await;
+    }
+    #[tokio::test]
+    async fn incremental_lost_receipt_replays_same_task_without_backup_or_payload() {
+        let pair = Pair::new().await;
+        let source = pair.root.join("目录");
+        let target = pair.root.join("b-receive/目录");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(source.join("same.txt"), b"same").unwrap();
+        fs::write(target.join("same.txt"), b"same").unwrap();
+        let preview = pair
+            .a
+            .preview_directory(&pair.ca, pair.ib, source)
+            .await
+            .unwrap();
+        let ids = pair
+            .a
+            .confirm_directory(&pair.ca, pair.ib, preview.id)
+            .await
+            .unwrap();
+        let file = pair
+            .a
+            .snapshot()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.file_details().is_some())
+            .unwrap();
+        for id in &ids {
+            if id != file.task_id() {
+                pair.a
+                    .send_file(&pair.ca, pair.ib, id.clone())
+                    .await
+                    .unwrap();
+            }
+        }
+        pair.b
+            .drop_completion
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(
+            pair.a
+                .send_file(&pair.ca, pair.ib, file.task_id().clone())
+                .await
+                .is_err()
+        );
+        wait_state(&pair.b, file.task_id(), TaskState::Completed).await;
+        assert!(
+            pair.b
+                .task(file.task_id().clone())
+                .await
+                .unwrap()
+                .file_details()
+                .unwrap()
+                .skipped_existing
+        );
+        pair.a
+            .resume(&pair.ca, pair.ib, file.task_id().clone())
+            .await
+            .unwrap();
+        assert!(
+            pair.a
+                .task(file.task_id().clone())
+                .await
+                .unwrap()
+                .file_details()
+                .unwrap()
+                .skipped_existing
+        );
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 1);
+        assert!(!pair.root.join("b-receive/.p2p-desktop").exists());
+        pair.shutdown().await;
+    }
+    #[tokio::test]
+    async fn incremental_legacy_peer_preview_falls_back_to_original_full_send() {
+        let pair = Pair::new().await;
+        pair.a.set_peer_incremental_support(pair.ib, false);
+        pair.b.set_peer_incremental_support(pair.ia, false);
+        let source = pair.root.join("目录");
+        let target = pair.root.join("b-receive/目录");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(source.join("same.txt"), b"same").unwrap();
+        fs::write(target.join("same.txt"), b"same").unwrap();
+        let preview = pair
+            .a
+            .preview_directory(&pair.ca, pair.ib, source)
+            .await
+            .unwrap();
+        assert!(!preview.supported);
+        assert_eq!(
+            (
+                preview.unchanged,
+                preview.transfer_bytes,
+                preview.saved_bytes
+            ),
+            (0, 4, 0)
+        );
+        let ids = pair
+            .a
+            .confirm_directory(&pair.ca, pair.ib, preview.id)
+            .await
+            .unwrap();
+        pair.a.send_selection(&pair.ca, pair.ib, ids).await.unwrap();
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 2);
+        assert!(!pair.a.snapshot().await.unwrap().iter().any(|r| {
+            r.file_details()
+                .is_some_and(|d| d.incremental || d.skipped_existing)
+        }));
         pair.shutdown().await;
     }
     #[tokio::test]

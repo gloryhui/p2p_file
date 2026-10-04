@@ -139,6 +139,8 @@ pub enum SessionEvent {
         peer: Option<NodeId>,
     },
     Diagnostic(String),
+    DirectoryPreview(super::incremental::Preview),
+    DirectoryPreviewFailed(super::task_model::TaskId),
     SelectionQueued {
         peer: NodeId,
         count: usize,
@@ -401,6 +403,39 @@ impl DesktopSessionHandle {
     }
 
     #[allow(dead_code)] // T010 selection controls.
+    pub fn preview_directory(
+        &self,
+        peer: NodeId,
+        source: std::path::PathBuf,
+    ) -> std::result::Result<super::task_model::TaskId, String> {
+        let request = super::task_model::TaskId::generate();
+        self.commands
+            .try_send(SessionCommand::PreviewDirectory {
+                peer,
+                source,
+                request: request.clone(),
+            })
+            .map_err(|_| "目录预览命令队列已满或会话已关闭".to_owned())?;
+        Ok(request)
+    }
+    pub fn confirm_directory(
+        &self,
+        peer: NodeId,
+        id: super::task_model::TaskId,
+    ) -> std::result::Result<(), String> {
+        self.commands
+            .try_send(SessionCommand::ConfirmDirectory { peer, id })
+            .map_err(|_| "目录确认命令队列已满或会话已关闭".into())
+    }
+    pub fn cancel_directory_preview(
+        &self,
+        id: super::task_model::TaskId,
+    ) -> std::result::Result<(), String> {
+        self.commands
+            .try_send(SessionCommand::CancelDirectoryPreview(id))
+            .map_err(|_| "目录取消命令队列已满或会话已关闭".into())
+    }
+
     pub fn send_directory(
         &self,
         peer: NodeId,
@@ -529,6 +564,16 @@ enum SessionCommand {
         peer: NodeId,
         id: super::task_model::TaskId,
     },
+    PreviewDirectory {
+        peer: NodeId,
+        source: std::path::PathBuf,
+        request: super::task_model::TaskId,
+    },
+    ConfirmDirectory {
+        peer: NodeId,
+        id: super::task_model::TaskId,
+    },
+    CancelDirectoryPreview(super::task_model::TaskId),
     SendPaths {
         peer: NodeId,
         sources: Vec<std::path::PathBuf>,
@@ -588,9 +633,17 @@ enum SessionCommand {
 }
 
 impl SessionCommand {
+    fn preview_request(&self) -> Option<super::task_model::TaskId> {
+        match self {
+            Self::PreviewDirectory { request, .. } => Some(request.clone()),
+            _ => None,
+        }
+    }
     fn business_peer(&self) -> Option<NodeId> {
         match self {
-            Self::SendPaths { peer, .. }
+            Self::PreviewDirectory { peer, .. }
+            | Self::ConfirmDirectory { peer, .. }
+            | Self::SendPaths { peer, .. }
             | Self::SendFile { peer, .. }
             | Self::SendDirectory { peer, .. }
             | Self::ResumeTask { peer, .. }
@@ -984,6 +1037,11 @@ async fn run_session(
                     "远程访问尚未授权；请先连接设备并完成密码认证".into(),
                 ))
                 .await;
+            if let Some(request) = command.preview_request() {
+                let _ = events
+                    .send(SessionEvent::DirectoryPreviewFailed(request))
+                    .await;
+            }
             if matches!(command, SessionCommand::StartSpeed { .. }) {
                 let _ = events.send(SessionEvent::SpeedRequestEnded { peer }).await;
             }
@@ -1301,29 +1359,49 @@ async fn run_session(
                         .await;
                 }
             }
+            Wake::Command(Some(SessionCommand::CancelDirectoryPreview(id))) => {
+                if let Some(service) = &config.transfer {
+                    service.cancel_preview(&id);
+                }
+            }
             Wake::Command(Some(
-                command @ (SessionCommand::SendPaths { .. }
+                command @ (SessionCommand::PreviewDirectory { .. }
+                | SessionCommand::ConfirmDirectory { .. }
+                | SessionCommand::SendPaths { .. }
                 | SessionCommand::SendFile { .. }
                 | SessionCommand::SendDirectory { .. }
                 | SessionCommand::ResumeTask { .. }),
             )) => {
                 let peer = match &command {
-                    SessionCommand::SendPaths { peer, .. }
+                    SessionCommand::PreviewDirectory { peer, .. }
+                    | SessionCommand::ConfirmDirectory { peer, .. }
+                    | SessionCommand::SendPaths { peer, .. }
                     | SessionCommand::SendFile { peer, .. }
                     | SessionCommand::SendDirectory { peer, .. }
                     | SessionCommand::ResumeTask { peer, .. } => *peer,
                     _ => unreachable!(),
                 };
+                let preview_request = command.preview_request();
                 let Some(service) = config.transfer.clone() else {
                     let _ = events
                         .send(SessionEvent::Diagnostic("任务存储尚未就绪".into()))
                         .await;
+                    if let Some(request) = &preview_request {
+                        let _ = events
+                            .send(SessionEvent::DirectoryPreviewFailed(request.clone()))
+                            .await;
+                    }
                     continue;
                 };
                 if peer == local_node {
                     let _ = events
                         .send(SessionEvent::Diagnostic("不能向本机发送任务".into()))
                         .await;
+                    if let Some(request) = &preview_request {
+                        let _ = events
+                            .send(SessionEvent::DirectoryPreviewFailed(request.clone()))
+                            .await;
+                    }
                     continue;
                 }
                 let connection = connections
@@ -1340,8 +1418,24 @@ async fn run_session(
                             "文件命令排队已达上限，请稍后重试".into(),
                         ))
                         .await;
+                    if let Some(request) = &preview_request {
+                        let _ = events
+                            .send(SessionEvent::DirectoryPreviewFailed(request.clone()))
+                            .await;
+                    }
                     continue;
                 };
+                if let Some(request) = &preview_request
+                    && let Err(error) = service.begin_preview(peer, request.clone())
+                {
+                    let _ = events
+                        .send(SessionEvent::DirectoryPreviewFailed(request.clone()))
+                        .await;
+                    let _ = events
+                        .send(SessionEvent::Diagnostic(error.to_string()))
+                        .await;
+                    continue;
+                }
                 let live = authorizations[&peer].2.live();
                 let selection_workers = selection_workers.clone();
                 let events = events.clone();
@@ -1350,6 +1444,42 @@ async fn run_session(
                     let result = live
                         .guard(false, async {
                             match command {
+                                SessionCommand::PreviewDirectory {
+                                    source, request, ..
+                                } => {
+                                    let _worker =
+                                        selection_workers.clone().acquire_owned().await.map_err(
+                                            |_| super::transfer_files::failure("扫描任务已关闭"),
+                                        )?;
+                                    let connection = connection.ok_or_else(|| {
+                                        super::transfer_files::failure("请先连接并授权对端")
+                                    })?;
+                                    let preview = service
+                                        .preview_directory_request(
+                                            &connection,
+                                            peer,
+                                            source,
+                                            request,
+                                        )
+                                        .await?;
+                                    let _ =
+                                        events.send(SessionEvent::DirectoryPreview(preview)).await;
+                                    Ok(())
+                                }
+                                SessionCommand::ConfirmDirectory { id, .. } => {
+                                    let connection = connection.ok_or_else(|| {
+                                        super::transfer_files::failure("请先连接并授权对端")
+                                    })?;
+                                    let ids =
+                                        service.confirm_directory(&connection, peer, id).await?;
+                                    let _ = events
+                                        .send(SessionEvent::SelectionQueued {
+                                            peer,
+                                            count: ids.len(),
+                                        })
+                                        .await;
+                                    Ok(())
+                                }
                                 SessionCommand::SendPaths { sources, .. } => {
                                     let _worker =
                                         selection_workers.clone().acquire_owned().await.map_err(
@@ -1406,6 +1536,12 @@ async fn run_session(
                         })
                         .await;
                     if let Err(error) = result {
+                        if let Some(request) = preview_request {
+                            service.cancel_preview(&request);
+                            let _ = events
+                                .send(SessionEvent::DirectoryPreviewFailed(request))
+                                .await;
+                        }
                         let _ = events
                             .send(SessionEvent::Diagnostic(error.to_string()))
                             .await;
@@ -2339,6 +2475,10 @@ async fn run_session(
                 connections.insert(peer, (generation, connection.clone()));
                 peer_capabilities.insert(peer, capabilities);
                 if let Some(service) = config.transfer.as_ref() {
+                    service.set_peer_incremental_support(
+                        peer,
+                        capabilities & super::protocol::CAP_INCREMENTAL_DIRECTORY != 0,
+                    );
                     service.set_peer_flow_support(
                         peer,
                         capabilities & super::protocol::CAP_FILE_FLOW != 0,
@@ -4872,6 +5012,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incremental_preview_confirm_and_cancel_run_through_authenticated_session_commands() {
+        use super::super::{
+            task_model::TaskState, task_store::TaskStore, transfer::TransferService,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "p2p-session-incremental-{}",
+            super::super::task_model::TaskId::generate()
+        ));
+        for dir in ["a-receive", "b-receive", "目录", "b-receive/目录"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(root.join("目录/a.txt"), b"same").unwrap();
+        std::fs::write(root.join("b-receive/目录/a.txt"), b"same").unwrap();
+        let (a_store, _) = TaskStore::open(&root.join("a-state/tasks.json")).unwrap();
+        let (b_store, _) = TaskStore::open(&root.join("b-state/tasks.json")).unwrap();
+        let a_service = TransferService::new(a_store, root.join("a-receive"));
+        let b_service = TransferService::new(b_store, root.join("b-receive"));
+        let (address, server) = start_local_server().await;
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let mut ca = auth_config(address);
+        let mut cb = auth_config(address);
+        ca.transfer = Some(a_service.clone());
+        cb.transfer = Some(b_service.clone());
+        let (ha, mut ea) = spawn(a.clone(), ca).unwrap();
+        let (hb, mut eb) = spawn(b.clone(), cb).unwrap();
+        wait_signal_online(&mut ea).await;
+        wait_signal_online(&mut eb).await;
+        ha.connect_peer_with_password(b.node_id(), test_password())
+            .unwrap();
+        assert!(
+            wait_authorization(&mut ea, b.node_id())
+                .await
+                .outbound_authorized()
+        );
+        assert!(
+            wait_authorization(&mut eb, a.node_id())
+                .await
+                .inbound_authorized()
+        );
+        async fn ready(
+            events: &mut mpsc::Receiver<SessionEvent>,
+            request: &super::super::task_model::TaskId,
+        ) -> super::super::incremental::Preview {
+            time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match events.recv().await.unwrap() {
+                        SessionEvent::DirectoryPreview(p) if &p.id == request => return p,
+                        SessionEvent::DirectoryPreviewFailed(id) if &id == request => {
+                            panic!("directory preview failed")
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap()
+        }
+        let request = ha
+            .preview_directory(b.node_id(), root.join("目录"))
+            .unwrap();
+        let preview = ready(&mut ea, &request).await;
+        assert!(preview.supported);
+        assert_eq!(preview.unchanged, 1);
+        assert!(a_service.snapshot().await.unwrap().is_empty());
+        assert!(b_service.snapshot().await.unwrap().is_empty());
+        ha.cancel_directory_preview(preview.id).unwrap();
+        let request = ha
+            .preview_directory(b.node_id(), root.join("目录"))
+            .unwrap();
+        let preview = ready(&mut ea, &request).await;
+        ha.confirm_directory(b.node_id(), preview.id).unwrap();
+        time::timeout(Duration::from_secs(10), async {
+            loop {
+                let records = a_service.snapshot().await.unwrap();
+                if records.len() == 2 && records.iter().all(|r| r.state() == TaskState::Completed) {
+                    break;
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            b_service
+                .snapshot()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.file_details().is_some_and(|d| d.skipped_existing))
+        );
+        assert_eq!(
+            std::fs::read_dir(root.join("b-receive/目录"))
+                .unwrap()
+                .count(),
+            1
+        );
+        ha.shutdown();
+        hb.shutdown();
+        drop(ha);
+        drop(hb);
+        server.abort();
+        drop(a_service);
+        drop(b_service);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
     async fn unauthorized_file_directory_resume_and_speed_commands_cannot_start_business() {
         use super::super::{task_store::TaskStore, transfer::TransferService};
         let root =
@@ -4891,6 +5138,12 @@ mod tests {
         handle.send_file(peer, source).unwrap();
         handle.send_directory(peer, root.join("receive")).unwrap();
         handle
+            .preview_directory(peer, root.join("receive"))
+            .unwrap();
+        handle
+            .confirm_directory(peer, super::super::task_model::TaskId::generate())
+            .unwrap();
+        handle
             .resume_task(peer, super::super::task_model::TaskId::generate())
             .unwrap();
         handle
@@ -4898,7 +5151,7 @@ mod tests {
             .unwrap();
         time::timeout(Duration::from_secs(3), async {
             let mut rejected = 0;
-            while rejected < 4 {
+            while rejected < 6 {
                 if let Some(SessionEvent::Diagnostic(message)) = events.recv().await
                     && message.contains("远程访问尚未授权")
                 {

@@ -171,10 +171,12 @@ $BIN push --signal $SIGNAL --peer $HOME_ID ./大文件.mkv
 提供托盘入口。后台保留同一会话，未完成文件重启后仍需手动继续。平台差异和登录项
 说明见 [后台运行](docs/DESKTOP_BACKGROUND.md)。设置页还可开启默认关闭的
 [断网自动恢复](docs/DESKTOP_AUTO_RESUME.md)，仅恢复本次进程中的网络中断任务。
+
 - [桌面接收空间预检查与共享预算](docs/DESKTOP_RECEIVE_SPACE.md)
 - [桌面拖拽文件与目录发送](docs/DESKTOP_DROP_SEND.md)
 - [桌面任务详情与本机定位](docs/DESKTOP_TASK_DETAILS.md)
 
+“增量发送目录”提供确认前差异预览；发送时重新校验并跳过相同内容，新增/修改文件继续安全传输和备份，多余文件保留。详情显示实际跳过数量与节省字节；旧对端明确回退全量发送。见 [目录增量发送](docs/DESKTOP_INCREMENTAL_SEND.md)。
 
 ```bash
 cargo run --locked --features gui --bin p2p-desktop

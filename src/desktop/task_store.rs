@@ -325,6 +325,37 @@ impl TaskStore {
         self.commit_tasks(candidate)
     }
 
+    pub(crate) fn enable_incremental(&mut self, id: &TaskId) -> Result<(), TaskStoreError> {
+        self.ensure_healthy()?;
+        let mut candidate = self.tasks.clone();
+        candidate
+            .iter_mut()
+            .find(|t| t.task_id() == id)
+            .ok_or(TaskStoreError::TaskNotFound)?
+            .enable_incremental()?;
+        self.commit_tasks(candidate)
+    }
+    pub(crate) fn commit_skipped(&mut self, id: &TaskId, now: i64) -> Result<(), TaskStoreError> {
+        self.ensure_healthy()?;
+        let mut candidate = self.tasks.clone();
+        let task = candidate
+            .iter_mut()
+            .find(|t| t.task_id() == id)
+            .ok_or(TaskStoreError::TaskNotFound)?;
+        let from = task.state();
+        task.commit_skipped(now)?;
+        self.commit_tasks(candidate)?;
+        self.events.record(
+            id.clone(),
+            now,
+            TaskEventKind::StateChanged {
+                from,
+                to: TaskState::Completed,
+            },
+        );
+        Ok(())
+    }
+
     pub(crate) fn commit_receipt(&mut self, id: &TaskId, now: i64) -> Result<(), TaskStoreError> {
         self.ensure_healthy()?;
         let mut candidate = self.tasks.clone();
